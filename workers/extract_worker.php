@@ -71,6 +71,9 @@ class ExtractWorker extends BaseWorker {
         $stmt = $this->pdo->prepare("UPDATE jobs SET total_emails = (SELECT COUNT(*) FROM emails WHERE job_id = ?) WHERE id = ?");
         $stmt->execute([$task['job_id'], $task['job_id']]);
         
+        // Check if job has reached target or deadline
+        $this->checkJobCompletion($task['job_id']);
+        
         $this->log('info', "Extracted and saved {$savedCount} emails from {$url}");
     }
     
@@ -160,6 +163,46 @@ class ExtractWorker extends BaseWorker {
         }
         
         return 'domain';
+    }
+    
+    private function checkJobCompletion($jobId) {
+        try {
+            $stmt = $this->pdo->prepare("SELECT target_emails, time_limit, deadline, total_emails, status FROM jobs WHERE id = ?");
+            $stmt->execute([$jobId]);
+            $job = $stmt->fetch();
+            
+            if (!$job || $job['status'] === 'completed') {
+                return;
+            }
+            
+            $shouldComplete = false;
+            $reason = '';
+            
+            // Check if target emails reached
+            if ($job['target_emails'] > 0 && $job['total_emails'] >= $job['target_emails']) {
+                $shouldComplete = true;
+                $reason = 'Target email count reached';
+            }
+            
+            // Check if deadline passed
+            if ($job['deadline'] && strtotime($job['deadline']) <= time()) {
+                $shouldComplete = true;
+                $reason = 'Time limit expired';
+            }
+            
+            if ($shouldComplete) {
+                $stmt = $this->pdo->prepare("UPDATE jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?");
+                $stmt->execute([$jobId]);
+                
+                // Mark all pending tasks for this job as completed
+                $stmt = $this->pdo->prepare("UPDATE queue SET status = 'cancelled', completed_at = datetime('now') WHERE job_id = ? AND status = 'pending'");
+                $stmt->execute([$jobId]);
+                
+                $this->log('info', "Job #{$jobId} completed: {$reason}");
+            }
+        } catch (Exception $e) {
+            $this->log('error', "Error checking job completion: " . $e->getMessage());
+        }
     }
 }
 

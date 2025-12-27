@@ -19,6 +19,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $emailType = $_POST['email_type'] ?? 'all';
     $speedMode = $_POST['speed_mode'] ?? 'normal';
     $searchDepth = $_POST['search_depth'] ?? '10';
+    $targetEmails = (int)($_POST['target_emails'] ?? 0);
+    $timeLimit = (int)($_POST['time_limit'] ?? 0);
     
     if (empty($jobName)) {
         $message = 'Job name is required';
@@ -28,9 +30,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $messageType = 'error';
     } else {
         try {
+            // Calculate deadline if time limit is set
+            $deadline = null;
+            if ($timeLimit > 0) {
+                $deadline = date('Y-m-d H:i:s', time() + ($timeLimit * 60));
+            }
+            
             // Create job
-            $stmt = $pdo->prepare("INSERT INTO jobs (name, niche, country_code, email_type, speed_mode, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))");
-            $stmt->execute([$jobName, $niche, $countryCode, $emailType, $speedMode]);
+            $stmt = $pdo->prepare("INSERT INTO jobs (name, niche, country_code, email_type, speed_mode, status, target_emails, time_limit, deadline, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, datetime('now'))");
+            $stmt->execute([$jobName, $niche, $countryCode, $emailType, $speedMode, $targetEmails, $timeLimit, $deadline]);
             $jobId = $pdo->lastInsertId();
             
             // Create initial discovery tasks
@@ -317,6 +325,36 @@ $countries = [
                             </div>
                         </label>
                     </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2 class="section-title">🎯 Goals & Limits</h2>
+                
+                <div class="info-box">
+                    Set optional targets and time limits for your job. Leave at 0 for unlimited collection.
+                </div>
+                
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label for="target_emails">
+                            Target Email Count
+                            <div class="label-hint">Number of emails to collect (0 = unlimited)</div>
+                        </label>
+                        <input type="number" name="target_emails" id="target_emails" value="0" min="0" placeholder="e.g., 1000">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="time_limit">
+                            Time Limit (minutes)
+                            <div class="label-hint">Maximum time to run (0 = unlimited)</div>
+                        </label>
+                        <input type="number" name="time_limit" id="time_limit" value="0" min="0" placeholder="e.g., 60">
+                    </div>
+                </div>
+                
+                <div class="info-box" style="background: #fff4e6; border-left: 4px solid #ff9800;">
+                    <strong>⚠️ Note:</strong> The job will automatically stop when either the target email count is reached OR the time limit expires, whichever comes first.
                 </div>
             </div>
             

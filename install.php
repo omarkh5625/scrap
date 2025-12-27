@@ -171,7 +171,10 @@ function createTables($pdo, $dbType) {
             created_at $datetime,
             completed_at $datetime,
             total_emails INTEGER DEFAULT 0,
-            progress DECIMAL(5,2) DEFAULT 0
+            progress DECIMAL(5,2) DEFAULT 0,
+            target_emails INTEGER DEFAULT 0,
+            time_limit INTEGER DEFAULT 0,
+            deadline $datetime
         )",
         
         "CREATE TABLE IF NOT EXISTS queue (

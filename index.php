@@ -185,6 +185,7 @@ try {
                             <th>Country</th>
                             <th>Status</th>
                             <th>Emails</th>
+                            <th>Target</th>
                             <th>Progress</th>
                             <th>Created</th>
                         </tr>
@@ -206,6 +207,15 @@ try {
                                     <span class="badge badge-<?php echo $statusClass; ?>"><?php echo $job['status']; ?></span>
                                 </td>
                                 <td><?php echo number_format($job['total_emails']); ?></td>
+                                <td>
+                                    <?php 
+                                    if ($job['target_emails'] > 0) {
+                                        echo number_format($job['target_emails']);
+                                    } else {
+                                        echo '∞';
+                                    }
+                                    ?>
+                                </td>
                                 <td><?php echo number_format($job['progress'], 1); ?>%</td>
                                 <td><?php echo date('M j, Y H:i', strtotime($job['created_at'])); ?></td>
                             </tr>
