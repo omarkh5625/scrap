@@ -53,9 +53,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $baseDir = __DIR__;
             $startedCount = 0;
             
-            // IMPORTANT: Limit workers to prevent server overload
-            $maxWorkers = 1; // Only start 1 worker at a time on shared hosting
-            $actualCount = min($count, $maxWorkers);
+            // Start workers in parallel (proper parallel processing)
+            // Respect the user-specified count
+            $actualCount = max(1, min($count, 10)); // Max 10 workers per type for safety
+            
+            $pids = []; // Track process IDs
             
             for ($i = 0; $i < $actualCount; $i++) {
                 $workerId = $workerType . '_' . uniqid();
@@ -63,7 +65,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $logFile = $baseDir . '/logs/' . $workerId . '.log';
                 
                 if ($procOpenAvailable) {
-                    // Use proc_open with non-blocking mode
+                    // Use proc_open with proper non-blocking mode
                     $descriptorspec = array(
                         0 => array("pipe", "r"),  // stdin
                         1 => array("file", $logFile, "a"),  // stdout
@@ -74,26 +76,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         "php " . escapeshellarg($baseDir . "/workers/{$workerType}_worker.php") . " " . escapeshellarg($workerId),
                         $descriptorspec,
                         $pipes,
-                        $baseDir
+                        $baseDir,
+                        array()
                     );
                     
                     if (is_resource($process)) {
-                        // Close pipes immediately to prevent blocking
+                        // Close stdin pipe
                         if (isset($pipes[0])) fclose($pipes[0]);
-                        // Don't wait - let it run in background
-                        proc_close($process);
+                        
+                        // Get process status
+                        $status = proc_get_status($process);
+                        if ($status && isset($status['pid'])) {
+                            $pids[] = $status['pid'];
+                        }
+                        
+                        // Don't call proc_close() - let it run independently
+                        // This allows true background execution
                         $startedCount++;
                     }
                 } else {
-                    // Fallback to exec
+                    // Fallback to exec with background execution
                     $command = "cd " . escapeshellarg($baseDir) . " && php workers/{$workerType}_worker.php " . escapeshellarg($workerId) . " > " . escapeshellarg($logFile) . " 2>&1 &";
                     exec($command);
                     $startedCount++;
                 }
-                usleep(500000); // 500ms delay to prevent overload
+                
+                // Small delay only between workers (50ms instead of 500ms)
+                if ($i < $actualCount - 1) {
+                    usleep(50000); // 50ms
+                }
             }
             
-            $message = "Started {$startedCount} {$workerType} worker(s).<br><small>⚠️ For better performance on shared hosting, consider using cron jobs instead of starting workers from the web interface.</small>";
+            $message = "Started {$startedCount} {$workerType} worker(s) successfully.";
+            if (count($pids) > 0) {
+                $message .= "<br><small>Process IDs: " . implode(', ', $pids) . "</small>";
+            }
             $messageType = 'success';
             logMessage('info', "Started {$startedCount} {$workerType} workers by " . $user['username']);
         } catch (Exception $e) {
