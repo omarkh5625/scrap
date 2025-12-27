@@ -257,7 +257,13 @@ function createTables($pdo, $dbType) {
         ['generate_workers', '2']
     ];
     
-    $stmt = $pdo->prepare("INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES (?, ?)");
+    // Use database-specific INSERT syntax
+    if ($dbType === 'mysql') {
+        $stmt = $pdo->prepare("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES (?, ?)");
+    } else {
+        $stmt = $pdo->prepare("INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES (?, ?)");
+    }
+    
     foreach ($defaultSettings as $setting) {
         $stmt->execute($setting);
     }
