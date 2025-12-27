@@ -44,20 +44,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $execAvailable = !in_array('exec', $disabledFunctions);
             $procOpenAvailable = !in_array('proc_open', $disabledFunctions);
             
+            // WARNING: Starting workers from web UI is NOT recommended for shared hosting
+            // It can cause server overload. Use cron jobs instead.
             if (!$execAvailable && !$procOpenAvailable) {
-                throw new Exception('Both exec() and proc_open() are disabled on this server. Please contact your hosting provider to enable background processes, or manually run workers using: php workers/' . $workerType . '_worker.php [worker_id]');
+                throw new Exception('⚠️ Cannot start workers from web interface.<br><br><strong>RECOMMENDED: Use Cron Jobs</strong><br>Add these to your cPanel Cron Jobs (run every 5 minutes):<br><br><code>*/5 * * * * cd ' . __DIR__ . ' && php workers/discover_worker.php discover_cron 2>&1<br>*/5 * * * * cd ' . __DIR__ . ' && php workers/extract_worker.php extract_cron 2>&1<br>*/5 * * * * cd ' . __DIR__ . ' && php workers/generate_worker.php generate_cron 2>&1</code>');
             }
             
             $baseDir = __DIR__;
             $startedCount = 0;
             
-            for ($i = 0; $i < $count; $i++) {
+            // IMPORTANT: Limit workers to prevent server overload
+            $maxWorkers = 1; // Only start 1 worker at a time on shared hosting
+            $actualCount = min($count, $maxWorkers);
+            
+            for ($i = 0; $i < $actualCount; $i++) {
                 $workerId = $workerType . '_' . uniqid();
                 // Use full path and redirect output to logs
                 $logFile = $baseDir . '/logs/' . $workerId . '.log';
                 
                 if ($procOpenAvailable) {
-                    // Use proc_open (more likely to be available)
+                    // Use proc_open with non-blocking mode
                     $descriptorspec = array(
                         0 => array("pipe", "r"),  // stdin
                         1 => array("file", $logFile, "a"),  // stdout
@@ -72,7 +78,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     );
                     
                     if (is_resource($process)) {
-                        // Don't wait for the process to finish
+                        // Close pipes immediately to prevent blocking
+                        if (isset($pipes[0])) fclose($pipes[0]);
+                        // Don't wait - let it run in background
                         proc_close($process);
                         $startedCount++;
                     }
@@ -82,10 +90,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     exec($command);
                     $startedCount++;
                 }
-                usleep(100000); // 100ms delay between starting workers
+                usleep(500000); // 500ms delay to prevent overload
             }
             
-            $message = "Started {$startedCount} {$workerType} worker(s)";
+            $message = "Started {$startedCount} {$workerType} worker(s).<br><small>⚠️ For better performance on shared hosting, consider using cron jobs instead of starting workers from the web interface.</small>";
             $messageType = 'success';
             logMessage('info', "Started {$startedCount} {$workerType} workers by " . $user['username']);
         } catch (Exception $e) {
