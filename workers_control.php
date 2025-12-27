@@ -43,14 +43,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     } elseif ($action === 'stop' && $workerType) {
         try {
-            // Mark workers as stopped
+            // Mark workers as stopped - workers will see this and stop themselves
             $stmt = $pdo->prepare("UPDATE workers_status SET status = 'stopped' WHERE worker_type = ?");
             $stmt->execute([$workerType]);
             
-            // Kill worker processes
-            exec("pkill -f {$workerType}_worker.php");
-            
-            $message = "Stopped all {$workerType} workers";
+            $message = "Stopped all {$workerType} workers (workers will exit gracefully)";
             $messageType = 'success';
             logMessage('info', "Stopped {$workerType} workers by " . $user['username']);
         } catch (Exception $e) {
@@ -59,10 +56,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     } elseif ($action === 'stop_all') {
         try {
+            // Mark all workers as stopped - they will see this and stop themselves
             $pdo->exec("UPDATE workers_status SET status = 'stopped'");
-            exec("pkill -f '_worker.php'");
             
-            $message = 'Stopped all workers';
+            $message = 'Stopped all workers (workers will exit gracefully)';
             $messageType = 'success';
             logMessage('info', 'Stopped all workers by ' . $user['username']);
         } catch (Exception $e) {

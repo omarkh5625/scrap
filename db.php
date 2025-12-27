@@ -57,8 +57,9 @@ function setSetting($key, $value) {
 function logMessage($level, $message, $context = null) {
     try {
         $pdo = getDbConnection();
-        $stmt = $pdo->prepare("INSERT INTO logs (log_level, message, context, created_at) VALUES (?, ?, ?, datetime('now'))");
-        $stmt->execute([$level, $message, $context ? json_encode($context) : null]);
+        $now = date('Y-m-d H:i:s');
+        $stmt = $pdo->prepare("INSERT INTO logs (log_level, message, context, created_at) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$level, $message, $context ? json_encode($context) : null, $now]);
     } catch (Exception $e) {
         error_log("Failed to log message: " . $e->getMessage());
     }

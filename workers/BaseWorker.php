@@ -26,8 +26,19 @@ abstract class BaseWorker {
     
     public function register() {
         try {
-            $stmt = $this->pdo->prepare("INSERT OR REPLACE INTO workers_status (worker_id, worker_type, status, started_at, last_heartbeat) VALUES (?, ?, 'active', datetime('now'), datetime('now'))");
-            $stmt->execute([$this->workerId, $this->workerType]);
+            $now = date('Y-m-d H:i:s');
+            // Use REPLACE for SQLite or INSERT...ON DUPLICATE KEY for MySQL
+            if (DB_TYPE === 'sqlite') {
+                $stmt = $this->pdo->prepare("INSERT OR REPLACE INTO workers_status (worker_id, worker_type, status, started_at, last_heartbeat) VALUES (?, ?, 'active', ?, ?)");
+            } else {
+                $stmt = $this->pdo->prepare("INSERT INTO workers_status (worker_id, worker_type, status, started_at, last_heartbeat) VALUES (?, ?, 'active', ?, ?) ON DUPLICATE KEY UPDATE status='active', started_at=?, last_heartbeat=?");
+            }
+            $params = [$this->workerId, $this->workerType, $now, $now];
+            if (DB_TYPE !== 'sqlite') {
+                $params[] = $now;
+                $params[] = $now;
+            }
+            $stmt->execute($params);
         } catch (Exception $e) {
             error_log("Worker registration failed: " . $e->getMessage());
         }
@@ -35,8 +46,17 @@ abstract class BaseWorker {
     
     public function updateHeartbeat($taskId = null) {
         try {
-            $stmt = $this->pdo->prepare("UPDATE workers_status SET last_heartbeat = datetime('now'), current_task = ? WHERE worker_id = ?");
-            $stmt->execute([$taskId, $this->workerId]);
+            $now = date('Y-m-d H:i:s');
+            $stmt = $this->pdo->prepare("UPDATE workers_status SET last_heartbeat = ?, current_task = ? WHERE worker_id = ?");
+            $stmt->execute([$now, $taskId, $this->workerId]);
+            
+            // Check if we should stop
+            $stmt = $this->pdo->prepare("SELECT status FROM workers_status WHERE worker_id = ?");
+            $stmt->execute([$this->workerId]);
+            $status = $stmt->fetchColumn();
+            if ($status === 'stopped') {
+                $this->running = false;
+            }
         } catch (Exception $e) {
             error_log("Heartbeat update failed: " . $e->getMessage());
         }
@@ -51,8 +71,9 @@ abstract class BaseWorker {
             $task = $stmt->fetch();
             
             if ($task) {
-                $stmt = $this->pdo->prepare("UPDATE queue SET status = 'processing', worker_id = ?, started_at = datetime('now') WHERE id = ?");
-                $stmt->execute([$this->workerId, $task['id']]);
+                $now = date('Y-m-d H:i:s');
+                $stmt = $this->pdo->prepare("UPDATE queue SET status = 'processing', worker_id = ?, started_at = ? WHERE id = ?");
+                $stmt->execute([$this->workerId, $now, $task['id']]);
             }
             
             $this->pdo->commit();
@@ -67,8 +88,9 @@ abstract class BaseWorker {
     public function completeTask($taskId, $success = true, $error = null) {
         try {
             $status = $success ? 'completed' : 'failed';
-            $stmt = $this->pdo->prepare("UPDATE queue SET status = ?, completed_at = datetime('now'), error_message = ? WHERE id = ?");
-            $stmt->execute([$status, $error, $taskId]);
+            $now = date('Y-m-d H:i:s');
+            $stmt = $this->pdo->prepare("UPDATE queue SET status = ?, completed_at = ?, error_message = ? WHERE id = ?");
+            $stmt->execute([$status, $now, $error, $taskId]);
         } catch (Exception $e) {
             error_log("Complete task failed: " . $e->getMessage());
         }
