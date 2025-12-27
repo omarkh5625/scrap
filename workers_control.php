@@ -38,19 +38,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     if ($action === 'start' && $workerType) {
         try {
+            // Check if exec() or proc_open() is available
+            $disabledFunctions = explode(',', ini_get('disable_functions'));
+            $disabledFunctions = array_map('trim', $disabledFunctions);
+            $execAvailable = !in_array('exec', $disabledFunctions);
+            $procOpenAvailable = !in_array('proc_open', $disabledFunctions);
+            
+            if (!$execAvailable && !$procOpenAvailable) {
+                throw new Exception('Both exec() and proc_open() are disabled on this server. Please contact your hosting provider to enable background processes, or manually run workers using: php workers/' . $workerType . '_worker.php [worker_id]');
+            }
+            
             $baseDir = __DIR__;
+            $startedCount = 0;
+            
             for ($i = 0; $i < $count; $i++) {
                 $workerId = $workerType . '_' . uniqid();
                 // Use full path and redirect output to logs
                 $logFile = $baseDir . '/logs/' . $workerId . '.log';
-                $command = "cd " . escapeshellarg($baseDir) . " && php workers/{$workerType}_worker.php " . escapeshellarg($workerId) . " > " . escapeshellarg($logFile) . " 2>&1 &";
-                exec($command);
+                
+                if ($procOpenAvailable) {
+                    // Use proc_open (more likely to be available)
+                    $descriptorspec = array(
+                        0 => array("pipe", "r"),  // stdin
+                        1 => array("file", $logFile, "a"),  // stdout
+                        2 => array("file", $logFile, "a")   // stderr
+                    );
+                    
+                    $process = proc_open(
+                        "php " . escapeshellarg($baseDir . "/workers/{$workerType}_worker.php") . " " . escapeshellarg($workerId),
+                        $descriptorspec,
+                        $pipes,
+                        $baseDir
+                    );
+                    
+                    if (is_resource($process)) {
+                        // Don't wait for the process to finish
+                        proc_close($process);
+                        $startedCount++;
+                    }
+                } else {
+                    // Fallback to exec
+                    $command = "cd " . escapeshellarg($baseDir) . " && php workers/{$workerType}_worker.php " . escapeshellarg($workerId) . " > " . escapeshellarg($logFile) . " 2>&1 &";
+                    exec($command);
+                    $startedCount++;
+                }
                 usleep(100000); // 100ms delay between starting workers
             }
             
-            $message = "Started {$count} {$workerType} worker(s)";
+            $message = "Started {$startedCount} {$workerType} worker(s)";
             $messageType = 'success';
-            logMessage('info', "Started {$count} {$workerType} workers by " . $user['username']);
+            logMessage('info', "Started {$startedCount} {$workerType} workers by " . $user['username']);
         } catch (Exception $e) {
             $message = 'Failed to start workers: ' . $e->getMessage();
             $messageType = 'error';
