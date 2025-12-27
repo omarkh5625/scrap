@@ -411,20 +411,123 @@ foreach (['discover', 'extract', 'generate'] as $type) {
         </div>
     </div>
     
+    <!-- Alert Container for Worker Errors -->
+    <div id="alert-container" style="position: fixed; top: 80px; right: 20px; z-index: 1000; max-width: 400px;"></div>
+    
     <script>
-        // Auto-refresh every 3 seconds using AJAX
-        setInterval(function() {
+        // Live update workers without page refresh
+        let lastAlertId = 0;
+        
+        function updateWorkerCounts() {
             fetch('api.php?action=workers')
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        // Update worker status without page reload
-                        // For MVP, using simple reload
-                        location.reload();
+                        const counts = data.data.counts;
+                        const pendingTasks = data.data.pending_tasks;
+                        
+                        // Update discover count
+                        const discoverCount = document.querySelector('.worker-card:nth-child(1) .worker-count');
+                        if (discoverCount) {
+                            discoverCount.textContent = counts.discover + ' Active';
+                        }
+                        
+                        const discoverPending = document.querySelector('.worker-card:nth-child(1) .stat-value');
+                        if (discoverPending) {
+                            discoverPending.textContent = pendingTasks.discover;
+                        }
+                        
+                        const discoverStatus = document.querySelector('.worker-card:nth-child(1) .stat-value:last-child');
+                        if (discoverStatus) {
+                            discoverStatus.textContent = counts.discover > 0 ? '✓ Running' : '○ Idle';
+                        }
+                        
+                        // Update extract count
+                        const extractCount = document.querySelector('.worker-card:nth-child(2) .worker-count');
+                        if (extractCount) {
+                            extractCount.textContent = counts.extract + ' Active';
+                        }
+                        
+                        const extractPending = document.querySelectorAll('.stat-value')[2];
+                        if (extractPending) {
+                            extractPending.textContent = pendingTasks.extract;
+                        }
+                        
+                        // Update generate count
+                        const generateCount = document.querySelector('.worker-card:nth-child(3) .worker-count');
+                        if (generateCount) {
+                            generateCount.textContent = counts.generate + ' Active';
+                        }
+                        
+                        const generatePending = document.querySelectorAll('.stat-value')[4];
+                        if (generatePending) {
+                            generatePending.textContent = pendingTasks.generate;
+                        }
                     }
                 })
                 .catch(error => console.error('Error fetching workers:', error));
-        }, 3000);
+        }
+        
+        function checkWorkerAlerts() {
+            fetch('api.php?action=worker_alerts&limit=3')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success && data.data.length > 0) {
+                        const container = document.getElementById('alert-container');
+                        
+                        data.data.forEach(alert => {
+                            const alertId = alert.id || alert.created_at;
+                            
+                            // Only show new alerts
+                            if (alertId > lastAlertId) {
+                                showAlert(alert.message, alert.level === 'error' ? 'danger' : 'warning');
+                                lastAlertId = alertId;
+                            }
+                        });
+                    }
+                })
+                .catch(error => console.error('Error fetching alerts:', error));
+        }
+        
+        function showAlert(message, type = 'warning') {
+            const container = document.getElementById('alert-container');
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-' + (type === 'danger' ? 'error' : 'warning');
+            alertDiv.style.marginBottom = '10px';
+            alertDiv.style.boxShadow = '0 4px 12px rgba(0,0,0,0.15)';
+            alertDiv.style.animation = 'slideIn 0.3s ease-out';
+            alertDiv.innerHTML = message + ' <button onclick="this.parentElement.remove()" style="float: right; background: none; border: none; cursor: pointer; font-size: 18px; color: inherit; padding: 0 5px;">×</button>';
+            
+            container.appendChild(alertDiv);
+            
+            // Auto-remove after 10 seconds
+            setTimeout(() => {
+                alertDiv.style.animation = 'slideOut 0.3s ease-out';
+                setTimeout(() => alertDiv.remove(), 300);
+            }, 10000);
+        }
+        
+        // Add CSS animations
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes slideIn {
+                from { transform: translateX(400px); opacity: 0; }
+                to { transform: translateX(0); opacity: 1; }
+            }
+            @keyframes slideOut {
+                from { transform: translateX(0); opacity: 1; }
+                to { transform: translateX(400px); opacity: 0; }
+            }
+        `;
+        document.head.appendChild(style);
+        
+        // Update every 3 seconds - live updates without refresh!
+        setInterval(updateWorkerCounts, 3000);
+        setInterval(checkWorkerAlerts, 5000);
+        
+        // Initial update
+        setTimeout(updateWorkerCounts, 1000);
+        setTimeout(checkWorkerAlerts, 2000);
     </script>
 </body>
 </html>

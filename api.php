@@ -114,16 +114,50 @@ try {
                 'generate' => 0
             ];
             
+            $detailedWorkers = [];
+            
             foreach ($workers as $worker) {
                 if ($worker['status'] === 'active') {
                     $workersByType[$worker['worker_type']]++;
+                    $detailedWorkers[] = $worker;
                 }
             }
             
+            // Get pending tasks per type
+            $pendingTasks = [
+                'discover' => 0,
+                'extract' => 0,
+                'generate' => 0
+            ];
+            
+            foreach (['discover', 'extract', 'generate'] as $type) {
+                $stmt = $pdo->prepare("SELECT COUNT(*) as count FROM queue WHERE task_type = ? AND status = 'pending'");
+                $stmt->execute([$type]);
+                $pendingTasks[$type] = $stmt->fetch()['count'];
+            }
+            
             echo json_encode(['success' => true, 'data' => [
-                'workers' => $workers,
-                'counts' => $workersByType
+                'workers' => $detailedWorkers,
+                'all_workers' => $workers,
+                'counts' => $workersByType,
+                'pending_tasks' => $pendingTasks
             ]]);
+            break;
+            
+        case 'worker_alerts':
+            // Get recent error/alert logs from workers
+            $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 5;
+            
+            try {
+                $stmt = $pdo->prepare("SELECT * FROM logs WHERE level IN ('error', 'alert') ORDER BY created_at DESC LIMIT ?");
+                $stmt->execute([$limit]);
+                $alerts = $stmt->fetchAll();
+                
+                echo json_encode(['success' => true, 'data' => $alerts]);
+            } catch (Exception $e) {
+                // If logs table doesn't exist, return empty
+                echo json_encode(['success' => true, 'data' => []]);
+            }
             break;
             
         case 'recent_emails':

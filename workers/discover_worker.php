@@ -152,6 +152,24 @@ class DiscoverWorker extends BaseWorker {
             }
         }
         
+        // Log error if no URLs found
+        if ($extractedCount === 0) {
+            $errorMsg = "⚠️ NO URLs FOUND for query '{$query}' using search type '{$searchType}'. Check your API key and search settings.";
+            $this->log('error', $errorMsg);
+            
+            // Store alert in database for UI to display
+            try {
+                $stmt = $this->pdo->prepare("INSERT INTO logs (level, message, context, created_at) VALUES ('alert', ?, ?, ?)");
+                $stmt->execute([
+                    $errorMsg,
+                    json_encode(['worker_id' => $this->workerId, 'worker_type' => $this->workerType, 'query' => $query]),
+                    date('Y-m-d H:i:s')
+                ]);
+            } catch (Exception $e) {
+                // Ignore if logs table doesn't exist
+            }
+        }
+        
         return $extractedCount;
     }
 }

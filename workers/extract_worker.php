@@ -98,12 +98,15 @@ class ExtractWorker extends BaseWorker {
     }
     
     private function extractEmails($html) {
-        // Email regex pattern
-        $pattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/';
+        // Improved email regex pattern - more comprehensive
+        $pattern = '/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/';
         
         // Remove common obfuscations
-        $html = str_replace([' at ', ' AT ', '[at]', '(at)'], '@', $html);
-        $html = str_replace([' dot ', ' DOT ', '[dot]', '(dot)'], '.', $html);
+        $html = str_replace([' at ', ' AT ', '[at]', '(at)', ' @ '], '@', $html);
+        $html = str_replace([' dot ', ' DOT ', '[dot]', '(dot)', ' . '], '.', $html);
+        
+        // Also decode HTML entities
+        $html = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         
         preg_match_all($pattern, $html, $matches);
         
@@ -111,12 +114,16 @@ class ExtractWorker extends BaseWorker {
         
         // Filter out common false positives
         $filtered = [];
-        $excludeDomains = ['example.com', 'sentry.io', 'schema.org', 'w3.org', 'example.org'];
+        $excludeDomains = ['example.com', 'sentry.io', 'schema.org', 'w3.org', 'example.org', 'localhost', 'test.com'];
+        
+        // Common generic/placeholder emails to exclude
+        $excludePatterns = ['noreply@', 'no-reply@', 'mailer@', 'postmaster@', 'admin@localhost'];
         
         foreach ($emails as $email) {
-            $email = strtolower($email);
+            $email = strtolower(trim($email));
             $isValid = true;
             
+            // Check excluded domains
             foreach ($excludeDomains as $exclude) {
                 if (strpos($email, $exclude) !== false) {
                     $isValid = false;
@@ -124,12 +131,21 @@ class ExtractWorker extends BaseWorker {
                 }
             }
             
-            // Filter out image file extensions and paths
-            if (preg_match('/\.(png|jpg|jpeg|gif|svg|css|js)(\?|$)/i', $email) || strpos($email, '/') !== false) {
+            // Check excluded patterns
+            foreach ($excludePatterns as $pattern) {
+                if (stripos($email, $pattern) !== false) {
+                    $isValid = false;
+                    break;
+                }
+            }
+            
+            // Filter out file extensions and paths
+            if (preg_match('/\.(png|jpg|jpeg|gif|svg|css|js|woff|ttf|eot)(\?|$)/i', $email) || strpos($email, '/') !== false) {
                 $isValid = false;
             }
             
-            if ($isValid && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            // Must be valid email format and reasonable length
+            if ($isValid && filter_var($email, FILTER_VALIDATE_EMAIL) && strlen($email) <= 100) {
                 $filtered[] = $email;
             }
         }
