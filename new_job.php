@@ -88,7 +88,7 @@ function generateSearchQueries($niche, $country, $depth) {
         }
     }
     
-    return array_unique(array_slice($queries, 0, $depth));
+    return array_slice(array_unique($queries), 0, $depth);
 }
 
 $countries = [

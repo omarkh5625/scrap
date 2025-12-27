@@ -81,7 +81,6 @@ class ExtractWorker extends BaseWorker {
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
         curl_setopt($ch, CURLOPT_TIMEOUT, 20);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
         
         $html = curl_exec($ch);
@@ -122,8 +121,8 @@ class ExtractWorker extends BaseWorker {
                 }
             }
             
-            // Filter out image file extensions
-            if (preg_match('/\.(png|jpg|jpeg|gif|svg|css|js)$/i', $email)) {
+            // Filter out image file extensions and paths
+            if (preg_match('/\.(png|jpg|jpeg|gif|svg|css|js)(\?|$)/i', $email) || strpos($email, '/') !== false) {
                 $isValid = false;
             }
             

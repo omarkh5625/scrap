@@ -43,8 +43,15 @@ function getSetting($key, $default = null) {
 
 function setSetting($key, $value) {
     $pdo = getDbConnection();
-    $stmt = $pdo->prepare("INSERT OR REPLACE INTO settings (setting_key, setting_value, updated_at) VALUES (?, ?, datetime('now'))");
-    return $stmt->execute([$key, $value]);
+    
+    if (DB_TYPE === 'sqlite') {
+        $stmt = $pdo->prepare("INSERT OR REPLACE INTO settings (setting_key, setting_value, updated_at) VALUES (?, ?, datetime('now'))");
+        return $stmt->execute([$key, $value]);
+    } else {
+        // MySQL compatible UPSERT
+        $stmt = $pdo->prepare("INSERT INTO settings (setting_key, setting_value, updated_at) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE setting_value = ?, updated_at = NOW()");
+        return $stmt->execute([$key, $value, $value]);
+    }
 }
 
 function logMessage($level, $message, $context = null) {

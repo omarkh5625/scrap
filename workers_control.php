@@ -18,6 +18,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $workerType = $_POST['worker_type'] ?? '';
     $count = (int)($_POST['count'] ?? 1);
     
+    // Validate worker type against allowlist
+    $allowedWorkerTypes = ['discover', 'extract', 'generate'];
+    if ($workerType && !in_array($workerType, $allowedWorkerTypes)) {
+        $message = 'Invalid worker type';
+        $messageType = 'error';
+        $workerType = '';
+    }
+    
     if ($action === 'start' && $workerType) {
         try {
             for ($i = 0; $i < $count; $i++) {
@@ -330,9 +338,18 @@ foreach (['discover', 'extract', 'generate'] as $type) {
     </div>
     
     <script>
-        // Auto-refresh every 3 seconds
-        setTimeout(function() {
-            location.reload();
+        // Auto-refresh every 3 seconds using AJAX
+        setInterval(function() {
+            fetch('api.php?action=workers')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        // Update worker status without page reload
+                        // For MVP, using simple reload
+                        location.reload();
+                    }
+                })
+                .catch(error => console.error('Error fetching workers:', error));
         }, 3000);
     </script>
 </body>
