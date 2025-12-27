@@ -17,14 +17,18 @@ if (isset($_POST['verify_api'])) {
     $apiKey = $_POST['serpapi_key'] ?? '';
     
     if (!empty($apiKey)) {
-        // Test API key with a simple search
-        $testUrl = "https://serpapi.com/search.json?engine=google&q=test&api_key=" . urlencode($apiKey);
+        // Test API key with a simple account info request (more reliable than search)
+        $testUrl = "https://serpapi.com/account.json?api_key=" . urlencode($apiKey);
         
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $testUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'Ultra Email Intelligence Platform/1.0');
+        
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
@@ -33,24 +37,35 @@ if (isset($_POST['verify_api'])) {
         // Check if request was successful
         if ($httpCode === 200 && !empty($response)) {
             $data = json_decode($response, true);
-            // Check if response contains valid data or error
+            // Check if response contains valid account data
             if (isset($data['error'])) {
                 $message = 'API key verification failed: ' . $data['error'];
                 $messageType = 'error';
-            } elseif (isset($data['search_metadata']) || isset($data['organic_results'])) {
+            } elseif (isset($data['account_id']) || isset($data['api_key_id'])) {
                 $message = 'API key verified successfully!';
                 $messageType = 'success';
             } else {
-                $message = 'API key may be valid but response is unexpected. You can still save and use it.';
+                $message = 'API response received. You can save and use this key.';
                 $messageType = 'success';
             }
         } else {
-            if (!empty($error)) {
-                $message = 'Connection error: ' . $error . '. API key may still be valid.';
+            // Try to decode response even on error to get detailed message
+            $data = !empty($response) ? json_decode($response, true) : null;
+            
+            if ($httpCode === 401) {
+                if (isset($data['error'])) {
+                    $message = 'Invalid API key: ' . $data['error'] . '. Please check your key at serpapi.com';
+                } else {
+                    $message = 'Invalid API key (401 Unauthorized). Please verify your API key from serpapi.com/manage-api-key';
+                }
+                $messageType = 'error';
+            } elseif (!empty($error)) {
+                $message = 'Connection error: ' . $error . '. Check your internet connection and try again.';
+                $messageType = 'error';
             } else {
-                $message = 'Could not verify API key (HTTP ' . $httpCode . '). You can still save and use it if you\'re sure it\'s correct.';
+                $message = 'Verification returned HTTP ' . $httpCode . '. You can still save and use the key if you\'re confident it\'s correct.';
+                $messageType = 'error';
             }
-            $messageType = 'error';
         }
     }
 }
