@@ -14,6 +14,9 @@ logs/
 tmp/
 temp/
 
+# Test files
+test_install.php
+
 # System files
 .DS_Store
 Thumbs.db
