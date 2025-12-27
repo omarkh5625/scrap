@@ -37,15 +37,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             
             // Create job
-            $createdAt = isMySQL($pdo) ? 'NOW()' : "datetime('now')";
-            $stmt = $pdo->prepare("INSERT INTO jobs (name, niche, country_code, email_type, speed_mode, status, target_emails, time_limit, deadline, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, $createdAt)");
-            $stmt->execute([$jobName, $niche, $countryCode, $emailType, $speedMode, $targetEmails, $timeLimit, $deadline]);
+            $createdAt = date('Y-m-d H:i:s');
+            $stmt = $pdo->prepare("INSERT INTO jobs (name, niche, country_code, email_type, speed_mode, status, target_emails, time_limit, deadline, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)");
+            $stmt->execute([$jobName, $niche, $countryCode, $emailType, $speedMode, $targetEmails, $timeLimit, $deadline, $createdAt]);
             $jobId = $pdo->lastInsertId();
             
             // Create initial discovery tasks
             $searchQueries = generateSearchQueries($niche, $countryCode, (int)$searchDepth);
             
-            $stmt = $pdo->prepare("INSERT INTO queue (job_id, task_type, task_data, status, priority, created_at) VALUES (?, 'discover', ?, 'pending', 1, $createdAt)");
+            $stmt = $pdo->prepare("INSERT INTO queue (job_id, task_type, task_data, status, priority, created_at) VALUES (?, 'discover', ?, 'pending', 1, ?)");
             
             foreach ($searchQueries as $query) {
                 $taskData = json_encode([
@@ -53,7 +53,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'country' => $countryCode,
                     'niche' => $niche
                 ]);
-                $stmt->execute([$jobId, $taskData]);
+                $stmt->execute([$jobId, $taskData, $createdAt]);
             }
             
             logMessage('info', "Job created: {$jobName} (ID: {$jobId}) by " . $user['username']);
