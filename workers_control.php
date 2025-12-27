@@ -3,11 +3,21 @@
  * Workers Control Panel
  */
 
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
 require_once 'auth.php';
 require_once 'db.php';
 
 $user = requireAuth();
 $pdo = getDbConnection();
+
+// Ensure logs directory exists
+$logsDir = __DIR__ . '/logs';
+if (!file_exists($logsDir)) {
+    mkdir($logsDir, 0755, true);
+}
 
 $message = '';
 $messageType = '';
@@ -28,10 +38,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     if ($action === 'start' && $workerType) {
         try {
+            $baseDir = __DIR__;
             for ($i = 0; $i < $count; $i++) {
                 $workerId = $workerType . '_' . uniqid();
-                $command = "php workers/{$workerType}_worker.php {$workerId} > /dev/null 2>&1 &";
+                // Use full path and redirect output to logs
+                $logFile = $baseDir . '/logs/' . $workerId . '.log';
+                $command = "cd " . escapeshellarg($baseDir) . " && php workers/{$workerType}_worker.php " . escapeshellarg($workerId) . " > " . escapeshellarg($logFile) . " 2>&1 &";
                 exec($command);
+                usleep(100000); // 100ms delay between starting workers
             }
             
             $message = "Started {$count} {$workerType} worker(s)";
@@ -40,6 +54,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } catch (Exception $e) {
             $message = 'Failed to start workers: ' . $e->getMessage();
             $messageType = 'error';
+            logMessage('error', "Failed to start workers: " . $e->getMessage());
         }
     } elseif ($action === 'stop' && $workerType) {
         try {
