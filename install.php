@@ -128,7 +128,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 // Create admin user
                 $hashedPassword = password_hash($password, PASSWORD_BCRYPT);
-                $stmt = $pdo->prepare("INSERT INTO users (username, password, role, created_at) VALUES (?, ?, 'admin', datetime('now'))");
+                
+                // Use database-specific datetime syntax
+                if ($_SESSION['install_db_type'] === 'mysql') {
+                    $stmt = $pdo->prepare("INSERT INTO users (username, password, role, created_at) VALUES (?, ?, 'admin', NOW())");
+                } else {
+                    $stmt = $pdo->prepare("INSERT INTO users (username, password, role, created_at) VALUES (?, ?, 'admin', datetime('now'))");
+                }
                 $stmt->execute([$username, $hashedPassword]);
                 
                 // Create config.php
