@@ -1,6 +1,6 @@
 <?php
 /**
- * SerpApi Settings Configuration
+ * Serper.dev Settings Configuration
  */
 
 require_once 'auth.php';
@@ -17,17 +17,23 @@ if (isset($_POST['verify_api'])) {
     $apiKey = $_POST['serpapi_key'] ?? '';
     
     if (!empty($apiKey)) {
-        // Test API key with a simple account info request (more reliable than search)
-        $testUrl = "https://serpapi.com/account.json?api_key=" . urlencode($apiKey);
+        // Test API key with a simple search request to Serper.dev
+        $testUrl = "https://google.serper.dev/search";
+        $testData = json_encode(['q' => 'test']);
         
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $testUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $testData);
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'Ultra Email Intelligence Platform/1.0');
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'X-API-KEY: ' . $apiKey,
+            'Content-Type: application/json'
+        ]);
         
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -37,12 +43,12 @@ if (isset($_POST['verify_api'])) {
         // Check if request was successful
         if ($httpCode === 200 && !empty($response)) {
             $data = json_decode($response, true);
-            // Check if response contains valid account data
+            // Check if response contains valid search results
             if (isset($data['error'])) {
                 $message = 'API key verification failed: ' . $data['error'];
                 $messageType = 'error';
-            } elseif (isset($data['account_id']) || isset($data['api_key_id'])) {
-                $message = 'API key verified successfully!';
+            } elseif (isset($data['organic']) || isset($data['searchParameters'])) {
+                $message = 'API key verified successfully! ✓';
                 $messageType = 'success';
             } else {
                 $message = 'API response received. You can save and use this key.';
@@ -53,11 +59,14 @@ if (isset($_POST['verify_api'])) {
             $data = !empty($response) ? json_decode($response, true) : null;
             
             if ($httpCode === 401) {
-                if (isset($data['error'])) {
-                    $message = 'Invalid API key: ' . $data['error'] . '. Please check your key at serpapi.com';
+                if (isset($data['message'])) {
+                    $message = 'Invalid API key: ' . $data['message'] . '. Please check your key at serper.dev/api-key';
                 } else {
-                    $message = 'Invalid API key (401 Unauthorized). Please verify your API key from serpapi.com/manage-api-key';
+                    $message = 'Invalid API key (401 Unauthorized). Please verify your API key from serper.dev/api-key';
                 }
+                $messageType = 'error';
+            } elseif ($httpCode === 403) {
+                $message = 'API key access forbidden (403). Please check your subscription at serper.dev';
                 $messageType = 'error';
             } elseif (!empty($error)) {
                 $message = 'Connection error: ' . $error . '. Check your internet connection and try again.';
@@ -74,7 +83,7 @@ if (isset($_POST['verify_api'])) {
 if (isset($_POST['save_settings'])) {
     try {
         $settings = [
-            'serpapi_key' => $_POST['serpapi_key'] ?? '',
+            'serper_api_key' => $_POST['serpapi_key'] ?? '', // Using serper.dev now
             'search_engines' => $_POST['search_engines'] ?? 'google', // Now supports multiple
             'language' => $_POST['language'] ?? 'en',
             'country' => $_POST['country'] ?? 'us',
@@ -99,7 +108,7 @@ if (isset($_POST['save_settings'])) {
 
 // Load current settings
 $currentSettings = [
-    'serpapi_key' => getSetting('serpapi_key', ''),
+    'serpapi_key' => getSetting('serper_api_key', getSetting('serpapi_key', '')), // Backward compatibility
     'search_engines' => getSetting('search_engines', 'google'),
     'language' => getSetting('language', 'en'),
     'country' => getSetting('country', 'us'),
@@ -184,36 +193,36 @@ $currentSettings = [
         
         <form method="post">
             <div class="section">
-                <h2 class="section-title">🔑 SerpApi Configuration</h2>
+                <h2 class="section-title">🔑 Serper.dev API Configuration</h2>
                 
                 <div class="info-box">
-                    Get your API key from <a href="https://serpapi.com/" target="_blank" style="color: #667eea;">serpapi.com</a>. 
+                    Get your API key from <a href="https://serper.dev/api-key" target="_blank" style="color: #667eea;">serper.dev/api-key</a>. 
                     The API key is required for all discovery operations.
                 </div>
                 
                 <div class="form-group">
                     <label for="serpapi_key">
                         API Key
-                        <div class="label-hint">Your SerpApi authentication key</div>
+                        <div class="label-hint">Your Serper.dev authentication key</div>
                     </label>
                     <div class="input-group">
                         <input type="text" name="serpapi_key" id="serpapi_key" 
                                value="<?php echo htmlspecialchars($currentSettings['serpapi_key']); ?>" 
-                               placeholder="Enter your SerpApi key">
+                               placeholder="Enter your Serper.dev API key">
                         <button type="submit" name="verify_api" class="btn">Verify</button>
                     </div>
                 </div>
                 
                 <div class="form-group">
                     <label for="search_engines">
-                        Search Engines
-                        <div class="label-hint">Comma-separated list of search engines (e.g., google, google_maps, bing)</div>
+                        Search Types
+                        <div class="label-hint">Comma-separated list of search types (e.g., google, images, news)</div>
                     </label>
                     <input type="text" name="search_engines" id="search_engines" 
                            value="<?php echo htmlspecialchars($currentSettings['search_engines']); ?>" 
-                           placeholder="google, google_maps, bing">
+                           placeholder="google, images, news">
                     <div style="font-size: 12px; color: #718096; margin-top: 5px;">
-                        Available engines: google, google_maps, bing, yahoo, yandex, baidu, duckduckgo
+                        Available types: google (web search), images, news, places, shopping
                     </div>
                 </div>
                 

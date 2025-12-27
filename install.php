@@ -254,7 +254,7 @@ function createTables($pdo, $dbType) {
     
     // Insert default settings
     $defaultSettings = [
-        ['serpapi_key', ''],
+        ['serper_api_key', ''], // Updated to Serper.dev
         ['search_engines', 'google'],
         ['language', 'en'],
         ['country', 'us'],
