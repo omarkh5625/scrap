@@ -255,7 +255,7 @@ function createTables($pdo, $dbType) {
     // Insert default settings
     $defaultSettings = [
         ['serpapi_key', ''],
-        ['search_engine', 'google'],
+        ['search_engines', 'google'],
         ['language', 'en'],
         ['country', 'us'],
         ['discover_workers', '2'],

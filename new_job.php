@@ -234,15 +234,10 @@ $countries = [
                     
                     <div class="form-group">
                         <label for="search_depth">
-                            Search Depth
-                            <div class="label-hint">Number of search queries to generate</div>
+                            Number of Search Queries
+                            <div class="label-hint">Enter the number of search queries to generate (no limit)</div>
                         </label>
-                        <select name="search_depth" id="search_depth">
-                            <option value="5">Light (5 queries)</option>
-                            <option value="10" selected>Standard (10 queries)</option>
-                            <option value="20">Deep (20 queries)</option>
-                            <option value="50">Maximum (50 queries)</option>
-                        </select>
+                        <input type="number" name="search_depth" id="search_depth" value="10" min="1" placeholder="e.g., 10, 50, 100">
                     </div>
                 </div>
             </div>

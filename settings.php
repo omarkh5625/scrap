@@ -23,16 +23,33 @@ if (isset($_POST['verify_api'])) {
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $testUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
         curl_close($ch);
         
-        if ($httpCode === 200) {
-            $message = 'API key verified successfully!';
-            $messageType = 'success';
+        // Check if request was successful
+        if ($httpCode === 200 && !empty($response)) {
+            $data = json_decode($response, true);
+            // Check if response contains valid data or error
+            if (isset($data['error'])) {
+                $message = 'API key verification failed: ' . $data['error'];
+                $messageType = 'error';
+            } elseif (isset($data['search_metadata']) || isset($data['organic_results'])) {
+                $message = 'API key verified successfully!';
+                $messageType = 'success';
+            } else {
+                $message = 'API key may be valid but response is unexpected. You can still save and use it.';
+                $messageType = 'success';
+            }
         } else {
-            $message = 'API key verification failed. Please check your key.';
+            if (!empty($error)) {
+                $message = 'Connection error: ' . $error . '. API key may still be valid.';
+            } else {
+                $message = 'Could not verify API key (HTTP ' . $httpCode . '). You can still save and use it if you\'re sure it\'s correct.';
+            }
             $messageType = 'error';
         }
     }
@@ -43,7 +60,7 @@ if (isset($_POST['save_settings'])) {
     try {
         $settings = [
             'serpapi_key' => $_POST['serpapi_key'] ?? '',
-            'search_engine' => $_POST['search_engine'] ?? 'google',
+            'search_engines' => $_POST['search_engines'] ?? 'google', // Now supports multiple
             'language' => $_POST['language'] ?? 'en',
             'country' => $_POST['country'] ?? 'us',
             'discover_workers' => $_POST['discover_workers'] ?? '2',
@@ -68,7 +85,7 @@ if (isset($_POST['save_settings'])) {
 // Load current settings
 $currentSettings = [
     'serpapi_key' => getSetting('serpapi_key', ''),
-    'search_engine' => getSetting('search_engine', 'google'),
+    'search_engines' => getSetting('search_engines', 'google'),
     'language' => getSetting('language', 'en'),
     'country' => getSetting('country', 'us'),
     'discover_workers' => getSetting('discover_workers', '2'),
@@ -173,15 +190,16 @@ $currentSettings = [
                 </div>
                 
                 <div class="form-group">
-                    <label for="search_engine">
-                        Search Engine
-                        <div class="label-hint">Default search engine for queries</div>
+                    <label for="search_engines">
+                        Search Engines
+                        <div class="label-hint">Comma-separated list of search engines (e.g., google, google_maps, bing)</div>
                     </label>
-                    <select name="search_engine" id="search_engine">
-                        <option value="google" <?php echo $currentSettings['search_engine'] === 'google' ? 'selected' : ''; ?>>Google</option>
-                        <option value="google_maps" <?php echo $currentSettings['search_engine'] === 'google_maps' ? 'selected' : ''; ?>>Google Maps</option>
-                        <option value="bing" <?php echo $currentSettings['search_engine'] === 'bing' ? 'selected' : ''; ?>>Bing</option>
-                    </select>
+                    <input type="text" name="search_engines" id="search_engines" 
+                           value="<?php echo htmlspecialchars($currentSettings['search_engines']); ?>" 
+                           placeholder="google, google_maps, bing">
+                    <div style="font-size: 12px; color: #718096; margin-top: 5px;">
+                        Available engines: google, google_maps, bing, yahoo, yandex, baidu, duckduckgo
+                    </div>
                 </div>
                 
                 <div class="grid">
