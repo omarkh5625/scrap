@@ -100,6 +100,55 @@ abstract class BaseWorker {
         logMessage($level, "[{$this->workerType}:{$this->workerId}] {$message}");
     }
     
+    protected function checkJobCompletion($jobId) {
+        try {
+            // Get job details
+            $stmt = $this->pdo->prepare("SELECT target_emails, time_limit, deadline, status FROM jobs WHERE id = ?");
+            $stmt->execute([$jobId]);
+            $job = $stmt->fetch();
+            
+            if (!$job || $job['status'] === 'completed') {
+                return; // Job already completed
+            }
+            
+            // Check if deadline passed
+            if ($job['deadline'] && strtotime($job['deadline']) < time()) {
+                $this->completeJob($jobId, 'Time limit reached');
+                return;
+            }
+            
+            // Check if target emails reached
+            if ($job['target_emails'] > 0) {
+                $stmt = $this->pdo->prepare("SELECT COUNT(*) FROM results WHERE job_id = ?");
+                $stmt->execute([$jobId]);
+                $emailCount = $stmt->fetchColumn();
+                
+                if ($emailCount >= $job['target_emails']) {
+                    $this->completeJob($jobId, 'Target email count reached');
+                    return;
+                }
+            }
+        } catch (Exception $e) {
+            error_log("Check job completion failed: " . $e->getMessage());
+        }
+    }
+    
+    protected function completeJob($jobId, $reason) {
+        try {
+            $now = date('Y-m-d H:i:s');
+            $stmt = $this->pdo->prepare("UPDATE jobs SET status = 'completed', completed_at = ? WHERE id = ?");
+            $stmt->execute([$now, $jobId]);
+            
+            // Cancel pending tasks for this job
+            $stmt = $this->pdo->prepare("UPDATE queue SET status = 'cancelled' WHERE job_id = ? AND status = 'pending'");
+            $stmt->execute([$jobId]);
+            
+            $this->log('info', "Job #{$jobId} auto-completed: {$reason}");
+        } catch (Exception $e) {
+            error_log("Complete job failed: " . $e->getMessage());
+        }
+    }
+    
     public function shutdown($signal = null) {
         $this->running = false;
         
@@ -115,6 +164,8 @@ abstract class BaseWorker {
     
     public function run() {
         $this->log('info', 'Worker started');
+        $idleCount = 0;
+        $maxIdleIterations = 10; // Stop after 10 idle iterations (20 seconds)
         
         while ($this->running) {
             pcntl_signal_dispatch();
@@ -122,27 +173,43 @@ abstract class BaseWorker {
             $task = $this->getNextTask();
             
             if ($task) {
+                $idleCount = 0; // Reset idle counter
                 $this->updateHeartbeat($task['id']);
                 $this->log('info', "Processing task #{$task['id']}");
                 
                 try {
                     $this->processTask($task);
                     $this->completeTask($task['id'], true);
-                    $this->log('info', "Task #{$task['id']} completed");
+                    $this->log('info', "✓ Task #{$task['id']} completed successfully");
                 } catch (Exception $e) {
                     $this->completeTask($task['id'], false, $e->getMessage());
-                    $this->log('error', "Task #{$task['id']} failed: " . $e->getMessage());
+                    $this->log('error', "✗ Task #{$task['id']} failed: " . $e->getMessage());
                 }
                 
                 $this->updateHeartbeat();
+                
+                // Check job completion after each task
+                if (isset($task['job_id'])) {
+                    $this->checkJobCompletion($task['job_id']);
+                }
             } else {
-                // No tasks available, sleep briefly
-                sleep(2);
+                // No tasks available
+                $idleCount++;
+                
+                if ($idleCount >= $maxIdleIterations) {
+                    $this->log('info', "No tasks available after {$maxIdleIterations} checks. Worker auto-stopping to save resources.");
+                    $this->running = false;
+                    break;
+                }
+                
+                // Sleep briefly (reduced from 2s to 1s for faster response)
+                sleep(1);
                 $this->updateHeartbeat();
             }
         }
         
         $this->log('info', 'Worker stopped');
+        $this->shutdown();
     }
     
     abstract protected function processTask($task);

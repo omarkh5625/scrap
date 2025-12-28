@@ -101,9 +101,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $startedCount++;
                 }
                 
-                // Small delay only between workers (50ms instead of 500ms)
+                // Small delay only between workers (20ms instead of 50ms for faster startup)
                 if ($i < $actualCount - 1) {
-                    usleep(50000); // 50ms
+                    usleep(20000); // 20ms - fast enough to prevent race conditions
                 }
             }
             
