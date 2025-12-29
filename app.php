@@ -3153,17 +3153,26 @@ class Router {
         // Check if exec() is available
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
+        $successCount = 0;
+        
         if ($execAvailable) {
             error_log("autoSpawnWorkers: Using exec() method");
             // Method 1: Spawn background PHP processes (preferred)
             self::spawnWorkersViaExec($workerCount);
+            $successCount = $workerCount; // Assume success for exec method
         } else {
             error_log("autoSpawnWorkers: exec() not available, using HTTP method");
             // Method 2: Use async HTTP requests (fallback for restricted hosting)
-            self::spawnWorkersViaHttp($workerCount);
+            $successCount = self::spawnWorkersViaHttp($workerCount);
+            
+            // Method 3: If HTTP spawning completely failed, process one worker inline
+            if ($successCount === 0) {
+                error_log("autoSpawnWorkers: HTTP spawning failed, starting inline fallback worker");
+                self::startInlineFallbackWorker();
+            }
         }
         
-        error_log("autoSpawnWorkers: Completed spawning attempt for {$workerCount} workers");
+        error_log("autoSpawnWorkers: Completed spawning attempt - {$successCount}/{$workerCount} workers spawned");
     }
     
     private static function spawnWorkersViaExec(int $workerCount): void {
@@ -3193,7 +3202,7 @@ class Router {
         }
     }
     
-    private static function spawnWorkersViaHttp(int $workerCount): void {
+    private static function spawnWorkersViaHttp(int $workerCount): int {
         // Get the current URL
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
@@ -3256,6 +3265,68 @@ class Router {
         curl_multi_close($multiHandle);
         
         error_log("spawnWorkersViaHttp: Successfully triggered {$successCount}/{$workerCount} HTTP workers");
+        return $successCount;
+    }
+    
+    /**
+     * Inline fallback worker - processes queue items directly when async methods fail
+     * This ensures jobs make progress even in restricted hosting environments
+     */
+    private static function startInlineFallbackWorker(): void {
+        error_log("startInlineFallbackWorker: Starting inline worker as fallback");
+        
+        // Close connection immediately so user doesn't wait
+        if (!headers_sent()) {
+            ignore_user_abort(true);
+            set_time_limit(300); // 5 minutes
+            
+            // Try to send response and close connection
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+                error_log("startInlineFallbackWorker: Used fastcgi_finish_request()");
+            }
+        }
+        
+        $db = Database::connect();
+        $workerName = 'inline-worker-' . uniqid();
+        
+        try {
+            $workerId = Worker::register($workerName);
+            error_log("startInlineFallbackWorker: Registered worker {$workerName} (ID: {$workerId})");
+            
+            // Process up to 3 queue items inline
+            $maxItems = 3;
+            $processed = 0;
+            
+            for ($i = 0; $i < $maxItems; $i++) {
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                
+                $job = Worker::getNextJob();
+                
+                if ($job) {
+                    error_log("startInlineFallbackWorker: Processing job #{$job['id']}");
+                    Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                    
+                    try {
+                        Worker::processJob($job['id']);
+                        $processed++;
+                        error_log("startInlineFallbackWorker: Completed job #{$job['id']} ({$processed}/{$maxItems})");
+                    } catch (Exception $e) {
+                        error_log("startInlineFallbackWorker: Error processing job #{$job['id']}: " . $e->getMessage());
+                        Worker::logError($workerId, $job['id'], 'inline_processing_error', $e->getMessage(), $e->getTraceAsString());
+                    }
+                } else {
+                    error_log("startInlineFallbackWorker: No more jobs in queue");
+                    break;
+                }
+            }
+            
+            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            error_log("startInlineFallbackWorker: Completed - processed {$processed} jobs");
+            
+        } catch (Exception $e) {
+            error_log("startInlineFallbackWorker: Fatal error: " . $e->getMessage());
+        }
     }
     
     private static function renderNewJob(): void {
