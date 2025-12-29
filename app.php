@@ -2554,7 +2554,7 @@ class Router {
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
                         // Start job processing with specified workers
-                        self::startJobProcessing($jobId, $workerCount);
+                        self::spawnParallelWorkers($jobId, $workerCount);
                         
                         // Redirect to dashboard with job ID
                         header('Location: ?page=dashboard&job_id=' . $jobId);
@@ -2873,7 +2873,6 @@ class Router {
                 <?php if ($newJobId > 0): ?>
                 const jobId = <?php echo $newJobId; ?>;
                 let progressInterval = null;
-                let processingStarted = false;
                 
                 // Function to update job progress
                 function updateJobProgress() {
@@ -2929,34 +2928,9 @@ class Router {
                         });
                 }
                 
-                // Start processing workers via AJAX (non-blocking)
-                function startJobProcessing() {
-                    if (processingStarted) return;
-                    processingStarted = true;
-                    
-                    fetch('?page=api&action=process-job-workers', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                        },
-                        body: 'job_id=' + jobId + '&worker_count=5'
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        console.log('Worker processing triggered:', data);
-                    })
-                    .catch(error => {
-                        console.error('Error starting workers:', error);
-                        document.getElementById('progress-content').innerHTML = '<p style="color: #fca5a5;">❌ Error starting workers: ' + error.message + '</p>';
-                    });
-                }
-                
                 // Start progress monitoring immediately
                 updateJobProgress();
                 progressInterval = setInterval(updateJobProgress, 3000); // Update every 3 seconds
-                
-                // Trigger worker processing after a short delay (let UI render first)
-                setTimeout(startJobProcessing, 500);
                 <?php endif; ?>
             </script>
             <?php
