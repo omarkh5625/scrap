@@ -41,7 +41,7 @@ define('CONFIG_END', true);
 // ============================================================================
 
 error_reporting(E_ALL);
-ini_set('display_errors', '0');
+ini_set('display_errors', '1');
 ini_set('log_errors', '1');
 ini_set('error_log', __DIR__ . '/php_errors.log');
 date_default_timezone_set('UTC');
@@ -249,6 +249,8 @@ class Database {
             return ['success' => true, 'error' => null];
         } catch (PDOException $e) {
             return ['success' => false, 'error' => 'Failed to create admin user: ' . $e->getMessage()];
+        } catch (Exception $e) {
+            return ['success' => false, 'error' => $e->getMessage()];
         }
     }
     
@@ -267,7 +269,9 @@ class Database {
         $pattern = '/\$DB_CONFIG\s*=\s*\[.*?\];/s';
         $content = preg_replace($pattern, $newConfig, $content);
         
-        file_put_contents($filePath, $content);
+        if (file_put_contents($filePath, $content) === false) {
+            throw new Exception('Failed to update configuration file. Please check file permissions.');
+        }
     }
 }
 
@@ -440,13 +444,18 @@ class EmailExtractor {
 
 class Job {
     public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
-        $db = Database::connect();
-        $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
-        $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
-        
-        $jobId = (int)$db->lastInsertId();
-        
-        return $jobId;
+        try {
+            $db = Database::connect();
+            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
+            $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
+            
+            $jobId = (int)$db->lastInsertId();
+            
+            return $jobId;
+        } catch (PDOException $e) {
+            error_log('Job creation database error: ' . $e->getMessage());
+            throw new Exception('Failed to create job: ' . $e->getMessage());
+        }
     }
     
     public static function getAll(int $userId): array {
@@ -1205,23 +1214,37 @@ class Router {
     private static function renderNewJob(): void {
         $success = false;
         $jobId = 0;
+        $error = null;
         
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $query = $_POST['query'] ?? '';
-            $apiKey = $_POST['api_key'] ?? '';
-            $maxResults = (int)($_POST['max_results'] ?? 100);
-            $country = !empty($_POST['country']) ? $_POST['country'] : null;
-            $emailFilter = $_POST['email_filter'] ?? 'all';
-            
-            if ($query && $apiKey) {
-                // Create job for async processing
-                $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
-                $success = true;
+            try {
+                $query = $_POST['query'] ?? '';
+                $apiKey = $_POST['api_key'] ?? '';
+                $maxResults = (int)($_POST['max_results'] ?? 100);
+                $country = !empty($_POST['country']) ? $_POST['country'] : null;
+                $emailFilter = $_POST['email_filter'] ?? 'all';
+                
+                if ($query && $apiKey) {
+                    // Create job for async processing
+                    $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                    $success = true;
+                } else {
+                    $error = 'Query and API Key are required';
+                }
+            } catch (Exception $e) {
+                $error = 'Error creating job: ' . $e->getMessage();
+                error_log('Job creation error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
             }
         }
         
-        self::renderLayout('New Job', function() use ($success, $jobId) {
+        self::renderLayout('New Job', function() use ($success, $jobId, $error) {
             ?>
+            <?php if ($error): ?>
+                <div class="alert alert-error">
+                    ✗ <?php echo htmlspecialchars($error); ?>
+                </div>
+            <?php endif; ?>
+            
             <?php if ($success): ?>
                 <div class="alert alert-success">
                     ✓ Job #<?php echo $jobId; ?> created successfully! Workers will process it in the background.
