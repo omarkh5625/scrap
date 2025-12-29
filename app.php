@@ -1628,15 +1628,14 @@ class Worker {
     public static function processJob(int $jobId): void {
         $job = Job::getById($jobId);
         if (!$job) {
+            error_log("processJob: Job {$jobId} not found");
             return;
         }
         
-        echo "Processing job #{$jobId}: {$job['query']}\n";
+        error_log("processJob: Processing job #{$jobId}: {$job['query']}");
         
-        // Register this worker for tracking
-        $workerName = 'cli-worker-' . getmypid();
-        $workerId = self::register($workerName);
-        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+        // NOTE: Worker should already be registered by caller
+        // Do NOT register a new worker here to avoid duplicates
         
         $apiKey = $job['api_key'];
         $query = $job['query'];
@@ -1649,6 +1648,8 @@ class Worker {
         $maxToProcess = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : $maxResults;
         $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
         
+        error_log("processJob: Job {$jobId} - offset {$startOffset}, max {$maxToProcess}, queue_id " . ($queueId ?? 'none'));
+        
         $processed = 0;
         $pagesProcessed = 0;
         $page = (int)($startOffset / 10) + 1;
@@ -1657,6 +1658,7 @@ class Worker {
             $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
+                error_log("processJob: No data returned for job {$jobId} page {$page}");
                 break;
             }
             
@@ -1669,13 +1671,7 @@ class Worker {
             }
             
             $emailsExtractedThisPage = $processed - $emailsBefore;
-            
-            // Update worker statistics
-            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
-            
-            if ($processed > 0 && $processed % 10 === 0) {
-                echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
-            }
+            error_log("processJob: Job {$jobId} page {$page} - extracted {$emailsExtractedThisPage} emails (total: {$processed}/{$maxToProcess})");
             
             if (!isset($data['organic']) || count($data['organic']) === 0) {
                 break;
@@ -1691,15 +1687,13 @@ class Worker {
         // Mark queue item as complete
         if ($queueId) {
             self::markQueueItemComplete($queueId);
+            error_log("processJob: Marked queue item {$queueId} as complete");
         }
         
         // Update overall job progress
         self::updateJobProgress($jobId);
         
-        echo "Job chunk completed! Processed {$processed} emails\n";
-        
-        // Mark worker as idle
-        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+        error_log("processJob: Job {$jobId} chunk completed! Processed {$processed} emails from {$pagesProcessed} pages");
     }
     
     public static function updateJobProgress(int $jobId): void {
@@ -2790,6 +2784,18 @@ class Router {
                     if (!$query || !$apiKey) {
                         $error = 'Query and API Key are required';
                     } else {
+                        // CRITICAL: Clean up any stale workers BEFORE creating new job
+                        // This prevents confusion with old workers showing as "active"
+                        error_log("=== CLEANING UP STALE WORKERS BEFORE NEW JOB ===");
+                        $staleWorkers = Worker::detectStaleWorkers(60); // Workers idle for 1+ minute
+                        foreach ($staleWorkers as $worker) {
+                            Worker::markWorkerAsCrashed($worker['id'], 'Auto-cleanup: Worker stale before new job creation');
+                        }
+                        error_log("Cleaned up " . count($staleWorkers) . " stale workers");
+                        
+                        // Also clean up old workers (24+ hours old)
+                        Worker::cleanupOldWorkers(1); // Clean workers older than 1 hour
+                        
                         // Create job for immediate processing
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
@@ -3714,11 +3720,16 @@ class Router {
                         }
                     }
                     
-                    // Final heartbeat update before worker finishes
-                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    // Final heartbeat update before worker finishes - mark as STOPPED
+                    Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
+                    error_log("processWorkersInBackground: Worker {$workerIndex} ({$workerName}) finished and marked as stopped");
                     
                 } catch (Exception $e) {
                     error_log("processWorkersInBackground: Worker {$workerIndex} fatal error: " . $e->getMessage());
+                    // Mark worker as stopped even on error
+                    if ($workerId) {
+                        Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
+                    }
                 }
             }
             
