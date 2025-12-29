@@ -3150,29 +3150,22 @@ class Router {
     private static function autoSpawnWorkers(int $workerCount): void {
         error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
         
-        // Check if exec() is available
-        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+        // For restricted hosting environments (exec disabled, no cron), 
+        // process work directly in background after closing connection
+        // This ensures extraction starts immediately without blocking UI
         
-        $successCount = 0;
+        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
             error_log("autoSpawnWorkers: Using exec() method");
-            // Method 1: Spawn background PHP processes (preferred)
+            // Method 1: Spawn background PHP processes (only if exec available)
             self::spawnWorkersViaExec($workerCount);
-            $successCount = $workerCount; // Assume success for exec method
         } else {
-            error_log("autoSpawnWorkers: exec() not available, using HTTP method");
-            // Method 2: Use async HTTP requests (fallback for restricted hosting)
-            $successCount = self::spawnWorkersViaHttp($workerCount);
-            
-            // Method 3: If HTTP spawning completely failed, process one worker inline
-            if ($successCount === 0) {
-                error_log("autoSpawnWorkers: HTTP spawning failed, starting inline fallback worker");
-                self::startInlineFallbackWorker();
-            }
+            // Method 2: Direct background processing (no exec, no HTTP, no cron needed)
+            // Process work in same request but after closing connection to user
+            error_log("autoSpawnWorkers: exec() not available, using direct background processing");
+            self::processWorkersInBackground($workerCount);
         }
-        
-        error_log("autoSpawnWorkers: Completed spawning attempt - {$successCount}/{$workerCount} workers spawned");
     }
     
     private static function spawnWorkersViaExec(int $workerCount): void {
@@ -3338,6 +3331,91 @@ class Router {
                     error_log("startInlineFallbackWorker: Cleanup error: " . $cleanupError->getMessage());
                 }
             }
+        }
+    }
+    
+    /**
+     * Process workers in background after closing connection
+     * This method works without exec, HTTP workers, or cron
+     * It processes queue items directly but only after the connection is closed
+     */
+    private static function processWorkersInBackground(int $workerCount): void {
+        error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers");
+        
+        // Close connection immediately so UI is not blocked
+        if (!headers_sent()) {
+            ignore_user_abort(true);
+            set_time_limit(0); // No time limit for background processing
+            
+            // Send response and close connection using FastCGI
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+                error_log("processWorkersInBackground: Connection closed via fastcgi_finish_request()");
+            } else {
+                // Fallback for non-FastCGI environments
+                if (ob_get_level() > 0) {
+                    ob_end_flush();
+                }
+                flush();
+                error_log("processWorkersInBackground: Connection closed via flush()");
+            }
+        }
+        
+        // Now process work in background - user has already received response
+        try {
+            $db = Database::connect();
+            
+            // Process queue items with multiple simulated workers
+            $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
+            $totalProcessed = 0;
+            
+            for ($workerIndex = 0; $workerIndex < $workerCount; $workerIndex++) {
+                $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
+                
+                try {
+                    $workerId = Worker::register($workerName);
+                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered");
+                    
+                    // Each simulated worker processes items from the queue
+                    $itemsProcessed = 0;
+                    
+                    for ($i = 0; $i < $maxItemsPerWorker; $i++) {
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        
+                        $job = Worker::getNextJob();
+                        
+                        if ($job) {
+                            error_log("processWorkersInBackground: Worker {$workerIndex} processing job #{$job['id']}");
+                            Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                            
+                            try {
+                                Worker::processJob($job['id']);
+                                $itemsProcessed++;
+                                $totalProcessed++;
+                                error_log("processWorkersInBackground: Worker {$workerIndex} completed job #{$job['id']}");
+                            } catch (Exception $e) {
+                                error_log("processWorkersInBackground: Worker {$workerIndex} error on job #{$job['id']}: " . $e->getMessage());
+                                Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
+                            }
+                        } else {
+                            // No more jobs in queue
+                            error_log("processWorkersInBackground: Worker {$workerIndex} - no more jobs available");
+                            break;
+                        }
+                    }
+                    
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    error_log("processWorkersInBackground: Worker {$workerIndex} completed {$itemsProcessed} items");
+                    
+                } catch (Exception $e) {
+                    error_log("processWorkersInBackground: Worker {$workerIndex} fatal error: " . $e->getMessage());
+                }
+            }
+            
+            error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers");
+            
+        } catch (Exception $e) {
+            error_log("processWorkersInBackground: Fatal error: " . $e->getMessage());
         }
     }
     
