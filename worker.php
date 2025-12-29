@@ -20,7 +20,7 @@ define('API_MODE', true); // Prevent UI rendering
 require_once __DIR__ . '/app.php';
 
 // Get worker name from command line or generate one
-$workerName = $argv[1] ?? 'worker_' . uniqid();
+$workerName = $argv[1] ?? 'worker_' . bin2hex(random_bytes(8));
 
 // Performance settings for workers
 ini_set('memory_limit', '256M'); // Lower than main app since workers are parallel
@@ -94,8 +94,8 @@ try {
             }
         }
         
-        // Small delay between jobs
-        sleep(1);
+        // Small delay between jobs to avoid overwhelming the system
+        usleep(100000); // 100ms
     }
     
 } catch (Exception $e) {

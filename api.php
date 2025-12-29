@@ -223,7 +223,13 @@ function apiSpawnWorkers(): void {
     // Spawn workers using background processes
     $spawned = 0;
     for ($i = 0; $i < $workerCount; $i++) {
-        $workerName = 'api_worker_' . uniqid() . '_' . $i;
+        $workerName = 'api_worker_' . bin2hex(random_bytes(8)) . '_' . $i;
+        
+        // Validate worker name (alphanumeric, underscore, dash only)
+        if (!preg_match('/^[a-zA-Z0-9_-]+$/', $workerName)) {
+            error_log("Invalid worker name generated: {$workerName}");
+            continue;
+        }
         
         // Spawn in background
         $phpBinary = PHP_BINARY;
@@ -238,8 +244,8 @@ function apiSpawnWorkers(): void {
         exec($command);
         $spawned++;
         
-        // Small delay to prevent overwhelming system
-        usleep(50000); // 50ms
+        // Small delay to prevent overwhelming system (reduced from 50ms for faster scaling)
+        usleep(20000); // 20ms
     }
     
     apiSuccess([

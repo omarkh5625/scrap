@@ -415,7 +415,10 @@
     </div>
     
     <script>
-        const API_URL = 'api.php';
+        // Detect API URL dynamically based on current location
+        const API_URL = window.location.href.includes('dashboard.html') 
+            ? window.location.href.replace('dashboard.html', 'api.php')
+            : 'api.php';
         
         // Utility functions
         function showAlert(message, type = 'info') {
