@@ -1141,6 +1141,9 @@ class Router {
             case 'process-worker':
                 self::handleWorkerProcessing();
                 break;
+            case 'start-worker':
+                self::handleStartWorker();
+                break;
             case 'api':
                 self::handleAPI();
                 break;
@@ -1376,6 +1379,79 @@ class Router {
                 } catch (Exception $e) {
                     error_log("HTTP Worker #{$workerIndex} error for job {$jobId}: " . $e->getMessage());
                 }
+            }
+        }
+        exit;
+    }
+    
+    private static function handleStartWorker(): void {
+        // This starts a worker that polls the queue
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $workerName = $_POST['worker_name'] ?? 'http-worker-' . uniqid();
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            
+            error_log("HTTP Worker {$workerName} starting...");
+            
+            // Close connection immediately so client doesn't wait
+            ignore_user_abort(true);
+            set_time_limit(0);
+            
+            // Calculate content before sending
+            $response = json_encode(['status' => 'started', 'worker' => $workerName]);
+            
+            // Send minimal response
+            header('Content-Type: application/json');
+            header('Content-Length: ' . strlen($response));
+            header('Connection: close');
+            echo $response;
+            
+            // Flush all output buffers
+            if (ob_get_level() > 0) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Close the session if it's open
+            if (session_id()) {
+                session_write_close();
+            }
+            
+            // Give time for connection to close
+            usleep(100000); // 0.1 seconds
+            
+            // Now run worker loop in background
+            try {
+                error_log("Worker {$workerName} entering queue polling mode");
+                
+                $workerId = Worker::register($workerName);
+                
+                // Process queue items until empty or timeout
+                $startTime = time();
+                $maxRuntime = 300; // 5 minutes max per worker
+                $itemsProcessed = 0;
+                
+                while ((time() - $startTime) < $maxRuntime) {
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    
+                    $job = Worker::getNextJob();
+                    
+                    if ($job) {
+                        Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                        Worker::processJob($job['id']);
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        $itemsProcessed++;
+                    } else {
+                        // No more jobs in queue, exit
+                        break;
+                    }
+                    
+                    // Small sleep between checks
+                    sleep(1);
+                }
+                
+                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} items.");
+            } catch (Exception $e) {
+                error_log("HTTP Worker {$workerName} error: " . $e->getMessage());
             }
         }
         exit;
@@ -1636,86 +1712,90 @@ class Router {
         // Update job status to pending (workers will pick it up from queue)
         Job::updateStatus($jobId, 'pending', 0);
         
-        error_log("Created {$workerCount} queue items for job {$jobId}. Workers will process from queue.");
+        error_log("Created {$workerCount} queue items for job {$jobId}. Auto-spawning workers...");
+        
+        // Auto-spawn workers to process the queue immediately
+        self::autoSpawnWorkers($workerCount);
     }
     
-    private static function spawnWorkersViaExec(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
+    private static function autoSpawnWorkers(int $workerCount): void {
+        // Check if exec() is available
+        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+        
+        if ($execAvailable) {
+            // Method 1: Spawn background PHP processes (preferred)
+            self::spawnWorkersViaExec($workerCount);
+        } else {
+            // Method 2: Use async HTTP requests (fallback for restricted hosting)
+            self::spawnWorkersViaHttp($workerCount);
+        }
+    }
+    
+    private static function spawnWorkersViaExec(int $workerCount): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
         for ($i = 0; $i < $workerCount; $i++) {
-            $startOffset = $i * $resultsPerWorker;
-            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            // Build command to run worker in queue mode
+            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+            $cmd = sprintf(
+                '%s %s %s > /dev/null 2>&1 &',
+                escapeshellarg($phpBinary),
+                escapeshellarg($scriptPath),
+                escapeshellarg($workerName)
+            );
             
-            if ($workerMaxResults > 0) {
-                // Build command to run worker
-                $cmd = sprintf(
-                    '%s %s process-job %d %d %d > /dev/null 2>&1 &',
-                    escapeshellarg($phpBinary),
-                    escapeshellarg($scriptPath),
-                    $jobId,
-                    $startOffset,
-                    $workerMaxResults
-                );
-                
-                // Execute in background
-                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-                    // Windows
-                    pclose(popen("start /B " . $cmd, "r"));
-                } else {
-                    // Unix/Linux
-                    exec($cmd);
-                }
+            // Execute in background
+            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                // Windows
+                pclose(popen("start /B " . $cmd, "r"));
+            } else {
+                // Unix/Linux
+                exec($cmd);
             }
+            
+            error_log("Spawned worker: {$workerName}");
         }
     }
     
-    private static function spawnWorkersViaHttp(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
+    private static function spawnWorkersViaHttp(int $workerCount): void {
         // Get the current URL
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
-        error_log("Spawning {$workerCount} workers via HTTP for job {$jobId}");
+        error_log("Spawning {$workerCount} HTTP workers");
         
         for ($i = 0; $i < $workerCount; $i++) {
-            $startOffset = $i * $resultsPerWorker;
-            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
             
-            if ($workerMaxResults > 0) {
-                // Create async HTTP request to trigger worker
-                $ch = curl_init($baseUrl . '?page=process-worker');
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_POST, true);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
-                    'job_id' => $jobId,
-                    'start_offset' => $startOffset,
-                    'max_results' => $workerMaxResults,
-                    'worker_index' => $i,
-                    'worker_token' => md5($jobId . $startOffset . 'secret')
-                ]));
-                curl_setopt($ch, CURLOPT_TIMEOUT, 5); // Give it 5 seconds to establish connection
-                curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
-                
-                // Execute async (don't wait for response)
-                $result = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                
-                if ($httpCode !== 200) {
-                    error_log("Failed to spawn worker #{$i} for job {$jobId}, HTTP code: {$httpCode}");
-                } else {
-                    error_log("Successfully spawned worker #{$i} for job {$jobId}");
-                }
-                
-                curl_close($ch);
-                
-                // Small delay between spawning workers to avoid overwhelming the server
-                usleep(50000); // 0.05 seconds
+            // Create async HTTP request to trigger worker
+            $ch = curl_init($baseUrl . '?page=start-worker');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'worker_name' => $workerName,
+                'worker_index' => $i
+            ]));
+            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Short timeout to just start the worker
+            curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            
+            // Execute async (don't wait for response)
+            curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            
+            if ($httpCode === 200) {
+                error_log("Successfully spawned HTTP worker: {$workerName}");
+            } else {
+                error_log("Failed to spawn HTTP worker #{$i}, HTTP code: {$httpCode}");
             }
+            
+            curl_close($ch);
+            
+            // Small delay between spawning workers
+            usleep(50000); // 0.05 seconds
         }
-        
-        error_log("All {$workerCount} workers spawned for job {$jobId}");
     }
     
     private static function renderNewJob(): void {
@@ -1759,8 +1839,7 @@ class Router {
             
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job #<?php echo $jobId; ?> created and queued for processing! <?php echo $_POST['worker_count'] ?? 5; ?> work chunks have been created.
-                    <br><strong>Start workers to process:</strong> <code>php app.php worker-1</code>
+                    ✓ Job #<?php echo $jobId; ?> created and processing started! <?php echo $_POST['worker_count'] ?? 5; ?> workers have been spawned automatically.
                     <br><a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
                     <a href="?page=dashboard">Go to Dashboard</a> | 
                     <a href="?page=workers">View Workers</a>
@@ -1770,7 +1849,7 @@ class Router {
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    📋 Jobs are queued and processed by CLI workers. Start workers with: <code>php app.php worker-name</code>
+                    ⚡ Workers start automatically when you create a job! Results appear in real-time.
                 </p>
                 <form method="POST">
                     <div class="form-group">
@@ -1825,10 +1904,10 @@ class Router {
                     <div class="form-group">
                         <label>Parallel Workers</label>
                         <input type="number" name="worker_count" value="5" min="1" max="1000">
-                        <small>Number of work chunks to create (1-1000). Each worker will process one chunk from the queue.</small>
+                        <small>Number of parallel workers to spawn automatically (1-1000). More workers = faster processing</small>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Create Job & Queue for Processing</button>
+                    <button type="submit" class="btn btn-primary">Create Job & Start Processing</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
@@ -1837,14 +1916,14 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>Job is split into chunks and added to processing queue</li>
-                    <li>Start CLI workers to process the queue: <code>php app.php worker-1</code></li>
+                    <li>Workers start automatically in the background</li>
+                    <li>Job is split into chunks for parallel processing</li>
                     <li>Workers pick up chunks from the queue and extract emails</li>
                     <li>Duplicates are automatically filtered out</li>
                     <li>Results appear in real-time on the dashboard</li>
                 </ol>
                 <p style="margin-top: 15px;">
-                    <strong>Queue-Based Processing:</strong> Jobs are queued and processed by persistent CLI workers. This is more reliable than HTTP-based workers and works on all hosting environments including cPanel.
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Create Job & Start Processing". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
                 </p>
             </div>
             <?php
