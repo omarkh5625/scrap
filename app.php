@@ -485,8 +485,19 @@ class Auth {
 // ============================================================================
 
 class BloomFilter {
+    // Configuration constants
+    private const DEFAULT_CACHE_SIZE = 10000;
+    private const BULK_CHECK_BATCH_SIZE = 1000;
+    
     private static array $cache = [];
-    private static int $cacheSize = 10000;
+    private static int $cacheSize = self::DEFAULT_CACHE_SIZE;
+    
+    /**
+     * Set cache size (useful for tuning based on available memory)
+     */
+    public static function setCacheSize(int $size): void {
+        self::$cacheSize = max(100, min($size, 100000)); // Limit between 100 and 100K
+    }
     
     public static function add(string $email): void {
         $hash = self::normalize($email);
@@ -559,17 +570,24 @@ class BloomFilter {
             return [];
         }
         
-        // Bulk query database
+        // Bulk query database in batches to avoid large IN clauses
         $db = Database::connect();
-        $placeholders = implode(',', array_fill(0, count($hashes), '?'));
-        $stmt = $db->prepare("SELECT hash FROM bloomfilter WHERE hash IN ($placeholders)");
-        $stmt->execute(array_keys($hashes));
-        
+        $hashKeys = array_keys($hashes);
         $existingHashes = [];
-        while ($row = $stmt->fetch()) {
-            $existingHashes[$row['hash']] = true;
-            // Add to cache
-            self::$cache[$row['hash']] = true;
+        
+        // Process in batches to avoid MySQL max_allowed_packet issues
+        $batches = array_chunk($hashKeys, self::BULK_CHECK_BATCH_SIZE);
+        
+        foreach ($batches as $batch) {
+            $placeholders = implode(',', array_fill(0, count($batch), '?'));
+            $stmt = $db->prepare("SELECT hash FROM bloomfilter WHERE hash IN ($placeholders)");
+            $stmt->execute($batch);
+            
+            while ($row = $stmt->fetch()) {
+                $existingHashes[$row['hash']] = true;
+                // Add to cache
+                self::$cache[$row['hash']] = true;
+            }
         }
         
         // Return emails that don't exist yet
@@ -757,21 +775,25 @@ class EmailExtractor {
 // ============================================================================
 
 class CurlMultiManager {
+    // Configuration constants
+    private const DEFAULT_MAX_CONNECTIONS = 50;
+    private const MAX_HOST_CONNECTIONS = 10;
+    
     private $multiHandle;
     private array $handles = [];
     private array $handleData = [];
     private int $maxConnections;
     
-    public function __construct(int $maxConnections = 50) {
-        $this->maxConnections = $maxConnections;
+    public function __construct(int $maxConnections = self::DEFAULT_MAX_CONNECTIONS) {
+        $this->maxConnections = min($maxConnections, 100); // Cap at 100 for safety
         $this->multiHandle = curl_multi_init();
         
         // Set max total connections and max per host
         if (defined('CURLMOPT_MAX_TOTAL_CONNECTIONS')) {
-            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_TOTAL_CONNECTIONS, $maxConnections);
+            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_TOTAL_CONNECTIONS, $this->maxConnections);
         }
         if (defined('CURLMOPT_MAX_HOST_CONNECTIONS')) {
-            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_HOST_CONNECTIONS, 10);
+            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_HOST_CONNECTIONS, self::MAX_HOST_CONNECTIONS);
         }
     }
     
@@ -789,8 +811,12 @@ class CurlMultiManager {
         curl_setopt($ch, CURLOPT_USERAGENT, $options['user_agent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
         curl_setopt($ch, CURLOPT_ENCODING, ''); // Enable compression
         curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        
+        // SSL verification - configurable for environments with SSL issues
+        // In production, keep SSL verification enabled for security
+        $sslVerify = $options['ssl_verify'] ?? true;
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, $sslVerify);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, $sslVerify ? 2 : 0);
         
         // HTTP/2 for better performance (if available)
         if (defined('CURL_HTTP_VERSION_2_0')) {
@@ -905,6 +931,9 @@ class CurlMultiManager {
 // ============================================================================
 
 class Job {
+    // Configuration constants
+    private const BULK_INSERT_BATCH_SIZE = 1000;
+    
     public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
         try {
             $db = Database::connect();
@@ -991,48 +1020,52 @@ class Job {
             return 0;
         }
         
-        // Build bulk insert query
-        $values = [];
-        $params = [];
+        // Process in batches to avoid MySQL max_allowed_packet issues
+        $emailBatches = array_chunk($uniqueEmails, self::BULK_INSERT_BATCH_SIZE);
         
-        foreach ($uniqueEmails as $email) {
-            $emailHash = hash('sha256', strtolower($email));
-            $domain = EmailExtractor::getDomain($email);
-            $sourceUrl = $sources[$email]['url'] ?? null;
-            $sourceTitle = $sources[$email]['title'] ?? null;
+        foreach ($emailBatches as $batch) {
+            // Build bulk insert query for this batch
+            $values = [];
+            $params = [];
             
-            $values[] = "(?, ?, ?, ?, ?, ?, ?)";
-            $params[] = $jobId;
-            $params[] = $email;
-            $params[] = $emailHash;
-            $params[] = $domain;
-            $params[] = $country;
-            $params[] = $sourceUrl;
-            $params[] = $sourceTitle;
-        }
-        
-        try {
-            $sql = "INSERT IGNORE INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES " . implode(", ", $values);
-            $stmt = $db->prepare($sql);
-            $stmt->execute($params);
-            $added = $stmt->rowCount();
-            
-            // Add to BloomFilter in bulk (much faster)
-            BloomFilter::addBulk($uniqueEmails);
-            
-            return $added;
-        } catch (PDOException $e) {
-            error_log("Bulk insert error: " . $e->getMessage());
-            // Fallback to individual inserts if bulk fails
-            foreach ($uniqueEmails as $email) {
+            foreach ($batch as $email) {
+                $emailHash = hash('sha256', strtolower($email));
+                $domain = EmailExtractor::getDomain($email);
                 $sourceUrl = $sources[$email]['url'] ?? null;
                 $sourceTitle = $sources[$email]['title'] ?? null;
-                if (self::addEmail($jobId, $email, $country, $sourceUrl, $sourceTitle)) {
-                    $added++;
+                
+                $values[] = "(?, ?, ?, ?, ?, ?, ?)";
+                $params[] = $jobId;
+                $params[] = $email;
+                $params[] = $emailHash;
+                $params[] = $domain;
+                $params[] = $country;
+                $params[] = $sourceUrl;
+                $params[] = $sourceTitle;
+            }
+            
+            try {
+                $sql = "INSERT IGNORE INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES " . implode(", ", $values);
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                $added += $stmt->rowCount();
+            } catch (PDOException $e) {
+                error_log("Bulk insert error for batch: " . $e->getMessage());
+                // Fallback to individual inserts for this batch if bulk fails
+                foreach ($batch as $email) {
+                    $sourceUrl = $sources[$email]['url'] ?? null;
+                    $sourceTitle = $sources[$email]['title'] ?? null;
+                    if (self::addEmail($jobId, $email, $country, $sourceUrl, $sourceTitle)) {
+                        $added++;
+                    }
                 }
             }
-            return $added;
         }
+        
+        // Add to BloomFilter in bulk (much faster)
+        BloomFilter::addBulk($uniqueEmails);
+        
+        return $added;
     }
 }
 
@@ -1041,6 +1074,9 @@ class Job {
 // ============================================================================
 
 class Worker {
+    // Configuration constants
+    private const DEFAULT_RATE_LIMIT = 0.3; // seconds between API requests (optimized for parallel mode)
+    
     public static function getAll(): array {
         $db = Database::connect();
         $stmt = $db->query("SELECT * FROM workers ORDER BY created_at DESC");
@@ -1431,7 +1467,7 @@ class Worker {
             $page++;
             
             // Reduced rate limiting when using parallel scraping (already more efficient)
-            $rateLimit = (float)(Settings::get('rate_limit', '0.3'));
+            $rateLimit = (float)(Settings::get('rate_limit', (string)self::DEFAULT_RATE_LIMIT));
             usleep((int)($rateLimit * 1000000));
         }
         
@@ -1600,7 +1636,7 @@ class Worker {
                     $page++;
                     
                     // Reduced rate limiting when using parallel scraping
-                    $rateLimit = (float)(Settings::get('rate_limit', '0.3'));
+                    $rateLimit = (float)(Settings::get('rate_limit', (string)self::DEFAULT_RATE_LIMIT));
                     usleep((int)($rateLimit * 1000000));
                 } catch (Exception $e) {
                     error_log("Error in page processing loop: " . $e->getMessage());
@@ -2773,6 +2809,7 @@ class Router {
                     
                     <div class="form-group">
                         <label>Rate Limit (seconds between requests)</label>
+                        <!-- Default: 0.3 (see Worker::DEFAULT_RATE_LIMIT) -->
                         <input type="number" step="0.1" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.3'); ?>">
                         <small>Optimized for parallel processing: 0.1-0.5 seconds recommended with curl_multi</small>
                     </div>
