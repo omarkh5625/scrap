@@ -154,6 +154,35 @@ class Database {
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 ");
             }
+            
+            // Migration: Create worker_errors table for error tracking
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'worker_errors'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS worker_errors (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        worker_id INT NULL,
+                        job_id INT NULL,
+                        error_type VARCHAR(100),
+                        error_message TEXT,
+                        error_details TEXT,
+                        severity ENUM('warning', 'error', 'critical') DEFAULT 'error',
+                        resolved BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_worker (worker_id),
+                        INDEX idx_job (job_id),
+                        INDEX idx_severity (severity),
+                        INDEX idx_resolved (resolved)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
+            
+            // Migration: Add error_count column to workers table
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM workers LIKE 'error_count'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN error_count INT DEFAULT 0 AFTER runtime_seconds");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN last_error TEXT AFTER error_count");
+            }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
             // Don't die on migration errors, just log them
@@ -267,6 +296,8 @@ class Database {
                     pages_processed INT DEFAULT 0,
                     emails_extracted INT DEFAULT 0,
                     runtime_seconds INT DEFAULT 0,
+                    error_count INT DEFAULT 0,
+                    last_error TEXT,
                     INDEX idx_status (status)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
@@ -294,6 +325,24 @@ class Database {
                     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
                     INDEX idx_status (status),
                     INDEX idx_job (job_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS worker_errors (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    worker_id INT NULL,
+                    job_id INT NULL,
+                    error_type VARCHAR(100),
+                    error_message TEXT,
+                    error_details TEXT,
+                    severity ENUM('warning', 'error', 'critical') DEFAULT 'error',
+                    resolved BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_worker (worker_id),
+                    INDEX idx_job (job_id),
+                    INDEX idx_severity (severity),
+                    INDEX idx_resolved (resolved)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
@@ -645,6 +694,76 @@ class Worker {
         }
     }
     
+    public static function logError(int $workerId, ?int $jobId, string $errorType, string $errorMessage, ?string $errorDetails = null, string $severity = 'error'): void {
+        $db = Database::connect();
+        
+        try {
+            // Log to worker_errors table
+            $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, error_details, severity) VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$workerId, $jobId, $errorType, $errorMessage, $errorDetails, $severity]);
+            
+            // Update worker's error count and last error
+            $stmt = $db->prepare("UPDATE workers SET error_count = error_count + 1, last_error = ? WHERE id = ?");
+            $stmt->execute([$errorMessage, $workerId]);
+            
+            error_log("Worker #{$workerId} error logged: [{$errorType}] {$errorMessage}");
+        } catch (PDOException $e) {
+            error_log("Failed to log worker error: " . $e->getMessage());
+        }
+    }
+    
+    public static function getErrors(bool $unresolvedOnly = true, int $limit = 50): array {
+        $db = Database::connect();
+        
+        $sql = "SELECT we.*, w.worker_name, j.query as job_query 
+                FROM worker_errors we 
+                LEFT JOIN workers w ON we.worker_id = w.id 
+                LEFT JOIN jobs j ON we.job_id = j.id ";
+        
+        if ($unresolvedOnly) {
+            $sql .= "WHERE we.resolved = FALSE ";
+        }
+        
+        $sql .= "ORDER BY we.created_at DESC LIMIT ?";
+        
+        $stmt = $db->prepare($sql);
+        $stmt->execute([$limit]);
+        
+        return $stmt->fetchAll();
+    }
+    
+    public static function resolveError(int $errorId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE worker_errors SET resolved = TRUE WHERE id = ?");
+        $stmt->execute([$errorId]);
+    }
+    
+    public static function detectStaleWorkers(int $timeoutSeconds = 300): array {
+        $db = Database::connect();
+        
+        // Find workers that are marked as running but haven't sent heartbeat in timeout period
+        $stmt = $db->prepare("
+            SELECT * FROM workers 
+            WHERE status = 'running' 
+            AND last_heartbeat IS NOT NULL 
+            AND TIMESTAMPDIFF(SECOND, last_heartbeat, NOW()) > ?
+        ");
+        $stmt->execute([$timeoutSeconds]);
+        
+        return $stmt->fetchAll();
+    }
+    
+    public static function markWorkerAsCrashed(int $workerId, string $reason): void {
+        $db = Database::connect();
+        
+        // Update worker status to stopped
+        $stmt = $db->prepare("UPDATE workers SET status = 'stopped', last_error = ? WHERE id = ?");
+        $stmt->execute([$reason, $workerId]);
+        
+        // Log the crash as a critical error
+        self::logError($workerId, null, 'worker_crash', $reason, null, 'critical');
+    }
+    
     public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
         $db = Database::connect();
         
@@ -960,91 +1079,114 @@ class Worker {
     public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
         error_log("processJobImmediately called: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults}");
         
-        $job = Job::getById($jobId);
-        if (!$job) {
-            error_log("processJobImmediately: Job {$jobId} not found");
-            return;
-        }
-        
-        error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
-        
         // Register this worker for tracking
         $workerName = 'worker-' . getmypid() . '-' . time();
         $workerId = self::register($workerName);
-        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
         
-        $apiKey = $job['api_key'];
-        $query = $job['query'];
-        $country = $job['country'];
-        $emailFilter = $job['email_filter'];
-        
-        $processed = 0;
-        $pagesProcessed = 0;
-        $page = (int)($startOffset / 10) + 1;
-        
-        error_log("processJobImmediately: Starting from page {$page}");
-        
-        while ($processed < $maxResults) {
-            error_log("processJobImmediately: Calling searchSerper, page={$page}");
-            $data = self::searchSerper($apiKey, $query, $page, $country);
-            
-            if (!$data) {
-                error_log("processJobImmediately: searchSerper returned null/false");
-                break;
+        try {
+            $job = Job::getById($jobId);
+            if (!$job) {
+                error_log("processJobImmediately: Job {$jobId} not found");
+                self::logError($workerId, $jobId, 'job_not_found', "Job {$jobId} not found", null, 'error');
+                return;
             }
             
-            if (!isset($data['organic'])) {
-                error_log("processJobImmediately: No organic results in response");
-                break;
-            }
+            error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
             
-            error_log("processJobImmediately: Got " . count($data['organic']) . " organic results");
+            self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
             
-            $pagesProcessed++;
-            $emailsBefore = $processed;
+            $apiKey = $job['api_key'];
+            $query = $job['query'];
+            $country = $job['country'];
+            $emailFilter = $job['email_filter'];
             
-            foreach ($data['organic'] as $result) {
-                if ($processed >= $maxResults) {
+            $processed = 0;
+            $pagesProcessed = 0;
+            $page = (int)($startOffset / 10) + 1;
+            
+            error_log("processJobImmediately: Starting from page {$page}");
+            
+            while ($processed < $maxResults) {
+                try {
+                    error_log("processJobImmediately: Calling searchSerper, page={$page}");
+                    $data = self::searchSerper($apiKey, $query, $page, $country);
+                    
+                    if (!$data) {
+                        error_log("processJobImmediately: searchSerper returned null/false");
+                        self::logError($workerId, $jobId, 'api_error', "Search API returned no data for page {$page}", "Query: {$query}, Country: {$country}", 'warning');
+                        break;
+                    }
+                    
+                    if (!isset($data['organic'])) {
+                        error_log("processJobImmediately: No organic results in response");
+                        self::logError($workerId, $jobId, 'no_results', "No organic results in API response for page {$page}", null, 'warning');
+                        break;
+                    }
+                    
+                    error_log("processJobImmediately: Got " . count($data['organic']) . " organic results");
+                    
+                    $pagesProcessed++;
+                    $emailsBefore = $processed;
+                    
+                    foreach ($data['organic'] as $result) {
+                        if ($processed >= $maxResults) {
+                            break;
+                        }
+                        
+                        try {
+                            self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
+                        } catch (Exception $e) {
+                            error_log("Error processing result: " . $e->getMessage());
+                            self::logError($workerId, $jobId, 'processing_error', "Error processing search result", $e->getMessage(), 'warning');
+                        }
+                    }
+                    
+                    $emailsExtractedThisPage = $processed - $emailsBefore;
+                    
+                    // Update worker heartbeat with stats
+                    self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+                    
+                    error_log("processJobImmediately: Processed {$processed} so far");
+                    
+                    if (!isset($data['organic']) || count($data['organic']) === 0) {
+                        break;
+                    }
+                    
+                    $page++;
+                    
+                    // Rate limiting: use configurable setting or default 0.5 seconds
+                    $rateLimit = (float)(Settings::get('rate_limit', '0.5'));
+                    usleep((int)($rateLimit * 1000000));
+                } catch (Exception $e) {
+                    error_log("Error in page processing loop: " . $e->getMessage());
+                    self::logError($workerId, $jobId, 'page_processing_error', "Error processing page {$page}", $e->getMessage(), 'error');
                     break;
                 }
-                
-                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
             }
             
-            $emailsExtractedThisPage = $processed - $emailsBefore;
+            // Update progress
+            $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
             
-            // Update worker heartbeat with stats
-            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+            error_log("processJobImmediately: Completed. Processed {$processed} emails, progress={$progress}%");
             
-            error_log("processJobImmediately: Processed {$processed} so far");
-            
-            if (!isset($data['organic']) || count($data['organic']) === 0) {
-                break;
+            // If this worker has completed its portion and progress is 100%, mark job as completed
+            if ($progress >= 100) {
+                Job::updateStatus($jobId, 'completed', 100);
+                error_log("processJobImmediately: Job {$jobId} marked as completed");
+            } else {
+                Job::updateStatus($jobId, 'running', min($progress, 100));
+                error_log("processJobImmediately: Job {$jobId} progress updated to " . min($progress, 100) . "%");
             }
             
-            $page++;
+            // Mark worker as idle when done
+            self::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
-            // Rate limiting: use configurable setting or default 0.5 seconds
-            $rateLimit = (float)(Settings::get('rate_limit', '0.5'));
-            usleep((int)($rateLimit * 1000000));
+        } catch (Exception $e) {
+            error_log("Critical error in processJobImmediately: " . $e->getMessage());
+            self::logError($workerId, $jobId, 'critical_error', "Critical worker error", $e->getMessage() . "\n" . $e->getTraceAsString(), 'critical');
+            self::updateHeartbeat($workerId, 'stopped', null, 0, 0);
+            throw $e;
         }
-        
-        // Update progress
-        $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
-        
-        error_log("processJobImmediately: Completed. Processed {$processed} emails, progress={$progress}%");
-        
-        // If this worker has completed its portion and progress is 100%, mark job as completed
-        if ($progress >= 100) {
-            Job::updateStatus($jobId, 'completed', 100);
-            error_log("processJobImmediately: Job {$jobId} marked as completed");
-        } else {
-            Job::updateStatus($jobId, 'running', min($progress, 100));
-            error_log("processJobImmediately: Job {$jobId} progress updated to " . min($progress, 100) . "%");
-        }
-        
-        // Mark worker as idle when done
-        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
     }
 }
 
@@ -1143,6 +1285,9 @@ class Router {
                 break;
             case 'start-worker':
                 self::handleStartWorker();
+                break;
+            case 'process-queue-worker':
+                self::handleProcessQueueWorker();
                 break;
             case 'api':
                 self::handleAPI();
@@ -1296,6 +1441,75 @@ class Router {
                 
             case 'jobs':
                 echo json_encode(Job::getAll(Auth::getUserId()));
+                break;
+                
+            case 'worker-errors':
+                $unresolvedOnly = isset($_GET['unresolved_only']) ? (bool)$_GET['unresolved_only'] : true;
+                
+                // Detect and mark stale workers before returning errors
+                $staleWorkers = Worker::detectStaleWorkers(300);
+                foreach ($staleWorkers as $worker) {
+                    Worker::markWorkerAsCrashed($worker['id'], 'Worker has not sent heartbeat for over 5 minutes. Possible crash or timeout.');
+                }
+                
+                echo json_encode(Worker::getErrors($unresolvedOnly));
+                break;
+                
+            case 'job-worker-status':
+                $jobId = (int)($_GET['job_id'] ?? 0);
+                if ($jobId > 0) {
+                    $db = Database::connect();
+                    
+                    // Get job info
+                    $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+                    $stmt->execute([$jobId]);
+                    $job = $stmt->fetch();
+                    
+                    // Get active workers for this job
+                    $stmt = $db->prepare("SELECT * FROM workers WHERE current_job_id = ? AND status = 'running'");
+                    $stmt->execute([$jobId]);
+                    $activeWorkers = $stmt->fetchAll();
+                    
+                    // Get total emails collected
+                    $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
+                    $stmt->execute([$jobId]);
+                    $emailsCollected = $stmt->fetch()['count'];
+                    
+                    // Calculate completion percentage
+                    $maxResults = $job['max_results'] ?? 1;
+                    $completionPercentage = min(100, round(($emailsCollected / $maxResults) * 100, 2));
+                    
+                    // Get recent errors for this job
+                    $stmt = $db->prepare("SELECT * FROM worker_errors WHERE job_id = ? AND resolved = FALSE ORDER BY created_at DESC LIMIT 5");
+                    $stmt->execute([$jobId]);
+                    $recentErrors = $stmt->fetchAll();
+                    
+                    // Detect stale workers
+                    $staleWorkers = Worker::detectStaleWorkers(300);
+                    
+                    echo json_encode([
+                        'job' => $job,
+                        'active_workers' => count($activeWorkers),
+                        'workers' => $activeWorkers,
+                        'emails_collected' => $emailsCollected,
+                        'emails_required' => $maxResults,
+                        'completion_percentage' => $completionPercentage,
+                        'recent_errors' => $recentErrors,
+                        'stale_workers' => $staleWorkers
+                    ]);
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
+            case 'resolve-error':
+                $errorId = (int)($_POST['error_id'] ?? 0);
+                if ($errorId > 0) {
+                    Worker::resolveError($errorId);
+                    echo json_encode(['success' => true]);
+                } else {
+                    echo json_encode(['error' => 'Invalid error ID']);
+                }
                 break;
                 
             default:
@@ -1452,6 +1666,98 @@ class Router {
                 error_log("Worker {$workerName} completed. Processed {$itemsProcessed} items.");
             } catch (Exception $e) {
                 error_log("HTTP Worker {$workerName} error: " . $e->getMessage());
+            }
+        }
+        exit;
+    }
+    
+    private static function handleProcessQueueWorker(): void {
+        // This processes queue items for a specific job
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $jobId = (int)($_POST['job_id'] ?? 0);
+            $workerName = $_POST['worker_name'] ?? 'queue-worker-' . uniqid();
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            
+            if ($jobId <= 0) {
+                exit;
+            }
+            
+            error_log("Queue Worker {$workerName} starting for job {$jobId}...");
+            
+            // Close connection immediately so client doesn't wait
+            ignore_user_abort(true);
+            set_time_limit(0);
+            
+            // Send minimal response
+            $response = json_encode(['status' => 'processing', 'worker' => $workerName, 'job_id' => $jobId]);
+            header('Content-Type: application/json');
+            header('Content-Length: ' . strlen($response));
+            header('Connection: close');
+            echo $response;
+            
+            // Flush all output buffers
+            if (ob_get_level() > 0) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Close the session if it's open
+            if (session_id()) {
+                session_write_close();
+            }
+            
+            // Give time for connection to close
+            usleep(100000); // 0.1 seconds
+            
+            // Now process queue items for this job in background
+            try {
+                error_log("Worker {$workerName} processing queue for job {$jobId}");
+                
+                $workerId = Worker::register($workerName);
+                
+                // Process queue items for this specific job
+                $startTime = time();
+                $maxRuntime = 600; // 10 minutes max per worker
+                $itemsProcessed = 0;
+                
+                while ((time() - $startTime) < $maxRuntime) {
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    
+                    // Get next queue item for this job
+                    $job = Worker::getNextJob();
+                    
+                    // Only process if it's for our job
+                    if ($job && isset($job['id']) && $job['id'] == $jobId) {
+                        Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                        Worker::processJob($job['id']);
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        $itemsProcessed++;
+                        
+                        // Check if all queue items for this job are done
+                        $db = Database::connect();
+                        $stmt = $db->prepare("SELECT COUNT(*) as pending FROM job_queue WHERE job_id = ? AND status = 'pending'");
+                        $stmt->execute([$jobId]);
+                        $pendingCount = $stmt->fetch()['pending'];
+                        
+                        if ($pendingCount == 0) {
+                            error_log("Worker {$workerName}: No more queue items for job {$jobId}. Exiting.");
+                            break;
+                        }
+                    } else {
+                        // No queue items for our job, exit
+                        error_log("Worker {$workerName}: No queue items found for job {$jobId}. Exiting.");
+                        break;
+                    }
+                    
+                    // Small sleep between items
+                    sleep(1);
+                }
+                
+                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} queue items for job {$jobId}.");
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } catch (Exception $e) {
+                error_log("Queue Worker {$workerName} error: " . $e->getMessage());
+                Worker::logError($workerId ?? 0, $jobId, 'worker_error', $e->getMessage(), $e->getTraceAsString(), 'error');
             }
         }
         exit;
@@ -1709,13 +2015,58 @@ class Router {
             }
         }
         
-        // Update job status to pending (workers will pick it up from queue)
-        Job::updateStatus($jobId, 'pending', 0);
+        // Update job status to running so it shows activity
+        Job::updateStatus($jobId, 'running', 0);
         
-        error_log("Created {$workerCount} queue items for job {$jobId}. Auto-spawning workers...");
+        error_log("Created {$workerCount} queue items for job {$jobId}. Spawning workers immediately...");
         
-        // Auto-spawn workers to process the queue immediately
-        self::autoSpawnWorkers($workerCount);
+        // Spawn workers directly to process queue items
+        self::spawnWorkersDirectly($jobId, $workerCount);
+    }
+    
+    private static function spawnWorkersDirectly(int $jobId, int $workerCount): void {
+        // For cPanel and restricted environments, spawn workers via direct HTTP requests
+        // This method processes queue items immediately instead of relying on background processes
+        
+        error_log("Spawning {$workerCount} workers directly for job {$jobId}");
+        
+        // Get the current URL
+        $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
+        $baseUrl = $protocol . '://' . $host . $scriptName;
+        
+        // Spawn workers via async HTTP requests
+        for ($i = 0; $i < $workerCount; $i++) {
+            $workerName = 'worker-' . $jobId . '-' . $i . '-' . time();
+            
+            // Create async HTTP request to trigger worker processing
+            $ch = curl_init($baseUrl . '?page=process-queue-worker');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'job_id' => $jobId,
+                'worker_name' => $workerName,
+                'worker_index' => $i
+            ]));
+            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Very short timeout - just to trigger
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+            curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            
+            // Execute without waiting for full response
+            curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            
+            if ($httpCode > 0) {
+                error_log("Spawned worker {$i} for job {$jobId}: HTTP {$httpCode}");
+            } else {
+                error_log("Warning: Worker {$i} spawn may have failed for job {$jobId}");
+            }
+            
+            // Small delay between spawns to avoid overwhelming the server
+            usleep(50000); // 0.05 seconds
+        }
     }
     
     private static function autoSpawnWorkers(int $workerCount): void {
@@ -2105,6 +2456,11 @@ class Router {
             </div>
             
             <div class="card">
+                <h2>🚨 System Alerts & Errors</h2>
+                <div id="worker-errors-list">Loading...</div>
+            </div>
+            
+            <div class="card">
                 <h2>Start New Worker</h2>
                 <p>To start a worker, run this command in your terminal:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-name</pre>
@@ -2120,6 +2476,70 @@ class Router {
                     if (seconds < 60) return seconds + 's';
                     if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
                     return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
+                }
+                
+                function updateWorkerErrors() {
+                    fetch('?page=api&action=worker-errors&unresolved_only=1')
+                        .then(res => res.json())
+                        .then(errors => {
+                            const container = document.getElementById('worker-errors-list');
+                            
+                            if (errors.length === 0) {
+                                container.innerHTML = '<p class="empty-state" style="padding: 20px;">✓ No unresolved errors. All systems running smoothly!</p>';
+                                return;
+                            }
+                            
+                            let html = '';
+                            errors.forEach(error => {
+                                const severity = error.severity || 'error';
+                                let icon = '⚠️';
+                                let alertClass = 'alert-error';
+                                
+                                if (severity === 'critical') {
+                                    icon = '🚨';
+                                    alertClass = 'alert-critical';
+                                } else if (severity === 'warning') {
+                                    icon = '⚠️';
+                                    alertClass = 'alert-warning';
+                                }
+                                
+                                html += `
+                                    <div class="alert ${alertClass}" style="margin-bottom: 10px;">
+                                        <div style="display: flex; justify-content: space-between; align-items: start;">
+                                            <div style="flex: 1;">
+                                                <strong>${icon} ${error.error_type || 'Error'}</strong><br>
+                                                ${error.error_message || 'Unknown error'}
+                                                ${error.worker_name ? '<br><small>Worker: ' + error.worker_name + '</small>' : ''}
+                                                ${error.job_query ? '<br><small>Job: ' + error.job_query + '</small>' : ''}
+                                                ${error.created_at ? '<br><small>Time: ' + new Date(error.created_at).toLocaleString() + '</small>' : ''}
+                                                ${error.error_details ? '<br><small style="color: #666;">Details: ' + error.error_details + '</small>' : ''}
+                                            </div>
+                                            <button class="btn btn-sm" onclick="resolveWorkerError(${error.id})" style="margin-left: 10px;">Resolve</button>
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                            
+                            container.innerHTML = html;
+                        })
+                        .catch(err => {
+                            console.error('Error fetching worker errors:', err);
+                        });
+                }
+                
+                function resolveWorkerError(errorId) {
+                    fetch('?page=api&action=resolve-error', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'error_id=' + errorId
+                    })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateWorkerErrors();
+                        }
+                    })
+                    .catch(err => console.error('Error resolving error:', err));
                 }
                 
                 function updateWorkerStats() {
@@ -2212,11 +2632,13 @@ class Router {
                 // Initial load
                 updateWorkerStats();
                 updateWorkers();
+                updateWorkerErrors();
                 
                 // Update every 3 seconds
                 setInterval(() => {
                     updateWorkerStats();
                     updateWorkers();
+                    updateWorkerErrors();
                 }, 3000);
             </script>
             <?php
@@ -2278,6 +2700,48 @@ class Router {
                 </div>
             </div>
             
+            <!-- Worker Searcher Status Section -->
+            <div class="card">
+                <h2>⚙️ Worker Searcher Status</h2>
+                
+                <!-- Alerts Section -->
+                <div id="worker-alerts" style="margin-bottom: 20px;"></div>
+                
+                <div class="stats-grid" style="margin-bottom: 20px;">
+                    <div class="stat-card">
+                        <div class="stat-icon">👥</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-active-workers">-</div>
+                            <div class="stat-label">Active Workers</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📧</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-emails-collected">-</div>
+                            <div class="stat-label">Emails Collected</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">🎯</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-emails-required">-</div>
+                            <div class="stat-label">Emails Required</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-completion-percentage">-</div>
+                            <div class="stat-label">Completion %</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Active Workers Details -->
+                <div id="job-workers-details"></div>
+            </div>
+            
             <div class="card">
                 <h2>Extracted Emails</h2>
                 <?php if (empty($results)): ?>
@@ -2306,11 +2770,112 @@ class Router {
             </div>
             
             <script>
+                const jobId = <?php echo $jobId; ?>;
+                
+                function updateJobWorkerStatus() {
+                    fetch(`?page=api&action=job-worker-status&job_id=${jobId}`)
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data.error) {
+                                console.error('Error fetching worker status:', data.error);
+                                return;
+                            }
+                            
+                            // Update stats
+                            document.getElementById('job-active-workers').textContent = data.active_workers || 0;
+                            document.getElementById('job-emails-collected').textContent = data.emails_collected || 0;
+                            document.getElementById('job-emails-required').textContent = data.emails_required || 0;
+                            document.getElementById('job-completion-percentage').textContent = data.completion_percentage + '%';
+                            
+                            // Display alerts for errors
+                            const alertsDiv = document.getElementById('worker-alerts');
+                            if (data.recent_errors && data.recent_errors.length > 0) {
+                                let alertsHtml = '';
+                                data.recent_errors.forEach(error => {
+                                    const severity = error.severity || 'error';
+                                    let icon = '⚠️';
+                                    if (severity === 'critical') icon = '🚨';
+                                    else if (severity === 'warning') icon = '⚠️';
+                                    
+                                    alertsHtml += `
+                                        <div class="alert alert-${severity}" style="margin-bottom: 10px;">
+                                            <div style="display: flex; justify-content: space-between; align-items: start;">
+                                                <div>
+                                                    <strong>${icon} ${error.error_type || 'Error'}</strong><br>
+                                                    ${error.error_message || 'Unknown error'}
+                                                    ${error.worker_name ? '<br><small>Worker: ' + error.worker_name + '</small>' : ''}
+                                                    ${error.created_at ? '<br><small>Time: ' + new Date(error.created_at).toLocaleString() + '</small>' : ''}
+                                                </div>
+                                                <button class="btn btn-sm" onclick="resolveError(${error.id})">Resolve</button>
+                                            </div>
+                                        </div>
+                                    `;
+                                });
+                                alertsDiv.innerHTML = alertsHtml;
+                            } else if (data.stale_workers && data.stale_workers.length > 0) {
+                                let alertsHtml = '<div class="alert alert-warning">⚠️ <strong>Stale Workers Detected</strong><br>';
+                                data.stale_workers.forEach(worker => {
+                                    alertsHtml += `Worker "${worker.worker_name}" has not sent heartbeat recently. It may have crashed.<br>`;
+                                });
+                                alertsHtml += '</div>';
+                                alertsDiv.innerHTML = alertsHtml;
+                            } else {
+                                alertsDiv.innerHTML = '';
+                            }
+                            
+                            // Display active workers details
+                            const workersDiv = document.getElementById('job-workers-details');
+                            if (data.workers && data.workers.length > 0) {
+                                let html = '<h3 style="margin: 20px 0 10px 0;">Active Workers</h3>';
+                                html += '<table class="data-table"><thead><tr><th>Worker</th><th>Pages</th><th>Emails</th><th>Last Heartbeat</th></tr></thead><tbody>';
+                                
+                                data.workers.forEach(worker => {
+                                    const lastHeartbeat = worker.last_heartbeat ? new Date(worker.last_heartbeat).toLocaleString() : 'Never';
+                                    html += `<tr>
+                                        <td><strong>${worker.worker_name}</strong></td>
+                                        <td>${worker.pages_processed || 0}</td>
+                                        <td>${worker.emails_extracted || 0}</td>
+                                        <td>${lastHeartbeat}</td>
+                                    </tr>`;
+                                });
+                                
+                                html += '</tbody></table>';
+                                workersDiv.innerHTML = html;
+                            } else {
+                                workersDiv.innerHTML = '<p style="color: #718096; margin-top: 10px;">No active workers currently processing this job.</p>';
+                            }
+                        })
+                        .catch(err => {
+                            console.error('Error fetching job worker status:', err);
+                        });
+                }
+                
+                function resolveError(errorId) {
+                    fetch('?page=api&action=resolve-error', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'error_id=' + errorId
+                    })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateJobWorkerStatus();
+                        }
+                    })
+                    .catch(err => console.error('Error resolving error:', err));
+                }
+                
+                // Initial load
+                updateJobWorkerStatus();
+                
+                // Update every 3 seconds
+                setInterval(updateJobWorkerStatus, 3000);
+                
                 // Auto-refresh results if job is still running
                 <?php if ($job['status'] === 'running' || $job['status'] === 'pending'): ?>
                 setInterval(function() {
                     location.reload();
-                }, 5000);
+                }, 30000); // Reload every 30 seconds instead of 5
                 <?php endif; ?>
             </script>
             <?php
@@ -2709,6 +3274,19 @@ class Router {
             background: #f0fff4;
             color: #22543d;
             border: 1px solid #9ae6b4;
+        }
+        
+        .alert-warning {
+            background: #fffbeb;
+            color: #b7791f;
+            border: 1px solid #fbd38d;
+        }
+        
+        .alert-critical {
+            background: #fff5f5;
+            color: #c53030;
+            border: 2px solid #e53e3e;
+            font-weight: bold;
         }
         
         /* Empty State */
