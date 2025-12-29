@@ -125,6 +125,14 @@ class Database {
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 ");
             }
+            
+            // Migration: Add worker statistics columns if they don't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM workers LIKE 'pages_processed'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN pages_processed INT DEFAULT 0 AFTER last_heartbeat");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN emails_extracted INT DEFAULT 0 AFTER pages_processed");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN runtime_seconds INT DEFAULT 0 AFTER emails_extracted");
+            }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
             // Don't die on migration errors, just log them
@@ -235,6 +243,9 @@ class Database {
                     current_job_id INT NULL,
                     last_heartbeat TIMESTAMP NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    pages_processed INT DEFAULT 0,
+                    emails_extracted INT DEFAULT 0,
+                    runtime_seconds INT DEFAULT 0,
                     INDEX idx_status (status)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
@@ -596,13 +607,54 @@ class Worker {
         }
     }
     
-    public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null): void {
+    public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
         $db = Database::connect();
-        $stmt = $db->prepare("UPDATE workers SET status = ?, current_job_id = ?, last_heartbeat = NOW() WHERE id = ?");
-        $stmt->execute([$status, $jobId, $workerId]);
+        
+        // Calculate runtime
+        $stmt = $db->prepare("SELECT created_at FROM workers WHERE id = ?");
+        $stmt->execute([$workerId]);
+        $worker = $stmt->fetch();
+        
+        if ($worker) {
+            $createdAt = strtotime($worker['created_at']);
+            $runtimeSeconds = time() - $createdAt;
+            
+            $stmt = $db->prepare("UPDATE workers SET status = ?, current_job_id = ?, last_heartbeat = NOW(), pages_processed = pages_processed + ?, emails_extracted = emails_extracted + ?, runtime_seconds = ? WHERE id = ?");
+            $stmt->execute([$status, $jobId, $pagesProcessed, $emailsExtracted, $runtimeSeconds, $workerId]);
+        }
     }
     
-    public static function getNextJob(): ?array {
+    public static function getStats(): array {
+        $db = Database::connect();
+        
+        // Get active workers count
+        $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE status = 'running'");
+        $activeWorkers = $stmt->fetch()['count'];
+        
+        // Get idle workers count
+        $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE status = 'idle'");
+        $idleWorkers = $stmt->fetch()['count'];
+        
+        // Get total pages processed
+        $stmt = $db->query("SELECT SUM(pages_processed) as total FROM workers");
+        $totalPages = $stmt->fetch()['total'] ?? 0;
+        
+        // Get total emails extracted
+        $stmt = $db->query("SELECT SUM(emails_extracted) as total FROM workers");
+        $totalEmails = $stmt->fetch()['total'] ?? 0;
+        
+        // Get average runtime
+        $stmt = $db->query("SELECT AVG(runtime_seconds) as avg FROM workers WHERE runtime_seconds > 0");
+        $avgRuntime = (int)($stmt->fetch()['avg'] ?? 0);
+        
+        return [
+            'active_workers' => $activeWorkers,
+            'idle_workers' => $idleWorkers,
+            'total_pages' => $totalPages,
+            'total_emails' => $totalEmails,
+            'avg_runtime' => $avgRuntime
+        ];
+    }
         $db = Database::connect();
         
         // Use transaction to prevent race conditions
@@ -681,6 +733,7 @@ class Worker {
         $emailFilter = $job['email_filter'];
         
         $processed = 0;
+        $pagesProcessed = 0;
         $page = 1;
         
         while ($processed < $maxResults) {
@@ -689,6 +742,9 @@ class Worker {
             if (!$data || !isset($data['organic'])) {
                 break;
             }
+            
+            $pagesProcessed++;
+            $emailsBefore = $processed;
             
             foreach ($data['organic'] as $result) {
                 if ($processed >= $maxResults) {
@@ -784,12 +840,18 @@ class Worker {
         
         error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
         
+        // Register this worker for tracking
+        $workerName = 'worker-' . getmypid() . '-' . time();
+        $workerId = self::register($workerName);
+        self::updateHeartbeat($workerId, 'running', $jobId);
+        
         $apiKey = $job['api_key'];
         $query = $job['query'];
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
         $processed = 0;
+        $pagesProcessed = 0;
         $page = (int)($startOffset / 10) + 1;
         
         error_log("processJobImmediately: Starting from page {$page}");
@@ -810,6 +872,9 @@ class Worker {
             
             error_log("processJobImmediately: Got " . count($data['organic']) . " organic results");
             
+            $pagesProcessed++;
+            $emailsBefore = $processed;
+            
             foreach ($data['organic'] as $result) {
                 if ($processed >= $maxResults) {
                     break;
@@ -817,6 +882,11 @@ class Worker {
                 
                 self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
             }
+            
+            $emailsExtractedThisPage = $processed - $emailsBefore;
+            
+            // Update worker heartbeat with stats
+            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
             
             error_log("processJobImmediately: Processed {$processed} so far");
             
@@ -844,6 +914,9 @@ class Worker {
             Job::updateStatus($jobId, 'running', min($progress, 100));
             error_log("processJobImmediately: Job {$jobId} progress updated to " . min($progress, 100) . "%");
         }
+        
+        // Mark worker as idle when done
+        self::updateHeartbeat($workerId, 'idle');
     }
 }
 
@@ -982,14 +1055,14 @@ class Router {
         $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
         
         while (true) {
-            Worker::updateHeartbeat($workerId, 'idle');
+            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
             $job = Worker::getNextJob();
             
             if ($job) {
-                Worker::updateHeartbeat($workerId, 'running', $job['id']);
+                Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                 Worker::processJob($job['id']);
-                Worker::updateHeartbeat($workerId, 'idle');
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             }
             
             sleep($pollingInterval);
@@ -1066,6 +1139,10 @@ class Router {
                 
             case 'workers':
                 echo json_encode(Worker::getAll());
+                break;
+                
+            case 'worker-stats':
+                echo json_encode(Worker::getStats());
                 break;
                 
             case 'jobs':
@@ -1707,9 +1784,61 @@ class Router {
     private static function renderWorkers(): void {
         self::renderLayout('Workers Control', function() {
             ?>
+            <!-- Worker Statistics Dashboard -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="active-workers">-</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">💤</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="idle-workers">-</div>
+                        <div class="stat-label">Idle Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📄</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-pages">-</div>
+                        <div class="stat-label">Pages Processed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-worker-emails">-</div>
+                        <div class="stat-label">Emails Extracted</div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="card">
-                <h2>Active Workers</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h2>Active Workers</h2>
+                    <div class="worker-status-indicator">
+                        <span class="status-dot" id="worker-status-dot"></span>
+                        <span id="worker-status-text">Monitoring...</span>
+                    </div>
+                </div>
                 <div id="workers-list">Loading...</div>
+            </div>
+            
+            <div class="card">
+                <h2>Performance Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">Average Runtime</div>
+                        <div class="metric-value" id="avg-runtime">-</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Last Update</div>
+                        <div class="metric-value" id="last-update">-</div>
+                    </div>
+                </div>
             </div>
             
             <div class="card">
@@ -1718,9 +1847,100 @@ class Router {
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-name</pre>
                 <p>Example:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-1</pre>
+                <p style="margin-top: 15px; color: #718096;">
+                    <strong>Note:</strong> Workers automatically track their performance metrics including pages processed, emails extracted, and runtime.
+                </p>
             </div>
             
+            <style>
+                .worker-status-indicator {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }
+                
+                .status-dot {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 50%;
+                    background: #48bb78;
+                    animation: pulse 2s infinite;
+                }
+                
+                @keyframes pulse {
+                    0%, 100% { opacity: 1; }
+                    50% { opacity: 0.5; }
+                }
+                
+                .metrics-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 20px;
+                }
+                
+                .metric-item {
+                    padding: 15px;
+                    background: #f7fafc;
+                    border-radius: 6px;
+                }
+                
+                .metric-label {
+                    font-size: 13px;
+                    color: #718096;
+                    margin-bottom: 5px;
+                }
+                
+                .metric-value {
+                    font-size: 24px;
+                    font-weight: 700;
+                    color: #2d3748;
+                }
+                
+                .worker-detail {
+                    margin-top: 10px;
+                    padding: 10px;
+                    background: #f7fafc;
+                    border-radius: 4px;
+                    font-size: 13px;
+                    color: #4a5568;
+                }
+            </style>
+            
             <script>
+                function formatRuntime(seconds) {
+                    if (seconds < 60) return seconds + 's';
+                    if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+                    return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
+                }
+                
+                function updateWorkerStats() {
+                    fetch('?page=api&action=worker-stats')
+                        .then(res => res.json())
+                        .then(stats => {
+                            document.getElementById('active-workers').textContent = stats.active_workers;
+                            document.getElementById('idle-workers').textContent = stats.idle_workers;
+                            document.getElementById('total-pages').textContent = stats.total_pages;
+                            document.getElementById('total-worker-emails').textContent = stats.total_emails;
+                            document.getElementById('avg-runtime').textContent = formatRuntime(stats.avg_runtime);
+                            
+                            // Update status indicator
+                            const statusDot = document.getElementById('worker-status-dot');
+                            const statusText = document.getElementById('worker-status-text');
+                            
+                            if (stats.active_workers > 0) {
+                                statusDot.style.background = '#48bb78';
+                                statusText.textContent = stats.active_workers + ' worker(s) active';
+                            } else if (stats.idle_workers > 0) {
+                                statusDot.style.background = '#ecc94b';
+                                statusText.textContent = 'Workers idle';
+                            } else {
+                                statusDot.style.background = '#cbd5e0';
+                                statusText.textContent = 'No workers';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching worker stats:', err));
+                }
+                
                 function updateWorkers() {
                     fetch('?page=api&action=workers')
                         .then(res => res.json())
@@ -1728,31 +1948,48 @@ class Router {
                             const container = document.getElementById('workers-list');
                             
                             if (workers.length === 0) {
-                                container.innerHTML = '<p class="empty-state">No workers running</p>';
+                                container.innerHTML = '<p class="empty-state">No workers registered yet. Start a worker using the command below.</p>';
                                 return;
                             }
                             
-                            let html = '<table class="data-table"><thead><tr><th>Worker</th><th>Status</th><th>Current Job</th><th>Last Heartbeat</th></tr></thead><tbody>';
+                            let html = '<table class="data-table"><thead><tr><th>Worker</th><th>Status</th><th>Current Job</th><th>Pages</th><th>Emails</th><th>Runtime</th><th>Last Heartbeat</th></tr></thead><tbody>';
                             
                             workers.forEach(worker => {
                                 const lastHeartbeat = worker.last_heartbeat ? new Date(worker.last_heartbeat).toLocaleString() : 'Never';
-                                const jobInfo = worker.current_job_id ? '#' + worker.current_job_id : '-';
+                                const jobInfo = worker.current_job_id ? '<a href="?page=results&job_id=' + worker.current_job_id + '">#' + worker.current_job_id + '</a>' : '-';
+                                const runtime = formatRuntime(worker.runtime_seconds || 0);
                                 
                                 html += `<tr>
-                                    <td>${worker.worker_name}</td>
+                                    <td><strong>${worker.worker_name}</strong></td>
                                     <td><span class="status-badge status-${worker.status}">${worker.status}</span></td>
                                     <td>${jobInfo}</td>
+                                    <td>${worker.pages_processed || 0}</td>
+                                    <td>${worker.emails_extracted || 0}</td>
+                                    <td>${runtime}</td>
                                     <td>${lastHeartbeat}</td>
                                 </tr>`;
                             });
                             
                             html += '</tbody></table>';
                             container.innerHTML = html;
+                            
+                            // Update last update time
+                            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                        })
+                        .catch(err => {
+                            console.error('Error fetching workers:', err);
                         });
                 }
                 
+                // Initial load
+                updateWorkerStats();
                 updateWorkers();
-                setInterval(updateWorkers, 3000);
+                
+                // Update every 3 seconds
+                setInterval(() => {
+                    updateWorkerStats();
+                    updateWorkers();
+                }, 3000);
             </script>
             <?php
         });
