@@ -1993,12 +1993,38 @@ class Router {
                 $workerCount = (int)($_POST['worker_count'] ?? 5);
                 
                 if ($jobId > 0) {
-                    // Process workers inline (this may take time)
+                    // Send immediate response, then process in background
+                    ignore_user_abort(true);
+                    set_time_limit(0);
+                    
+                    $response = json_encode(['success' => true, 'message' => 'Workers processing started']);
+                    
+                    header('Content-Type: application/json');
+                    header('Content-Length: ' . strlen($response));
+                    header('Connection: close');
+                    echo $response;
+                    
+                    // Flush all output buffers
+                    if (ob_get_level() > 0) {
+                        ob_end_flush();
+                    }
+                    flush();
+                    
+                    // Close the session if it's open
+                    if (session_id()) {
+                        session_write_close();
+                    }
+                    
+                    // Give time for connection to close
+                    usleep(100000); // 0.1 seconds
+                    
+                    // Now process workers in background
                     try {
+                        error_log("Starting background worker processing for job {$jobId}");
                         self::spawnParallelWorkers($jobId, $workerCount);
-                        echo json_encode(['success' => true, 'message' => 'Workers processing started']);
+                        error_log("Completed background worker processing for job {$jobId}");
                     } catch (Exception $e) {
-                        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                        error_log("Error in background worker processing for job {$jobId}: " . $e->getMessage());
                     }
                 } else {
                     echo json_encode(['error' => 'Invalid job ID']);
