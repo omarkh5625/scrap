@@ -3345,7 +3345,7 @@ class Router {
         // Close connection immediately so UI is not blocked
         if (!headers_sent()) {
             ignore_user_abort(true);
-            set_time_limit(0); // No time limit for background processing
+            set_time_limit(300); // 5 minutes max to prevent runaway processes
             
             // Send response and close connection using FastCGI
             if (function_exists('fastcgi_finish_request')) {
@@ -3368,13 +3368,25 @@ class Router {
             // Process queue items with multiple simulated workers
             $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
             $totalProcessed = 0;
+            $startTime = time();
+            $maxRuntime = 300; // 5 minutes total
             
             for ($workerIndex = 0; $workerIndex < $workerCount; $workerIndex++) {
+                // Check if we've exceeded max runtime
+                if ((time() - $startTime) >= $maxRuntime) {
+                    error_log("processWorkersInBackground: Max runtime reached, stopping");
+                    break;
+                }
+                
                 $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
                 
                 try {
                     $workerId = Worker::register($workerName);
-                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered");
+                    if (!$workerId) {
+                        error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
+                        continue;
+                    }
+                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered with ID {$workerId}");
                     
                     // Each simulated worker processes items from the queue
                     $itemsProcessed = 0;
