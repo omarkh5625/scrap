@@ -3127,14 +3127,32 @@ class Router {
                     .then(response => response.json())
                     .then(data => {
                         if (data.success) {
-                            // Show success message
-                            submitBtn.textContent = '✓ Job Created!';
-                            submitBtn.style.background = '#10b981';
+                            // Show success message inline
+                            const successDiv = document.createElement('div');
+                            successDiv.className = 'alert alert-success';
+                            successDiv.style.marginBottom = '20px';
+                            successDiv.innerHTML = `
+                                <strong>✓ Job #${data.job_id} created successfully!</strong><br>
+                                ${data.worker_count} workers are now processing in the background.<br><br>
+                                <a href="?page=results&job_id=${data.job_id}" class="btn btn-primary" style="margin-right: 10px;">View Job Progress</a>
+                                <a href="?page=workers" class="btn">View All Workers</a>
+                            `;
                             
-                            // Redirect to results page
-                            setTimeout(function() {
-                                window.location.href = '?page=dashboard&job_id=' + data.job_id;
-                            }, 500);
+                            // Insert success message before form
+                            const form = document.getElementById('dashboard-job-form');
+                            form.parentNode.insertBefore(successDiv, form);
+                            
+                            // Scroll to show the message
+                            successDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            
+                            // Reset button and form
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                            submitBtn.style.background = 'white';
+                            form.reset();
+                            
+                            // Auto-remove success message after 10 seconds
+                            setTimeout(() => successDiv.remove(), 10000);
                         } else {
                             // Show error in styled notification
                             const errorDiv = document.createElement('div');
@@ -3792,13 +3810,25 @@ class Router {
                         loadingOverlay.style.display = 'none';
                         
                         if (data.success) {
-                            // Show success alert
-                            alert('✓ Job #' + data.job_id + ' created successfully with ' + data.worker_count + ' workers!\nWorkers are starting in the background...');
+                            // Show success message in alert area instead of alert()
+                            const alertArea = document.getElementById('alert-area');
+                            alertArea.innerHTML = `
+                                <div class="alert alert-success" style="margin-bottom: 20px;">
+                                    <strong>✓ Job #${data.job_id} created successfully!</strong><br>
+                                    ${data.worker_count} workers are now processing in the background.<br><br>
+                                    <a href="?page=results&job_id=${data.job_id}" class="btn btn-primary" style="margin-right: 10px;">View Job Progress</a>
+                                    <a href="?page=dashboard" class="btn">Go to Dashboard</a>
+                                    <a href="?page=workers" class="btn">View All Workers</a>
+                                </div>
+                            `;
                             
-                            // Add small delay (100ms) before redirect to prevent UI hanging
-                            setTimeout(function() {
-                                window.location.href = '?page=results&job_id=' + data.job_id;
-                            }, 100);
+                            // Scroll to top to show the message
+                            window.scrollTo(0, 0);
+                            
+                            // Re-enable and reset the form for creating another job
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                            document.getElementById('job-form').reset();
                         } else {
                             // Show error alert
                             alert('✗ Error: ' + (data.error || 'Unknown error occurred'));
