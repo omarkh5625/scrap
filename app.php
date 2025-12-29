@@ -2245,22 +2245,16 @@ class Router {
                         }
                         flush();
                         
-                        // Close connection to client
+                        // Close connection to client - IMPORTANT: Do this BEFORE any heavy processing
                         if (function_exists('fastcgi_finish_request')) {
                             fastcgi_finish_request();
                         }
                         
-                        // Now spawn workers in background after response sent
-                        ignore_user_abort(true);
-                        set_time_limit(300);
+                        // NOTE: Workers should be started separately (via cron, CLI, or already running)
+                        // Do NOT spawn workers here as it blocks the PHP process
+                        // Queue items are created above, workers will pick them up automatically
                         
-                        try {
-                            self::autoSpawnWorkers($workerCount);
-                        } catch (Exception $e) {
-                            error_log('Worker spawning error for job ' . $jobId . ': ' . $e->getMessage());
-                            // Mark job as failed
-                            Job::updateStatus($jobId, 'failed', 0);
-                        }
+                        error_log("Job {$jobId} created with {$workerCount} queue items. Workers should pick them up automatically.");
                         
                     } catch (Exception $e) {
                         echo json_encode([
@@ -2268,6 +2262,52 @@ class Router {
                             'error' => 'Error creating job: ' . $e->getMessage()
                         ]);
                         error_log('Job creation error: ' . $e->getMessage());
+                    }
+                } else {
+                    echo json_encode(['success' => false, 'error' => 'Invalid request method']);
+                }
+                break;
+                
+            case 'trigger-workers':
+                // Separate endpoint to trigger workers - called asynchronously
+                // This ensures the job creation endpoint returns immediately
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                    $jobId = (int)($_POST['job_id'] ?? 0);
+                    
+                    if ($jobId > 0) {
+                        // Get job to determine worker count
+                        $job = Job::getById($jobId);
+                        if ($job) {
+                            $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            
+                            // Return immediately
+                            echo json_encode(['success' => true, 'message' => 'Workers triggered']);
+                            
+                            // Flush and close connection
+                            if (ob_get_level() > 0) {
+                                ob_end_flush();
+                            }
+                            flush();
+                            
+                            if (function_exists('fastcgi_finish_request')) {
+                                fastcgi_finish_request();
+                            }
+                            
+                            // Now spawn workers (connection already closed)
+                            ignore_user_abort(true);
+                            set_time_limit(0);
+                            
+                            try {
+                                error_log("Triggering {$workerCount} workers for job {$jobId}");
+                                self::autoSpawnWorkers($workerCount);
+                            } catch (Exception $e) {
+                                error_log('Worker spawning error: ' . $e->getMessage());
+                            }
+                        } else {
+                            echo json_encode(['success' => false, 'error' => 'Job not found']);
+                        }
+                    } else {
+                        echo json_encode(['success' => false, 'error' => 'Invalid job ID']);
                     }
                 } else {
                     echo json_encode(['success' => false, 'error' => 'Invalid request method']);
@@ -3127,6 +3167,15 @@ class Router {
                     .then(response => response.json())
                     .then(data => {
                         if (data.success) {
+                            // Trigger workers asynchronously (fire-and-forget)
+                            fetch('?page=api&action=trigger-workers', {
+                                method: 'POST',
+                                body: new URLSearchParams({ job_id: data.job_id }),
+                                keepalive: true
+                            }).catch(error => {
+                                console.error('Worker trigger error (non-blocking):', error);
+                            });
+                            
                             // Show live progress widget (same as New Job page)
                             const progressWidget = document.createElement('div');
                             progressWidget.innerHTML = `
@@ -3873,6 +3922,17 @@ class Router {
                         loadingOverlay.style.display = 'none';
                         
                         if (data.success) {
+                            // Trigger workers asynchronously (fire-and-forget)
+                            // This doesn't block the UI - we don't wait for response
+                            fetch('?page=api&action=trigger-workers', {
+                                method: 'POST',
+                                body: new URLSearchParams({ job_id: data.job_id }),
+                                keepalive: true  // Ensures request completes even if user navigates away
+                            }).catch(error => {
+                                console.error('Worker trigger error (non-blocking):', error);
+                                // Don't show error to user - workers may still start via other means
+                            });
+                            
                             // Show live progress widget
                             const alertArea = document.getElementById('alert-area');
                             alertArea.innerHTML = `
