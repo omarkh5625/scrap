@@ -2147,7 +2147,8 @@ class Router {
                     if ($job) {
                         $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
                     } else {
-                        $workerCount = Worker::calculateOptimalWorkerCount(100); // Default fallback
+                        // Default fallback to at least 1 worker
+                        $workerCount = 1;
                     }
                     
                     // Send immediate response, then process in background
