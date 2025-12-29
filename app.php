@@ -2512,18 +2512,28 @@ class Router {
             }
         }
         
-        // Update job status to running so it shows activity
-        Job::updateStatus($jobId, 'running', 0);
-        
+        // Don't set to running yet - wait for workers to actually start
         error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}. Spawning workers now...");
         
         // Spawn workers directly to process queue items
-        self::spawnWorkersDirectly($jobId, $workerCount);
+        $successCount = self::spawnWorkersDirectly($jobId, $workerCount);
         
-        error_log("✓ Worker spawning completed for job {$jobId}");
+        if ($successCount > 0) {
+            // At least one worker started successfully
+            Job::updateStatus($jobId, 'running', 0);
+            error_log("✓ Worker spawning completed for job {$jobId} - {$successCount}/{$workerCount} workers started");
+        } else {
+            // No workers started - mark job as failed
+            Job::updateStatus($jobId, 'failed', 0);
+            error_log("✗ Worker spawning FAILED for job {$jobId} - no workers could start");
+            
+            // Log error to worker_errors table for UI display
+            $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'spawn_failed', ?, 'critical')");
+            $stmt->execute([$jobId, "Failed to spawn any workers for job {$jobId}. Check server configuration and error logs."]);
+        }
     }
     
-    private static function spawnWorkersDirectly(int $jobId, int $workerCount): void {
+    private static function spawnWorkersDirectly(int $jobId, int $workerCount): int {
         // For cPanel and restricted environments, spawn workers via direct HTTP requests
         // This method processes queue items immediately instead of relying on background processes
         
@@ -2535,51 +2545,82 @@ class Router {
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
+        $successCount = 0;
+        $errors = [];
+        $db = Database::connect();
+        
         // Spawn workers via async HTTP requests
         for ($i = 0; $i < $workerCount; $i++) {
             $workerName = 'worker-' . $jobId . '-' . $i . '-' . time();
             
-            // Create async HTTP request to trigger worker processing
-            $ch = curl_init($baseUrl . '?page=process-queue-worker');
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
-                'job_id' => $jobId,
-                'worker_name' => $workerName,
-                'worker_index' => $i
-            ]));
-            // Increased timeout to allow worker to establish and respond
-            curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-            curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
-            // Don't verify SSL for local connections (worker spawning)
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-            
-            // Execute and wait for initial response
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curlError = curl_error($ch);
-            curl_close($ch);
-            
-            if ($httpCode === 200) {
-                error_log("✓ Successfully spawned worker {$i} for job {$jobId}");
-                $decoded = json_decode($response, true);
-                if ($decoded && isset($decoded['status'])) {
-                    error_log("  Worker response: " . $decoded['status']);
+            try {
+                // Create async HTTP request to trigger worker processing
+                $ch = curl_init($baseUrl . '?page=process-queue-worker');
+                if ($ch === false) {
+                    throw new Exception("Failed to initialize cURL");
                 }
-            } else {
-                error_log("✗ Warning: Worker {$i} spawn failed for job {$jobId} - HTTP {$httpCode}");
-                if ($curlError) {
-                    error_log("  cURL error: {$curlError}");
+                
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                    'job_id' => $jobId,
+                    'worker_name' => $workerName,
+                    'worker_index' => $i
+                ]));
+                // Increased timeout to allow worker to establish and respond
+                curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+                curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+                // Don't verify SSL for local connections (worker spawning)
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+                
+                // Execute and wait for initial response
+                $response = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError = curl_error($ch);
+                curl_close($ch);
+                
+                if ($httpCode === 200) {
+                    $successCount++;
+                    error_log("✓ Successfully spawned worker {$i} for job {$jobId}");
+                    $decoded = json_decode($response, true);
+                    if ($decoded && isset($decoded['status'])) {
+                        error_log("  Worker response: " . $decoded['status']);
+                    }
+                } else {
+                    $errorMsg = "Worker {$i} spawn failed - HTTP {$httpCode}";
+                    if ($curlError) {
+                        $errorMsg .= ": {$curlError}";
+                    }
+                    $errors[] = $errorMsg;
+                    error_log("✗ {$errorMsg}");
+                    
+                    // Log to database for UI display
+                    $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'spawn_error', ?, 'error')");
+                    $stmt->execute([$jobId, $errorMsg]);
                 }
+            } catch (Exception $e) {
+                $errorMsg = "Worker {$i} spawn exception: " . $e->getMessage();
+                $errors[] = $errorMsg;
+                error_log("✗ {$errorMsg}");
+                
+                // Log to database for UI display
+                $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'spawn_exception', ?, 'error')");
+                $stmt->execute([$jobId, $errorMsg]);
             }
             
             // Small delay between spawns to avoid overwhelming the server
             usleep(100000); // 0.1 seconds
         }
         
-        error_log("Finished spawning {$workerCount} workers for job {$jobId}");
+        // Log summary
+        if ($successCount === 0 && !empty($errors)) {
+            $summaryMsg = "All workers failed to spawn. Errors: " . implode("; ", $errors);
+            error_log("✗ CRITICAL: {$summaryMsg}");
+        }
+        
+        return $successCount;
     }
     
     private static function autoSpawnWorkers(int $workerCount): void {
@@ -2666,6 +2707,7 @@ class Router {
         $success = false;
         $jobId = 0;
         $error = null;
+        $warnings = [];
         
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
@@ -2683,7 +2725,29 @@ class Router {
                     // Spawn parallel workers in background immediately
                     self::spawnParallelWorkers($jobId, $workerCount);
                     
-                    $success = true;
+                    // Check if workers actually started
+                    $job = Job::getById($jobId);
+                    if ($job['status'] === 'failed') {
+                        // Workers failed to spawn - get errors
+                        $db = Database::connect();
+                        $stmt = $db->prepare("SELECT error_message FROM worker_errors WHERE job_id = ? ORDER BY created_at DESC LIMIT 5");
+                        $stmt->execute([$jobId]);
+                        $errors = $stmt->fetchAll();
+                        
+                        $errorMessages = [];
+                        foreach ($errors as $err) {
+                            $errorMessages[] = $err['error_message'];
+                        }
+                        
+                        $error = 'Failed to start workers: ' . implode('; ', $errorMessages);
+                    } else if ($job['status'] === 'running') {
+                        // Success - at least one worker started
+                        $success = true;
+                    } else {
+                        // Job created but workers haven't started yet
+                        $warnings[] = 'Job created but workers may take a moment to start. Check the Workers page for status.';
+                        $success = true;
+                    }
                 } else {
                     $error = 'Query and API Key are required';
                 }
@@ -2693,7 +2757,7 @@ class Router {
             }
         }
         
-        self::renderLayout('New Job', function() use ($success, $jobId, $error) {
+        self::renderLayout('New Job', function() use ($success, $jobId, $error, $warnings) {
             ?>
             <?php if ($error): ?>
                 <div class="alert alert-error">
@@ -2701,12 +2765,20 @@ class Router {
                 </div>
             <?php endif; ?>
             
-            <?php if ($success): ?>
+            <?php if (!empty($warnings)): ?>
+                <?php foreach ($warnings as $warning): ?>
+                    <div class="alert alert-warning" style="background: #fef3c7; border-color: #fbbf24; color: #92400e;">
+                        ⚠️ <?php echo htmlspecialchars($warning); ?>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+            
+            <?php if ($success && !$error): ?>
                 <div class="alert alert-success">
-                    ✓ Job #<?php echo $jobId; ?> created and processing started! <?php echo $_POST['worker_count'] ?? 5; ?> workers have been spawned automatically.
+                    ✓ Job #<?php echo $jobId; ?> created and workers started! 
                     <br><a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
                     <a href="?page=dashboard">Go to Dashboard</a> | 
-                    <a href="?page=workers">View Workers</a>
+                    <a href="?page=workers">View Workers & Status</a>
                 </div>
             <?php endif; ?>
             
