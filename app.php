@@ -897,6 +897,9 @@ class Router {
             case 'export':
                 self::handleExport();
                 break;
+            case 'process-worker':
+                self::handleWorkerProcessing();
+                break;
             case 'api':
                 self::handleAPI();
                 break;
@@ -1060,6 +1063,41 @@ class Router {
             echo json_encode($results, JSON_PRETTY_PRINT);
         }
         
+        exit;
+    }
+    
+    private static function handleWorkerProcessing(): void {
+        // This handles async HTTP worker requests (used when exec() is disabled)
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $jobId = (int)($_POST['job_id'] ?? 0);
+            $startOffset = (int)($_POST['start_offset'] ?? 0);
+            $maxResults = (int)($_POST['max_results'] ?? 100);
+            
+            if ($jobId > 0) {
+                // Close connection immediately so client doesn't wait
+                ignore_user_abort(true);
+                set_time_limit(0);
+                
+                // Send minimal response
+                header('Content-Type: application/json');
+                header('Content-Length: ' . ob_get_length());
+                header('Connection: close');
+                echo json_encode(['status' => 'processing']);
+                
+                // Flush output buffers
+                if (ob_get_level() > 0) {
+                    ob_end_flush();
+                }
+                flush();
+                
+                // Now process the job in background
+                try {
+                    Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                } catch (Exception $e) {
+                    error_log("HTTP Worker error for job {$jobId}: " . $e->getMessage());
+                }
+            }
+        }
         exit;
     }
     
@@ -1304,7 +1342,19 @@ class Router {
         // Update job to running status immediately
         Job::updateStatus($jobId, 'running', 0);
         
-        // Spawn background workers
+        // Check if exec() is available
+        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+        
+        if ($execAvailable) {
+            // Method 1: Spawn background PHP processes (preferred)
+            self::spawnWorkersViaExec($jobId, $workerCount, $resultsPerWorker, $maxResults);
+        } else {
+            // Method 2: Use async HTTP requests (fallback for restricted hosting)
+            self::spawnWorkersViaHttp($jobId, $workerCount, $resultsPerWorker, $maxResults);
+        }
+    }
+    
+    private static function spawnWorkersViaExec(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
@@ -1331,6 +1381,38 @@ class Router {
                     // Unix/Linux
                     exec($cmd);
                 }
+            }
+        }
+    }
+    
+    private static function spawnWorkersViaHttp(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
+        // Get the current URL
+        $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
+        $baseUrl = $protocol . '://' . $host . $scriptName;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            $startOffset = $i * $resultsPerWorker;
+            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            
+            if ($workerMaxResults > 0) {
+                // Create async HTTP request to trigger worker
+                $ch = curl_init($baseUrl . '?page=process-worker');
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                    'job_id' => $jobId,
+                    'start_offset' => $startOffset,
+                    'max_results' => $workerMaxResults,
+                    'worker_token' => md5($jobId . $startOffset . 'secret')
+                ]));
+                curl_setopt($ch, CURLOPT_TIMEOUT_MS, 100); // Very short timeout - we don't wait
+                curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+                
+                // Execute async (don't wait for response)
+                curl_exec($ch);
+                curl_close($ch);
             }
         }
     }
