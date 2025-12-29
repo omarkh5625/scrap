@@ -1167,6 +1167,11 @@ class Worker {
     private const WORKER_HEARTBEAT_TIMEOUT = 300; // 5 minutes - consider worker dead if no heartbeat
     private const WORKER_BATCH_SIZE = 50; // Spawn workers in batches to prevent resource spikes
     
+    // Timing constants for worker spawning (configurable for different environments)
+    private const WORKER_SPAWN_DELAY_MS = 5; // Milliseconds between worker spawns within batch (reduced from 10)
+    private const BATCH_DELAY_MS = 100; // Milliseconds between batches
+    private const MAX_BACKGROUND_RUNTIME = 600; // Maximum runtime for background processing (10 minutes)
+    
     /**
      * Calculate optimal worker count based on job size
      * Automatically determines the best number of workers for maximum performance
@@ -1279,14 +1284,22 @@ class Worker {
     /**
      * Clean up old completed/stopped workers to prevent database bloat
      * Important for 300 worker scenarios to keep database performant
+     * Only removes truly inactive workers (stopped status and old idle workers)
      */
     public static function cleanupOldWorkers(int $ageHours = 24): int {
         $db = Database::connect();
         
-        // Delete workers that are idle or stopped and older than specified hours
+        // Delete workers that are stopped or idle for long time and older than specified hours
+        // Idle workers are only deleted if they're old AND haven't sent heartbeat recently
         $stmt = $db->prepare("
             DELETE FROM workers 
-            WHERE status IN ('idle', 'stopped') 
+            WHERE (
+                status = 'stopped' 
+                OR (
+                    status = 'idle' 
+                    AND (last_heartbeat IS NULL OR last_heartbeat < DATE_SUB(NOW(), INTERVAL 1 HOUR))
+                )
+            )
             AND created_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
         ");
         $stmt->execute([$ageHours]);
@@ -2112,8 +2125,10 @@ class Router {
                 break;
                 
             case 'worker-stats':
-                // Periodically clean up old workers to prevent database bloat
-                // Run cleanup every ~10% of requests (probabilistic)
+                // Probabilistic cleanup to prevent database bloat without affecting all requests
+                // Runs approximately 10% of the time (1 in 10 requests)
+                // This approach distributes cleanup overhead across requests
+                // For production with high traffic, consider moving to a dedicated cron job
                 if (rand(1, 10) === 1) {
                     Worker::cleanupOldWorkers(24); // Clean workers older than 24 hours
                 }
@@ -3371,12 +3386,12 @@ class Router {
                 }
                 
                 // Small delay between worker spawns in same batch to prevent fork bomb
-                usleep(10000); // 0.01 seconds = 10ms
+                usleep(self::WORKER_SPAWN_DELAY_MS * 1000); // Convert ms to microseconds
             }
             
             // Small delay between batches to allow workers to initialize
             if ($batch < $batches - 1) {
-                usleep(100000); // 0.1 seconds between batches
+                usleep(self::BATCH_DELAY_MS * 1000); // Convert ms to microseconds
                 error_log("  Batch " . ($batch + 1) . " spawned. Waiting before next batch...");
             }
         }
@@ -3542,18 +3557,18 @@ class Router {
         // Connection should already be closed by caller
         // Just ensure we can continue after user disconnect
         ignore_user_abort(true);
-        set_time_limit(600); // 10 minutes max for large worker counts (increased from 5)
+        set_time_limit(self::MAX_BACKGROUND_RUNTIME); // Configurable timeout (10 minutes by default)
         
         // Now process work in background - user has already received response
         try {
             $db = Database::connect();
             
             // Process queue items with multiple simulated workers in batches
-            $batchSize = Worker::WORKER_BATCH_SIZE; // 50 workers per batch
+            $batchSize = self::WORKER_BATCH_SIZE; // 50 workers per batch
             $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
             $totalProcessed = 0;
             $startTime = time();
-            $maxRuntime = 600; // 10 minutes total for large worker counts
+            $maxRuntime = self::MAX_BACKGROUND_RUNTIME; // Use configurable timeout
             
             // Calculate number of batches
             $batches = (int)ceil($workerCount / $batchSize);
@@ -3645,9 +3660,9 @@ class Router {
                 }
             }
             
-            // Small delay between batches to prevent resource spikes
+            // Small delay between batches to prevent resource spikes (consistent with exec spawning)
             if ($batch < $batches - 1) {
-                usleep(200000); // 0.2 seconds between batches
+                usleep(self::BATCH_DELAY_MS * 1000); // Convert ms to microseconds
                 error_log("processWorkersInBackground: Batch " . ($batch + 1) . " complete. Waiting before next batch...");
             }
         }
