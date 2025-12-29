@@ -739,7 +739,78 @@ class EmailExtractor {
             return false;
         }
         
+        // Get domain for additional checks
+        $domain = self::getDomain($email);
+        
+        // Check against blacklisted/junk domains
+        if (self::isBlacklistedDomain($domain)) {
+            return false;
+        }
+        
+        // Check for placeholder/example emails
+        $localPart = explode('@', $email)[0];
+        $junkPatterns = ['example', 'test', 'noreply', 'no-reply', 'admin@', 'info@', 'contact@', 'support@'];
+        foreach ($junkPatterns as $pattern) {
+            if (stripos($localPart, $pattern) !== false || stripos($email, $pattern) !== false) {
+                return false;
+            }
+        }
+        
         return true;
+    }
+    
+    /**
+     * Check if domain is blacklisted (famous sites, social media, etc.)
+     */
+    public static function isBlacklistedDomain(string $domain): bool {
+        // Famous sites that don't provide value for email extraction
+        $blacklist = [
+            // Social media
+            'facebook.com', 'fb.com', 'twitter.com', 'x.com', 'instagram.com', 
+            'linkedin.com', 'pinterest.com', 'tiktok.com', 'snapchat.com',
+            'reddit.com', 'tumblr.com', 'whatsapp.com', 'telegram.org',
+            
+            // Search engines & tech giants
+            'google.com', 'gmail.com', 'yahoo.com', 'bing.com', 'yandex.com',
+            'amazon.com', 'microsoft.com', 'apple.com', 'cloudflare.com',
+            
+            // Common service providers
+            'wordpress.com', 'wix.com', 'squarespace.com', 'godaddy.com',
+            'namecheap.com', 'hostgator.com', 'bluehost.com',
+            
+            // Email/communication
+            'mailchimp.com', 'sendgrid.com', 'mailgun.com', 'postmarkapp.com',
+            
+            // Video/media platforms
+            'youtube.com', 'vimeo.com', 'dailymotion.com', 'twitch.tv',
+            
+            // E-commerce platforms
+            'ebay.com', 'etsy.com', 'shopify.com', 'alibaba.com',
+            
+            // Common junk/placeholder domains
+            'example.com', 'example.org', 'test.com', 'localhost',
+            'sentry.io', 'gravatar.com', 'github.com', 'gitlab.com',
+            
+            // News/media sites
+            'cnn.com', 'bbc.com', 'nytimes.com', 'forbes.com', 'techcrunch.com',
+            
+            // Government/education (usually not useful for marketing)
+            '.gov', '.edu', 'wikipedia.org', 'wikimedia.org'
+        ];
+        
+        // Check exact match
+        if (in_array($domain, $blacklist)) {
+            return true;
+        }
+        
+        // Check if domain ends with blacklisted TLD
+        foreach (['.gov', '.edu', '.mil'] as $tld) {
+            if (str_ends_with($domain, $tld)) {
+                return true;
+            }
+        }
+        
+        return false;
     }
     
     public static function getDomain(string $email): string {
@@ -1779,13 +1850,12 @@ class Router {
                 self::renderDashboard();
                 break;
             case 'new-job':
-                self::renderNewJob();
-                break;
+            case 'workers':
+                // Redirect old pages to dashboard
+                header('Location: ?page=dashboard');
+                exit;
             case 'settings':
                 self::renderSettings();
-                break;
-            case 'workers':
-                self::renderWorkers();
                 break;
             case 'results':
                 self::renderResults();
@@ -2451,6 +2521,9 @@ class Router {
     }
     
     private static function renderDashboard(): void {
+        $error = null;
+        $success = null;
+        
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             if ($_POST['action'] === 'delete_job') {
                 $jobId = (int)$_POST['job_id'];
@@ -2460,22 +2533,177 @@ class Router {
                 header('Location: ?page=dashboard');
                 exit;
             }
+            
+            // Handle new job creation from Dashboard
+            if ($_POST['action'] === 'create_job') {
+                try {
+                    $query = $_POST['query'] ?? '';
+                    $apiKey = $_POST['api_key'] ?? '';
+                    $maxResults = (int)($_POST['max_results'] ?? 100);
+                    $country = !empty($_POST['country']) ? $_POST['country'] : null;
+                    $emailFilter = $_POST['email_filter'] ?? 'all';
+                    $workerCount = (int)($_POST['worker_count'] ?? 0);
+                    
+                    // Validate worker count is specified
+                    if ($workerCount < 1) {
+                        $error = 'Worker count is required. Please specify how many workers to use (minimum 1).';
+                    } elseif (!$query || !$apiKey) {
+                        $error = 'Query and API Key are required';
+                    } else {
+                        // Create job for immediate processing
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        
+                        // Start job processing with specified workers
+                        self::startJobProcessing($jobId, $workerCount);
+                        
+                        // Redirect to dashboard with job ID
+                        header('Location: ?page=dashboard&job_id=' . $jobId);
+                        exit;
+                    }
+                } catch (Exception $e) {
+                    $error = 'Error creating job: ' . $e->getMessage();
+                    error_log('Job creation error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+                }
+            }
         }
         
         $jobs = Job::getAll(Auth::getUserId());
         $newJobId = (int)($_GET['job_id'] ?? 0); // Check if redirected from job creation
         
-        self::renderLayout('Dashboard', function() use ($jobs, $newJobId) {
+        self::renderLayout('Dashboard', function() use ($jobs, $newJobId, $error, $success) {
             ?>
+            <?php if ($error): ?>
+                <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
+            <?php endif; ?>
+            
+            <?php if ($success): ?>
+                <div class="alert alert-success"><?php echo htmlspecialchars($success); ?></div>
+            <?php endif; ?>
+            
+            <!-- New Job Creation Card -->
+            <div class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
+                <h2 style="color: white; margin-top: 0;">✨ Create New Email Extraction Job</h2>
+                
+                <!-- Query Templates -->
+                <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                    <h3 style="color: white; margin: 0 0 10px 0; font-size: 16px;">💡 High-Yield Query Templates</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='real estate agents'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🏘️ Real Estate Agents
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='dentists near me'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🦷 Dentists
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='lawyers attorney'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            ⚖️ Lawyers
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='restaurants contact'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🍽️ Restaurants
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='plumbers contact email'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🔧 Plumbers
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='marketing agencies'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            📢 Marketing Agencies
+                        </button>
+                    </div>
+                    <small style="display: block; margin-top: 8px; color: rgba(255,255,255,0.8); font-size: 12px;">
+                        💡 Tip: Add location terms like "california" or "new york" for better targeting
+                    </small>
+                </div>
+                
+                <form method="POST" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
+                    <input type="hidden" name="action" value="create_job">
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Search Query *</label>
+                            <input type="text" name="query" placeholder="e.g., real estate agents california" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Use specific industry + location for best results</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Serper.dev API Key *</label>
+                            <input type="text" name="api_key" placeholder="Your API key" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Get free key at <a href="https://serper.dev" target="_blank" style="color: white;">serper.dev</a></small>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Target Emails *</label>
+                            <input type="number" name="max_results" value="1000" min="1" max="100000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Recommended: 1000-10000 for quality</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Workers * 🚀</label>
+                            <input type="number" name="worker_count" value="20" min="1" max="1000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">20-50 workers = 100k emails in ~3 min</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Email Filter</label>
+                            <select name="email_filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                                <option value="all">All Types</option>
+                                <option value="business" selected>Business Only (Recommended)</option>
+                                <option value="gmail">Gmail Only</option>
+                                <option value="yahoo">Yahoo Only</option>
+                            </select>
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Business emails have higher value</small>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-bottom: 15px;">
+                        <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
+                        <select name="country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <option value="">All Countries</option>
+                            <option value="us">🇺🇸 United States</option>
+                            <option value="uk">🇬🇧 United Kingdom</option>
+                            <option value="ca">🇨🇦 Canada</option>
+                            <option value="au">🇦🇺 Australia</option>
+                            <option value="de">🇩🇪 Germany</option>
+                            <option value="fr">🇫🇷 France</option>
+                        </select>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-large" 
+                            style="background: white; color: #667eea; font-weight: 600; width: 100%; padding: 15px;">
+                        🚀 Start Extraction
+                    </button>
+                </form>
+                
+                <!-- Performance Tips -->
+                <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
+                    <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
+                        <li>Use 20-50 workers for fastest extraction (100k emails in ~3 minutes)</li>
+                        <li>Business email filter removes junk and social media emails</li>
+                        <li>Specific queries (industry + location) yield better quality emails</li>
+                        <li>System automatically filters famous sites and placeholder emails</li>
+                    </ul>
+                </div>
+            </div>
+            
             <?php if ($newJobId > 0): ?>
                 <!-- Job Progress Widget -->
-                <div id="job-progress-widget" class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
+                <div id="job-progress-widget" class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
                     <h2 style="color: white; margin-top: 0;">📊 Job Processing</h2>
                     <div id="progress-content" style="font-size: 14px;">
                         <p>🔄 Starting workers...</p>
                     </div>
                     <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
-                        <div id="progress-bar" style="background: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                        <div id="progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
                             <span id="progress-text">0%</span>
                         </div>
                     </div>
@@ -2498,10 +2726,35 @@ class Router {
                         </div>
                     </div>
                     <div style="margin-top: 15px; text-align: right;">
-                        <a href="?page=results&job_id=<?php echo $newJobId; ?>" style="color: white; text-decoration: underline;">View Results</a>
+                        <a href="?page=results&job_id=<?php echo $newJobId; ?>" style="color: white; text-decoration: underline;">View Full Results</a>
                     </div>
                 </div>
             <?php endif; ?>
+            
+            <!-- Worker Statistics -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="active-workers">-</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="worker-emails">-</div>
+                        <div class="stat-label">Worker Emails Extracted</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚡</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="extraction-rate">-</div>
+                        <div class="stat-label">Emails/Min</div>
+                    </div>
+                </div>
+            </div>
             
             <div class="stats-grid">
                 <div class="stat-card">
@@ -2592,10 +2845,26 @@ class Router {
                             document.getElementById('completed-jobs').textContent = data.completedJobs;
                             document.getElementById('total-results').textContent = data.totalResults;
                         });
+                    
+                    // Update worker statistics
+                    fetch('?page=api&action=worker-stats')
+                        .then(res => res.json())
+                        .then(stats => {
+                            document.getElementById('active-workers').textContent = stats.active_workers || 0;
+                            document.getElementById('worker-emails').textContent = stats.total_emails || 0;
+                            
+                            // Display extraction rate
+                            if (stats.emails_per_minute > 0) {
+                                document.getElementById('extraction-rate').textContent = stats.emails_per_minute;
+                            } else {
+                                document.getElementById('extraction-rate').textContent = '-';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching worker stats:', err));
                 }
                 
                 updateStats();
-                setInterval(updateStats, 5000);
+                setInterval(updateStats, 3000); // Update every 3 seconds for real-time feeling
                 
                 // Job progress widget logic
                 <?php if ($newJobId > 0): ?>
@@ -3704,12 +3973,6 @@ class Router {
                 <nav class="nav">
                     <a href="?page=dashboard" class="nav-item <?php echo ($_GET['page'] ?? 'dashboard') === 'dashboard' ? 'active' : ''; ?>">
                         📊 Dashboard
-                    </a>
-                    <a href="?page=new-job" class="nav-item <?php echo ($_GET['page'] ?? '') === 'new-job' ? 'active' : ''; ?>">
-                        ➕ New Email Job
-                    </a>
-                    <a href="?page=workers" class="nav-item <?php echo ($_GET['page'] ?? '') === 'workers' ? 'active' : ''; ?>">
-                        👥 Workers
                     </a>
                     <a href="?page=settings" class="nav-item <?php echo ($_GET['page'] ?? '') === 'settings' ? 'active' : ''; ?>">
                         🔧 Settings
