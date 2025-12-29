@@ -1162,7 +1162,7 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 100; // Maximum workers to spawn automatically for maximum performance
+    private const AUTO_MAX_WORKERS = 300; // Maximum workers to spawn automatically for maximum performance
     private const OPTIMAL_RESULTS_PER_WORKER = 100; // Optimal number of results per worker for best performance
     
     /**
@@ -2207,6 +2207,113 @@ class Router {
                 }
                 break;
                 
+            case 'create-job':
+                // AJAX endpoint to create job and return immediately
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                    try {
+                        $query = $_POST['query'] ?? '';
+                        $apiKey = $_POST['api_key'] ?? '';
+                        $maxResults = (int)($_POST['max_results'] ?? 100);
+                        $country = !empty($_POST['country']) ? $_POST['country'] : null;
+                        $emailFilter = $_POST['email_filter'] ?? 'all';
+                        
+                        if (empty($query) || empty($apiKey)) {
+                            echo json_encode(['success' => false, 'error' => 'Query and API Key are required']);
+                            break;
+                        }
+                        
+                        // Calculate optimal worker count (up to 300)
+                        $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
+                        
+                        // Create job
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        
+                        // Create queue items
+                        self::createQueueItems($jobId, $workerCount);
+                        
+                        // Return success immediately
+                        echo json_encode([
+                            'success' => true,
+                            'job_id' => $jobId,
+                            'worker_count' => $workerCount,
+                            'message' => "Job created with {$workerCount} workers"
+                        ]);
+                        
+                        // Flush response to client
+                        if (ob_get_level() > 0) {
+                            ob_end_flush();
+                        }
+                        flush();
+                        
+                        // Close connection to client - IMPORTANT: Do this BEFORE any heavy processing
+                        if (function_exists('fastcgi_finish_request')) {
+                            fastcgi_finish_request();
+                        }
+                        
+                        // NOTE: Workers should be started separately (via cron, CLI, or already running)
+                        // Do NOT spawn workers here as it blocks the PHP process
+                        // Queue items are created above, workers will pick them up automatically
+                        
+                        error_log("Job {$jobId} created with {$workerCount} queue items. Workers should pick them up automatically.");
+                        
+                    } catch (Exception $e) {
+                        echo json_encode([
+                            'success' => false,
+                            'error' => 'Error creating job: ' . $e->getMessage()
+                        ]);
+                        error_log('Job creation error: ' . $e->getMessage());
+                    }
+                } else {
+                    echo json_encode(['success' => false, 'error' => 'Invalid request method']);
+                }
+                break;
+                
+            case 'trigger-workers':
+                // Separate endpoint to trigger workers - called asynchronously
+                // This ensures the job creation endpoint returns immediately
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                    $jobId = (int)($_POST['job_id'] ?? 0);
+                    
+                    if ($jobId > 0) {
+                        // Get job to determine worker count
+                        $job = Job::getById($jobId);
+                        if ($job) {
+                            $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            
+                            // Return immediately
+                            echo json_encode(['success' => true, 'message' => 'Workers triggered']);
+                            
+                            // Flush and close connection
+                            if (ob_get_level() > 0) {
+                                ob_end_flush();
+                            }
+                            flush();
+                            
+                            if (function_exists('fastcgi_finish_request')) {
+                                fastcgi_finish_request();
+                            }
+                            
+                            // Now spawn workers (connection already closed)
+                            ignore_user_abort(true);
+                            set_time_limit(0);
+                            
+                            try {
+                                error_log("Triggering {$workerCount} workers for job {$jobId}");
+                                self::autoSpawnWorkers($workerCount);
+                            } catch (Exception $e) {
+                                error_log('Worker spawning error: ' . $e->getMessage());
+                            }
+                        } else {
+                            echo json_encode(['success' => false, 'error' => 'Job not found']);
+                        }
+                    } else {
+                        echo json_encode(['success' => false, 'error' => 'Invalid job ID']);
+                    }
+                } else {
+                    echo json_encode(['success' => false, 'error' => 'Invalid request method']);
+                }
+                break;
+                
             default:
                 echo json_encode(['error' => 'Unknown action']);
         }
@@ -2695,27 +2802,27 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 16px;">💡 High-Yield Query Templates</h3>
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='real estate agents'" 
+                        <button type="button" class="query-template" data-query="real estate agents" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🏘️ Real Estate Agents
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='dentists near me'" 
+                        <button type="button" class="query-template" data-query="dentists near me" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🦷 Dentists
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='lawyers attorney'" 
+                        <button type="button" class="query-template" data-query="lawyers attorney" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             ⚖️ Lawyers
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='restaurants contact'" 
+                        <button type="button" class="query-template" data-query="restaurants contact" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🍽️ Restaurants
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='plumbers contact email'" 
+                        <button type="button" class="query-template" data-query="plumbers contact email" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🔧 Plumbers
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='marketing agencies'" 
+                        <button type="button" class="query-template" data-query="marketing agencies" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             📢 Marketing Agencies
                         </button>
@@ -2725,20 +2832,18 @@ class Router {
                     </small>
                 </div>
                 
-                <form method="POST" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
-                    <input type="hidden" name="action" value="create_job">
-                    
+                <form id="dashboard-job-form" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Search Query *</label>
-                            <input type="text" name="query" placeholder="e.g., real estate agents california" required 
+                            <input type="text" name="query" id="dashboard-query" placeholder="e.g., real estate agents california" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Use specific industry + location for best results</small>
                         </div>
                         
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Serper.dev API Key *</label>
-                            <input type="text" name="api_key" placeholder="Your API key" required 
+                            <input type="text" name="api_key" id="dashboard-api-key" placeholder="Your API key" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Get free key at <a href="https://serper.dev" target="_blank" style="color: white;">serper.dev</a></small>
                         </div>
@@ -2747,14 +2852,14 @@ class Router {
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Target Emails *</label>
-                            <input type="number" name="max_results" value="1000" min="1" max="100000" required 
+                            <input type="number" name="max_results" id="dashboard-max-results" value="1000" min="1" max="100000" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Recommended: 1000-10000 for quality</small>
                         </div>
                         
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Email Filter</label>
-                            <select name="email_filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <select name="email_filter" id="dashboard-email-filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                                 <option value="all">All Types</option>
                                 <option value="business" selected>Business Only (Recommended)</option>
                                 <option value="gmail">Gmail Only</option>
@@ -2766,7 +2871,7 @@ class Router {
                     
                     <div style="margin-bottom: 15px;">
                         <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
-                        <select name="country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                        <select name="country" id="dashboard-country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <option value="">All Countries</option>
                             <option value="us">🇺🇸 United States</option>
                             <option value="uk">🇬🇧 United Kingdom</option>
@@ -2777,7 +2882,7 @@ class Router {
                         </select>
                     </div>
                     
-                    <button type="submit" class="btn btn-large" 
+                    <button type="submit" id="dashboard-submit-btn" class="btn btn-large" 
                             style="background: white; color: #667eea; font-weight: 600; width: 100%; padding: 15px;">
                         🚀 Start Extraction
                     </button>
@@ -2787,7 +2892,7 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
                     <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
-                        <li>🚀 Workers spawn automatically based on job size (up to 100 workers for maximum speed)</li>
+                        <li>🚀 Workers spawn automatically based on job size (up to 300 workers for maximum speed)</li>
                         <li>Business email filter removes junk and social media emails</li>
                         <li>Specific queries (industry + location) yield better quality emails</li>
                         <li>System automatically filters famous sites and placeholder emails</li>
@@ -2940,6 +3045,15 @@ class Router {
             </div>
             
             <script>
+                // Query template buttons event delegation
+                document.addEventListener('DOMContentLoaded', function() {
+                    document.querySelectorAll('.query-template').forEach(function(btn) {
+                        btn.addEventListener('click', function() {
+                            document.getElementById('dashboard-query').value = this.dataset.query;
+                        });
+                    });
+                });
+                
                 function updateStats() {
                     fetch('?page=api&action=stats')
                         .then(res => res.json())
@@ -3032,6 +3146,165 @@ class Router {
                 updateJobProgress();
                 progressInterval = setInterval(updateJobProgress, 3000); // Update every 3 seconds
                 <?php endif; ?>
+                
+                // Dashboard form AJAX submission
+                document.getElementById('dashboard-job-form').addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    
+                    // Get form data
+                    const formData = new FormData(this);
+                    
+                    // Disable submit button
+                    const submitBtn = document.getElementById('dashboard-submit-btn');
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = '⏳ Creating Job...';
+                    
+                    // Send AJAX request
+                    fetch('?page=api&action=create-job', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            // Trigger workers asynchronously (fire-and-forget)
+                            fetch('?page=api&action=trigger-workers', {
+                                method: 'POST',
+                                body: new URLSearchParams({ job_id: data.job_id }),
+                                keepalive: true
+                            }).catch(error => {
+                                console.error('Worker trigger error (non-blocking):', error);
+                            });
+                            
+                            // Show live progress widget (same as New Job page)
+                            const progressWidget = document.createElement('div');
+                            progressWidget.innerHTML = `
+                                <div class="alert alert-success" style="margin-bottom: 20px;">
+                                    <strong>✓ Job #${data.job_id} created successfully with ${data.worker_count} workers!</strong>
+                                </div>
+                                <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                                    <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
+                                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                                        <div id="dashboard-progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                                            <span id="dashboard-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-emails-collected">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-emails-target">Loading...</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-active-workers">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-job-status">starting</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top: 15px; text-align: right;">
+                                        <a href="?page=results&job_id=${data.job_id}" class="btn" style="background: white; color: #10b981; margin-right: 10px;">View Full Results</a>
+                                        <a href="?page=workers" class="btn" style="background: rgba(255,255,255,0.2); color: white;">View Workers</a>
+                                    </div>
+                                </div>
+                            `;
+                            
+                            // Insert progress widget before form
+                            const form = document.getElementById('dashboard-job-form');
+                            form.parentNode.insertBefore(progressWidget, form);
+                            
+                            // Scroll to show the widget
+                            progressWidget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            
+                            // Start live updates (efficient polling)
+                            let updateCount = 0;
+                            const maxUpdates = 200;
+                            
+                            function updateDashboardProgress() {
+                                if (updateCount++ >= maxUpdates) return;
+                                
+                                fetch('?page=api&action=job-worker-status&job_id=' + data.job_id)
+                                    .then(response => response.json())
+                                    .then(status => {
+                                        if (status.error) return;
+                                        
+                                        const percentage = status.completion_percentage || 0;
+                                        const collected = status.emails_collected || 0;
+                                        const target = status.emails_required || 0;
+                                        const workers = status.active_workers || 0;
+                                        const jobStatus = status.job ? status.job.status : 'running';
+                                        
+                                        document.getElementById('dashboard-progress-bar').style.width = percentage + '%';
+                                        document.getElementById('dashboard-progress-text').textContent = percentage + '%';
+                                        document.getElementById('dashboard-emails-collected').textContent = collected;
+                                        document.getElementById('dashboard-emails-target').textContent = target;
+                                        document.getElementById('dashboard-active-workers').textContent = workers;
+                                        document.getElementById('dashboard-job-status').textContent = jobStatus;
+                                        
+                                        if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+                                            setTimeout(updateDashboardProgress, 3000);
+                                        } else if (jobStatus === 'completed') {
+                                            document.getElementById('dashboard-job-status').textContent = '✅ Completed';
+                                        }
+                                    })
+                                    .catch(error => {
+                                        console.error('Progress update error:', error);
+                                        setTimeout(updateDashboardProgress, 5000);
+                                    });
+                            }
+                            
+                            setTimeout(updateDashboardProgress, 1000);
+                            
+                            // Reset button and form
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                            submitBtn.style.background = 'white';
+                            form.reset();
+                        } else {
+                            // Show error in styled notification
+                            const errorDiv = document.createElement('div');
+                            errorDiv.className = 'alert alert-error';
+                            errorDiv.style.marginBottom = '20px';
+                            errorDiv.innerHTML = '<strong>✗ Error:</strong><br>' + (data.error || 'Unknown error occurred');
+                            
+                            // Insert error before form
+                            const form = document.getElementById('dashboard-job-form');
+                            form.parentNode.insertBefore(errorDiv, form);
+                            
+                            // Auto-remove after 5 seconds
+                            setTimeout(() => errorDiv.remove(), 5000);
+                            
+                            // Re-enable submit button
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                        }
+                    })
+                    .catch(error => {
+                        // Show error in styled notification
+                        const errorDiv = document.createElement('div');
+                        errorDiv.className = 'alert alert-error';
+                        errorDiv.style.marginBottom = '20px';
+                        errorDiv.innerHTML = '<strong>✗ Error:</strong><br>Failed to create job: ' + error.message;
+                        
+                        // Insert error before form
+                        const form = document.getElementById('dashboard-job-form');
+                        form.parentNode.insertBefore(errorDiv, form);
+                        
+                        // Auto-remove after 5 seconds
+                        setTimeout(() => errorDiv.remove(), 5000);
+                        
+                        // Re-enable submit button
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = '🚀 Start Extraction';
+                        
+                        console.error('Error creating job:', error);
+                    });
+                });
             </script>
             <?php
         });
@@ -3510,110 +3783,51 @@ class Router {
     }
     
     private static function renderNewJob(): void {
-        $success = false;
-        $jobId = 0;
-        $error = null;
-        $warnings = [];
-        
-        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
-            try {
-                $query = $_POST['query'] ?? '';
-                $apiKey = $_POST['api_key'] ?? '';
-                $maxResults = (int)($_POST['max_results'] ?? 100);
-                $country = !empty($_POST['country']) ? $_POST['country'] : null;
-                $emailFilter = $_POST['email_filter'] ?? 'all';
-                
-                // Automatically calculate optimal worker count based on job size
-                $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
-                
-                if ($query && $apiKey) {
-                    // Create job for immediate processing
-                    $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
-                    
-                    // Prepare queue items but DON'T spawn workers yet
-                    self::createQueueItems($jobId, $workerCount);
-                    
-                    // Send redirect response immediately (don't block UI)
-                    header('Location: ?page=dashboard&job_id=' . $jobId);
-                    
-                    // Close connection to user BEFORE spawning workers
-                    if (function_exists('fastcgi_finish_request')) {
-                        fastcgi_finish_request();
-                    } else {
-                        if (ob_get_level() > 0) {
-                            ob_end_flush();
-                        }
-                        flush();
-                    }
-                    
-                    // Now spawn workers in background after response sent
-                    ignore_user_abort(true);
-                    set_time_limit(300);
-                    self::autoSpawnWorkers($workerCount);
-                    
-                    exit;
-                } else {
-                    $error = 'Query and API Key are required';
-                }
-            } catch (Exception $e) {
-                $error = 'Error creating job: ' . $e->getMessage();
-                error_log('Job creation error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
-            }
-        }
-        
-        self::renderLayout('New Job', function() use ($success, $jobId, $error, $warnings) {
+        self::renderLayout('New Job', function() {
             ?>
-            <?php if ($error): ?>
-                <div class="alert alert-error" style="white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px;">
-                    <strong style="font-size: 14px;">✗ Error:</strong><br>
-                    <?php echo htmlspecialchars($error); ?>
-                </div>
-            <?php endif; ?>
+            <!-- Alert area for messages -->
+            <div id="alert-area"></div>
             
-            <?php if (!empty($warnings)): ?>
-                <?php foreach ($warnings as $warning): ?>
-                    <div class="alert alert-warning" style="background: #fef3c7; border-color: #fbbf24; color: #92400e;">
-                        ⚠️ <?php echo htmlspecialchars($warning); ?>
+            <!-- Loading overlay -->
+            <div id="loading-overlay" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 9999; align-items: center; justify-content: center;">
+                <div style="background: white; padding: 40px; border-radius: 12px; text-align: center; max-width: 500px;">
+                    <div class="spinner" style="width: 50px; height: 50px; border: 4px solid #f3f3f3; border-top: 4px solid #3182ce; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 20px;"></div>
+                    <h2 id="loading-title">🚀 Creating Job...</h2>
+                    <p id="loading-message" style="color: #4a5568; margin-top: 10px;">Please wait while we set up your extraction job...</p>
+                    <div id="loading-progress" style="margin-top: 20px; display: none;">
+                        <p style="font-weight: 600; color: #2d3748;"><span id="worker-count-display">0</span> workers ready</p>
+                        <p style="color: #4a5568; font-size: 14px;">Workers are starting in the background...</p>
                     </div>
-                <?php endforeach; ?>
-            <?php endif; ?>
-            
-            <?php if ($success && !$error): ?>
-                <div class="alert alert-success">
-                    ✓ Job #<?php echo $jobId; ?> created and workers started! 
-                    <br><a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
-                    <a href="?page=dashboard">Go to Dashboard</a> | 
-                    <a href="?page=workers">View Workers & Status</a>
                 </div>
-            <?php endif; ?>
+            </div>
             
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Workers spawn automatically at maximum capacity based on your job size! Results appear in real-time.
+                    ⚡ Workers spawn automatically at maximum capacity (up to 300 workers) based on your job size! Results appear in real-time.
                 </p>
-                <form method="POST">
+                <form id="job-form">
                     <div class="form-group">
                         <label>Search Query *</label>
-                        <input type="text" name="query" placeholder="e.g., real estate agents california" required>
+                        <input type="text" name="query" id="query" placeholder="e.g., real estate agents california" required>
                         <small>Enter search terms to find pages containing emails</small>
                     </div>
                     
                     <div class="form-group">
                         <label>Serper.dev API Key *</label>
-                        <input type="text" name="api_key" placeholder="Your API key from serper.dev" required>
+                        <input type="text" name="api_key" id="api_key" placeholder="Your API key from serper.dev" required>
                         <small>Get your API key from <a href="https://serper.dev" target="_blank">serper.dev</a></small>
                     </div>
                     
                     <div class="form-group">
                         <label>Maximum Emails</label>
-                        <input type="number" name="max_results" value="100" min="1" max="100000">
+                        <input type="number" name="max_results" id="max_results" value="100" min="1" max="100000">
                         <small>Target number of emails to extract (1-100,000)</small>
                     </div>
                     
                     <div class="form-group">
                         <label>Country Target (Optional)</label>
-                        <select name="country">
+                        <select name="country" id="country">
                             <option value="">All Countries</option>
                             <option value="us">United States</option>
                             <option value="uk">United Kingdom</option>
@@ -3633,7 +3847,7 @@ class Router {
                     
                     <div class="form-group">
                         <label>Email Type Filter</label>
-                        <select name="email_filter">
+                        <select name="email_filter" id="email_filter">
                             <option value="all">All Email Types</option>
                             <option value="gmail">Gmail Only</option>
                             <option value="yahoo">Yahoo Only</option>
@@ -3642,7 +3856,7 @@ class Router {
                         <small>Filter extracted emails by domain type</small>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">🚀 Start Extraction</button>
+                    <button type="submit" class="btn btn-primary" id="submit-btn">🚀 Start Extraction</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
@@ -3651,7 +3865,7 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>System automatically calculates and spawns optimal number of workers (up to 100)</li>
+                    <li>System automatically calculates and spawns optimal number of workers (up to 300)</li>
                     <li>Job is split into chunks for parallel processing</li>
                     <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously</li>
                     <li>Emails are extracted and validated in batches</li>
@@ -3662,17 +3876,179 @@ class Router {
                     <strong>⚡ Performance Optimizations:</strong>
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
-                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size</li>
-                    <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections with curl_multi</li>
+                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size (up to 300 workers)</li>
+                    <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections per worker with curl_multi</li>
                     <li><strong>Batch Processing:</strong> URLs scraped in parallel, emails inserted in bulk</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support for faster requests</li>
                     <li><strong>Memory Caching:</strong> BloomFilter cache reduces database queries by ~90%</li>
                     <li><strong>Optimized Rate Limiting:</strong> 0.1s default with parallel processing</li>
                 </ul>
                 <p style="margin-top: 15px;">
-                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity when you click "🚀 Start Extraction". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity (up to 300) when you click "🚀 Start Extraction". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
                 </p>
             </div>
+            
+            <style>
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+            </style>
+            
+            <script>
+                document.getElementById('job-form').addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    
+                    // Get form data
+                    const formData = new FormData(this);
+                    
+                    // Show loading overlay
+                    const loadingOverlay = document.getElementById('loading-overlay');
+                    loadingOverlay.style.display = 'flex';
+                    
+                    // Disable submit button
+                    const submitBtn = document.getElementById('submit-btn');
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = '⏳ Creating...';
+                    
+                    // Send AJAX request
+                    fetch('?page=api&action=create-job', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        // Hide loading overlay immediately
+                        loadingOverlay.style.display = 'none';
+                        
+                        if (data.success) {
+                            // Trigger workers asynchronously (fire-and-forget)
+                            // This doesn't block the UI - we don't wait for response
+                            fetch('?page=api&action=trigger-workers', {
+                                method: 'POST',
+                                body: new URLSearchParams({ job_id: data.job_id }),
+                                keepalive: true  // Ensures request completes even if user navigates away
+                            }).catch(error => {
+                                console.error('Worker trigger error (non-blocking):', error);
+                                // Don't show error to user - workers may still start via other means
+                            });
+                            
+                            // Show live progress widget
+                            const alertArea = document.getElementById('alert-area');
+                            alertArea.innerHTML = `
+                                <div class="alert alert-success" style="margin-bottom: 20px;">
+                                    <strong>✓ Job #${data.job_id} created successfully with ${data.worker_count} workers!</strong>
+                                </div>
+                                <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                                    <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
+                                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                                        <div id="live-progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                                            <span id="live-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-emails-collected">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-emails-target">${data.job_id ? 'Loading...' : '-'}</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-active-workers">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-job-status">starting</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top: 15px; text-align: right;">
+                                        <a href="?page=results&job_id=${data.job_id}" class="btn" style="background: white; color: #10b981; margin-right: 10px;">View Full Results</a>
+                                        <a href="?page=workers" class="btn" style="background: rgba(255,255,255,0.2); color: white;">View Workers</a>
+                                    </div>
+                                </div>
+                            `;
+                            
+                            // Scroll to top to show the message
+                            window.scrollTo(0, 0);
+                            
+                            // Start live updates using efficient short polling (appears instant)
+                            let updateCount = 0;
+                            const maxUpdates = 200; // Stop after ~10 minutes (200 * 3s)
+                            
+                            function updateLiveProgress() {
+                                if (updateCount++ >= maxUpdates) {
+                                    return; // Stop updating after max updates
+                                }
+                                
+                                fetch('?page=api&action=job-worker-status&job_id=' + data.job_id)
+                                    .then(response => response.json())
+                                    .then(status => {
+                                        if (status.error) return;
+                                        
+                                        const percentage = status.completion_percentage || 0;
+                                        const collected = status.emails_collected || 0;
+                                        const target = status.emails_required || 0;
+                                        const workers = status.active_workers || 0;
+                                        const jobStatus = status.job ? status.job.status : 'running';
+                                        
+                                        // Update UI
+                                        document.getElementById('live-progress-bar').style.width = percentage + '%';
+                                        document.getElementById('live-progress-text').textContent = percentage + '%';
+                                        document.getElementById('live-emails-collected').textContent = collected;
+                                        document.getElementById('live-emails-target').textContent = target;
+                                        document.getElementById('live-active-workers').textContent = workers;
+                                        document.getElementById('live-job-status').textContent = jobStatus;
+                                        
+                                        // Continue updates if job is not complete
+                                        if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+                                            setTimeout(updateLiveProgress, 3000);
+                                        } else {
+                                            // Job complete - show message
+                                            if (jobStatus === 'completed') {
+                                                document.getElementById('live-job-status').textContent = '✅ Completed';
+                                            }
+                                        }
+                                    })
+                                    .catch(error => {
+                                        console.error('Progress update error:', error);
+                                        setTimeout(updateLiveProgress, 5000); // Retry with longer delay
+                                    });
+                            }
+                            
+                            // Start updates immediately
+                            setTimeout(updateLiveProgress, 1000); // First update after 1 second
+                            
+                            // Re-enable and reset the form for creating another job
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                            document.getElementById('job-form').reset();
+                        } else {
+                            // Show error alert
+                            alert('✗ Error: ' + (data.error || 'Unknown error occurred'));
+                            
+                            // Re-enable submit button
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                        }
+                    })
+                    .catch(error => {
+                        // Hide loading overlay
+                        loadingOverlay.style.display = 'none';
+                        
+                        // Show error alert
+                        alert('✗ Error: Failed to create job - ' + error.message);
+                        
+                        // Re-enable submit button
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = '🚀 Start Extraction';
+                        
+                        console.error('Error creating job:', error);
+                    });
+                });
+            </script>
             <?php
         });
     }
@@ -3885,7 +4261,7 @@ class Router {
                     <strong>⚡ Automatic Worker Spawning:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ System automatically spawns optimal workers based on job size (up to 100)</li>
+                    <li>✅ System automatically spawns optimal workers based on job size (up to 300)</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum performance</li>
                 </ul>
