@@ -1284,12 +1284,62 @@ class Worker {
         $db = Database::connect();
         $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
         $stmt->execute([$queueId]);
+        error_log("✓ Marked queue item {$queueId} as completed");
     }
     
     public static function markQueueItemFailed(int $queueId): void {
         $db = Database::connect();
         $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
         $stmt->execute([$queueId]);
+        error_log("✗ Marked queue item {$queueId} as failed");
+    }
+    
+    /**
+     * Check if all queue items for a job are complete and update job status accordingly
+     */
+    public static function checkAndUpdateJobCompletion(int $jobId): void {
+        $db = Database::connect();
+        
+        // Get total and completed queue items for this job
+        $stmt = $db->prepare("
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM job_queue 
+            WHERE job_id = ?
+        ");
+        $stmt->execute([$jobId]);
+        $counts = $stmt->fetch();
+        
+        $total = (int)$counts['total'];
+        $completed = (int)$counts['completed'];
+        $failed = (int)$counts['failed'];
+        
+        if ($total == 0) {
+            error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
+            return;
+        }
+        
+        // Calculate progress percentage
+        $progress = (int)round(($completed / $total) * 100);
+        
+        error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
+        
+        // Update job status based on queue completion
+        if ($completed == $total) {
+            // All queue items completed
+            Job::updateStatus($jobId, 'completed', 100);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
+        } elseif ($completed + $failed == $total) {
+            // All queue items either completed or failed
+            Job::updateStatus($jobId, 'completed', $progress);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
+        } else {
+            // Still processing
+            Job::updateStatus($jobId, 'running', $progress);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+        }
     }
     
     public static function processResultWithDeepScraping(
@@ -1565,21 +1615,14 @@ class Worker {
     public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
         error_log("processJobImmediately called: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults}");
         
-        // Register this worker for tracking
-        $workerName = 'worker-' . getmypid() . '-' . time();
-        $workerId = self::register($workerName);
-        
         try {
             $job = Job::getById($jobId);
             if (!$job) {
                 error_log("processJobImmediately: Job {$jobId} not found");
-                self::logError($workerId, $jobId, 'job_not_found', "Job {$jobId} not found", null, 'error');
                 return;
             }
             
             error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
-            
-            self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
             
             $apiKey = $job['api_key'];
             $query = $job['query'];
@@ -1590,7 +1633,7 @@ class Worker {
             $pagesProcessed = 0;
             $page = (int)($startOffset / 10) + 1;
             
-            error_log("processJobImmediately: Starting from page {$page}");
+            error_log("processJobImmediately: Starting from page {$page}, will process max {$maxResults} emails");
             
             while ($processed < $maxResults) {
                 try {
@@ -1599,13 +1642,11 @@ class Worker {
                     
                     if (!$data) {
                         error_log("processJobImmediately: searchSerper returned null/false");
-                        self::logError($workerId, $jobId, 'api_error', "Search API returned no data for page {$page}", "Query: {$query}, Country: {$country}", 'warning');
                         break;
                     }
                     
                     if (!isset($data['organic'])) {
                         error_log("processJobImmediately: No organic results in response");
-                        self::logError($workerId, $jobId, 'no_results', "No organic results in API response for page {$page}", null, 'warning');
                         break;
                     }
                     
@@ -1619,17 +1660,19 @@ class Worker {
                         self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxResults);
                     } catch (Exception $e) {
                         error_log("Error processing batch: " . $e->getMessage());
-                        self::logError($workerId, $jobId, 'processing_error', "Error processing search results batch", $e->getMessage(), 'warning');
                     }
                     
                     $emailsExtractedThisPage = $processed - $emailsBefore;
                     
-                    // Update worker heartbeat with stats
-                    self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
-                    
-                    error_log("processJobImmediately: Processed {$processed} so far");
+                    error_log("processJobImmediately: Processed {$processed}/{$maxResults} emails so far");
                     
                     if (!isset($data['organic']) || count($data['organic']) === 0) {
+                        break;
+                    }
+                    
+                    // Stop if we've reached the limit for this queue item
+                    if ($processed >= $maxResults) {
+                        error_log("processJobImmediately: Reached limit of {$maxResults} emails for this queue item");
                         break;
                     }
                     
@@ -1640,32 +1683,14 @@ class Worker {
                     usleep((int)($rateLimit * 1000000));
                 } catch (Exception $e) {
                     error_log("Error in page processing loop: " . $e->getMessage());
-                    self::logError($workerId, $jobId, 'page_processing_error', "Error processing page {$page}", $e->getMessage(), 'error');
                     break;
                 }
             }
             
-            // Update progress
-            $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
-            
-            error_log("processJobImmediately: Completed. Processed {$processed} emails, progress={$progress}%");
-            
-            // If this worker has completed its portion and progress is 100%, mark job as completed
-            if ($progress >= 100) {
-                Job::updateStatus($jobId, 'completed', 100);
-                error_log("processJobImmediately: Job {$jobId} marked as completed");
-            } else {
-                Job::updateStatus($jobId, 'running', min($progress, 100));
-                error_log("processJobImmediately: Job {$jobId} progress updated to " . min($progress, 100) . "%");
-            }
-            
-            // Mark worker as idle when done
-            self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            error_log("processJobImmediately: Completed. Processed {$processed} emails from {$pagesProcessed} pages");
             
         } catch (Exception $e) {
             error_log("Critical error in processJobImmediately: " . $e->getMessage());
-            self::logError($workerId, $jobId, 'critical_error', "Critical worker error", $e->getMessage() . "\n" . $e->getTraceAsString(), 'critical');
-            self::updateHeartbeat($workerId, 'stopped', null, 0, 0);
             throw $e;
         }
     }
@@ -2758,11 +2783,14 @@ class Router {
                     // Mark queue item as complete if we have queue_id
                     if ($queueId) {
                         Worker::markQueueItemComplete($queueId);
+                        
+                        // Check if all queue items are complete and update job status
+                        Worker::checkAndUpdateJobCompletion($jobId);
                     }
                     
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     $successCount++;
-                    error_log("✓ Worker {$i} completed processing queue item for job {$jobId}");
+                    error_log("✓ Worker {$i} completed processing queue item {$queueId} for job {$jobId}");
                 } else {
                     // No queue item available for this job
                     $successCount++; // Still count as success - worker was ready
