@@ -219,7 +219,7 @@
     <div class="card">
         <h2>📖 Next Steps</h2>
         <ol style="padding-left: 20px; color: #4a5568;">
-            <li>Go to <a href="app.php">app.php</a> to use the system</li>
+            <li>Go to the main application (typically app.php in your browser) to use the system</li>
             <li>Create a test job with a small result count (e.g., 10)</li>
             <li>Observe the instant response in browser console</li>
             <li>Watch the live progress updates</li>
