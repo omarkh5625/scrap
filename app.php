@@ -1058,6 +1058,14 @@ class Job {
         return $stmt->fetchAll();
     }
     
+    public static function getEmailCount(int $jobId): int {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
+        $stmt->execute([$jobId]);
+        $result = $stmt->fetch();
+        return (int)($result['count'] ?? 0);
+    }
+    
     public static function addEmail(int $jobId, string $email, ?string $country = null, ?string $sourceUrl = null, ?string $sourceTitle = null): bool {
         if (BloomFilter::exists($email)) {
             return false; // Skip duplicates
@@ -3396,29 +3404,15 @@ class Router {
     /**
      * Process workers in background after closing connection
      * This method works without exec, HTTP workers, or cron
-     * It processes queue items directly but only after the connection is closed
+     * Connection must be closed BEFORE calling this method
      */
     private static function processWorkersInBackground(int $workerCount): void {
         error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers");
         
-        // Close connection immediately so UI is not blocked
-        if (!headers_sent()) {
-            ignore_user_abort(true);
-            set_time_limit(300); // 5 minutes max to prevent runaway processes
-            
-            // Send response and close connection using FastCGI
-            if (function_exists('fastcgi_finish_request')) {
-                fastcgi_finish_request();
-                error_log("processWorkersInBackground: Connection closed via fastcgi_finish_request()");
-            } else {
-                // Fallback for non-FastCGI environments
-                if (ob_get_level() > 0) {
-                    ob_end_flush();
-                }
-                flush();
-                error_log("processWorkersInBackground: Connection closed via flush()");
-            }
-        }
+        // Connection should already be closed by caller
+        // Just ensure we can continue after user disconnect
+        ignore_user_abort(true);
+        set_time_limit(300); // 5 minutes max to prevent runaway processes
         
         // Now process work in background - user has already received response
         try {
@@ -3456,6 +3450,21 @@ class Router {
                         $job = Worker::getNextJob();
                         
                         if ($job) {
+                            // Check if job has reached target email count
+                            $jobId = (int)$job['id'];
+                            $jobDetails = Job::getById($jobId);
+                            if ($jobDetails) {
+                                $emailsCollected = Job::getEmailCount($jobId);
+                                $maxResults = (int)$jobDetails['max_results'];
+                                
+                                if ($emailsCollected >= $maxResults) {
+                                    error_log("processWorkersInBackground: Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
+                                    // Mark remaining queue items as complete
+                                    Worker::checkAndUpdateJobCompletion($jobId);
+                                    continue; // Skip this job, get next one
+                                }
+                            }
+                            
                             error_log("processWorkersInBackground: Worker {$workerIndex} processing job #{$job['id']}");
                             Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                             
@@ -3464,6 +3473,16 @@ class Router {
                                 $itemsProcessed++;
                                 $totalProcessed++;
                                 error_log("processWorkersInBackground: Worker {$workerIndex} completed job #{$job['id']}");
+                                
+                                // Check again after processing if target reached
+                                if ($jobDetails) {
+                                    $emailsCollected = Job::getEmailCount($jobId);
+                                    if ($emailsCollected >= $maxResults) {
+                                        error_log("processWorkersInBackground: Job {$jobId} reached target after processing, stopping");
+                                        Worker::checkAndUpdateJobCompletion($jobId);
+                                        break; // Stop processing more items for this worker
+                                    }
+                                }
                             } catch (Exception $e) {
                                 error_log("processWorkersInBackground: Worker {$workerIndex} error on job #{$job['id']}: " . $e->getMessage());
                                 Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
