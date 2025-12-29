@@ -1072,29 +1072,46 @@ class Router {
             $jobId = (int)($_POST['job_id'] ?? 0);
             $startOffset = (int)($_POST['start_offset'] ?? 0);
             $maxResults = (int)($_POST['max_results'] ?? 100);
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
             
             if ($jobId > 0) {
+                // Log worker start
+                error_log("Worker #{$workerIndex} started for job {$jobId}, offset {$startOffset}, max {$maxResults}");
+                
                 // Close connection immediately so client doesn't wait
                 ignore_user_abort(true);
                 set_time_limit(0);
                 
+                // Calculate content before sending
+                $response = json_encode(['status' => 'processing', 'worker' => $workerIndex]);
+                
                 // Send minimal response
                 header('Content-Type: application/json');
-                header('Content-Length: ' . ob_get_length());
+                header('Content-Length: ' . strlen($response));
                 header('Connection: close');
-                echo json_encode(['status' => 'processing']);
+                echo $response;
                 
-                // Flush output buffers
+                // Flush all output buffers
                 if (ob_get_level() > 0) {
                     ob_end_flush();
                 }
                 flush();
                 
+                // Close the session if it's open
+                if (session_id()) {
+                    session_write_close();
+                }
+                
+                // Give time for connection to close
+                usleep(100000); // 0.1 seconds
+                
                 // Now process the job in background
                 try {
+                    error_log("Worker #{$workerIndex} processing job {$jobId}");
                     Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                    error_log("Worker #{$workerIndex} completed job {$jobId}");
                 } catch (Exception $e) {
-                    error_log("HTTP Worker error for job {$jobId}: " . $e->getMessage());
+                    error_log("HTTP Worker #{$workerIndex} error for job {$jobId}: " . $e->getMessage());
                 }
             }
         }
@@ -1392,6 +1409,8 @@ class Router {
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
+        error_log("Spawning {$workerCount} workers via HTTP for job {$jobId}");
+        
         for ($i = 0; $i < $workerCount; $i++) {
             $startOffset = $i * $resultsPerWorker;
             $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
@@ -1405,16 +1424,30 @@ class Router {
                     'job_id' => $jobId,
                     'start_offset' => $startOffset,
                     'max_results' => $workerMaxResults,
+                    'worker_index' => $i,
                     'worker_token' => md5($jobId . $startOffset . 'secret')
                 ]));
-                curl_setopt($ch, CURLOPT_TIMEOUT_MS, 100); // Very short timeout - we don't wait
+                curl_setopt($ch, CURLOPT_TIMEOUT, 5); // Give it 5 seconds to establish connection
                 curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
                 
                 // Execute async (don't wait for response)
-                curl_exec($ch);
+                $result = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                
+                if ($httpCode !== 200) {
+                    error_log("Failed to spawn worker #{$i} for job {$jobId}, HTTP code: {$httpCode}");
+                } else {
+                    error_log("Successfully spawned worker #{$i} for job {$jobId}");
+                }
+                
                 curl_close($ch);
+                
+                // Small delay between spawning workers to avoid overwhelming the server
+                usleep(50000); // 0.05 seconds
             }
         }
+        
+        error_log("All {$workerCount} workers spawned for job {$jobId}");
     }
     
     private static function renderNewJob(): void {
@@ -1711,6 +1744,26 @@ class Router {
                     <?php if ($job['email_filter']): ?>
                         <span>Filter: <?php echo ucfirst($job['email_filter']); ?></span>
                     <?php endif; ?>
+                </div>
+                
+                <!-- Progress Bar -->
+                <div style="margin: 20px 0;">
+                    <div class="progress-bar" style="height: 30px; border-radius: 5px;">
+                        <div class="progress-fill" style="width: <?php echo $job['progress']; ?>%; height: 100%; background: linear-gradient(90deg, #4CAF50, #8BC34A); border-radius: 5px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
+                            <?php if ($job['progress'] > 0): ?>
+                                <?php echo $job['progress']; ?>%
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                    <small style="color: #666; margin-top: 5px; display: block;">
+                        <?php if ($job['status'] === 'running'): ?>
+                            ⚡ Workers are processing... Check php_errors.log for detailed progress
+                        <?php elseif ($job['status'] === 'completed'): ?>
+                            ✓ Job completed successfully
+                        <?php elseif ($job['status'] === 'pending'): ?>
+                            ⏳ Waiting for workers to start...
+                        <?php endif; ?>
+                    </small>
                 </div>
                 
                 <div class="action-bar">
