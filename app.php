@@ -2253,7 +2253,14 @@ class Router {
                         // Now spawn workers in background after response sent
                         ignore_user_abort(true);
                         set_time_limit(300);
-                        self::autoSpawnWorkers($workerCount);
+                        
+                        try {
+                            self::autoSpawnWorkers($workerCount);
+                        } catch (Exception $e) {
+                            error_log('Worker spawning error for job ' . $jobId . ': ' . $e->getMessage());
+                            // Mark job as failed
+                            Job::updateStatus($jobId, 'failed', 0);
+                        }
                         
                     } catch (Exception $e) {
                         echo json_encode([
@@ -3781,42 +3788,22 @@ class Router {
                     })
                     .then(response => response.json())
                     .then(data => {
+                        // Hide loading overlay immediately
+                        loadingOverlay.style.display = 'none';
+                        
                         if (data.success) {
-                            // Update loading message
-                            document.getElementById('loading-title').textContent = '✓ Job Created Successfully!';
-                            document.getElementById('loading-message').textContent = 
-                                `Job #${data.job_id} has been created with ${data.worker_count} workers`;
-                            document.getElementById('loading-progress').style.display = 'block';
-                            document.getElementById('worker-count-display').textContent = data.worker_count;
-                            
                             // Show success alert
-                            const alertArea = document.getElementById('alert-area');
-                            alertArea.innerHTML = `
-                                <div class="alert alert-success">
-                                    ✓ Job #${data.job_id} created successfully with ${data.worker_count} workers! 
-                                    <br>Workers are starting in the background...
-                                    <br><a href="?page=results&job_id=${data.job_id}">View Job</a> | 
-                                    <a href="?page=dashboard">Go to Dashboard</a> | 
-                                    <a href="?page=workers">View Workers & Status</a>
-                                </div>
-                            `;
+                            alert('✓ Job #' + data.job_id + ' created successfully with ' + data.worker_count + ' workers!\nWorkers are starting in the background...');
                             
-                            // Redirect after 2 seconds
-                            setTimeout(function() {
-                                window.location.href = '?page=results&job_id=' + data.job_id;
-                            }, 2000);
+                            // Redirect immediately to results page
+                            window.location.href = '?page=results&job_id=' + data.job_id;
                         } else {
-                            // Hide loading overlay
-                            loadingOverlay.style.display = 'none';
+                            // Show error alert
+                            alert('✗ Error: ' + (data.error || 'Unknown error occurred'));
                             
-                            // Show error
-                            const alertArea = document.getElementById('alert-area');
-                            alertArea.innerHTML = `
-                                <div class="alert alert-error">
-                                    <strong>✗ Error:</strong><br>
-                                    ${data.error || 'Unknown error occurred'}
-                                </div>
-                            `;
+                            // Re-enable submit button
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
                             
                             // Re-enable submit button
                             submitBtn.disabled = false;
@@ -3827,14 +3814,8 @@ class Router {
                         // Hide loading overlay
                         loadingOverlay.style.display = 'none';
                         
-                        // Show error
-                        const alertArea = document.getElementById('alert-area');
-                        alertArea.innerHTML = `
-                            <div class="alert alert-error">
-                                <strong>✗ Error:</strong><br>
-                                Failed to create job: ${error.message}
-                            </div>
-                        `;
+                        // Show error alert
+                        alert('✗ Error: Failed to create job - ' + error.message);
                         
                         // Re-enable submit button
                         submitBtn.disabled = false;
