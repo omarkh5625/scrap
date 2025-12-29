@@ -3798,29 +3798,37 @@ class Router {
             </div>
             
             <div class="card">
-                <h2>ℹ️ How It Works</h2>
+                <h2>ℹ️ How It Works - Enhanced for 300 Workers</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
                     <li>System automatically calculates and spawns optimal number of workers (up to 300)</li>
-                    <li>Job is split into chunks for parallel processing</li>
-                    <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously</li>
+                    <li><strong>Workers spawn in batches of 50</strong> with small delays to prevent resource spikes</li>
+                    <li>Job is split into chunks for parallel processing with transaction locking</li>
+                    <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously (up to 200 connections)</li>
                     <li>Emails are extracted and validated in batches</li>
                     <li>Duplicates are filtered using in-memory BloomFilter cache + database</li>
                     <li>Results appear in real-time on the dashboard</li>
+                    <li>Old workers are automatically cleaned up after 24 hours</li>
                 </ol>
                 <p style="margin-top: 15px;">
                     <strong>⚡ Performance Optimizations:</strong>
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
-                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size</li>
-                    <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections with curl_multi</li>
+                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size (up to 300)</li>
+                    <li><strong>Batch Spawning Strategy:</strong> Workers spawn in groups of 50 for stability</li>
+                    <li><strong>Parallel HTTP Requests:</strong> Up to 200 simultaneous connections with curl_multi</li>
                     <li><strong>Batch Processing:</strong> URLs scraped in parallel, emails inserted in bulk</li>
+                    <li><strong>Transaction Locking:</strong> Prevents race conditions in queue management</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support for faster requests</li>
                     <li><strong>Memory Caching:</strong> BloomFilter cache reduces database queries by ~90%</li>
                     <li><strong>Optimized Rate Limiting:</strong> 0.1s default with parallel processing</li>
+                    <li><strong>Automatic Cleanup:</strong> Old workers removed periodically to prevent database bloat</li>
                 </ul>
                 <p style="margin-top: 15px;">
-                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity when you click "🚀 Start Extraction". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
+                    <strong>🔒 UI/Backend Separation:</strong> The UI returns instantly (GET requests) while workers process in the background (POST/API requests). This ensures the interface never hangs, even with 300 workers running.
+                </p>
+                <p style="margin-top: 15px;">
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity when you click "🚀 Start Extraction". Works on all hosting environments including cPanel!
                 </p>
             </div>
             <?php
@@ -4032,12 +4040,24 @@ class Router {
                 <p>Example:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-1</pre>
                 <p style="margin-top: 15px; color: #718096;">
-                    <strong>⚡ Automatic Worker Spawning:</strong>
+                    <strong>⚡ Automatic Worker Spawning (Enhanced for 300 Workers):</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
                     <li>✅ System automatically spawns optimal workers based on job size (up to 300)</li>
+                    <li>✅ <strong>Batch Spawning:</strong> Workers spawn in batches of 50 to prevent resource spikes</li>
+                    <li>✅ <strong>Staggered Execution:</strong> 0.1s delay between batches ensures stability</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum performance</li>
+                </ul>
+                <p style="margin-top: 15px; color: #718096;">
+                    <strong>🔧 Worker Management Features:</strong>
+                </p>
+                <ul style="color: #718096; padding-left: 20px;">
+                    <li>✅ <strong>Transaction Locking:</strong> Prevents race conditions in queue management</li>
+                    <li>✅ <strong>Automatic Cleanup:</strong> Old workers removed after 24 hours to prevent bloat</li>
+                    <li>✅ <strong>Heartbeat Monitoring:</strong> Workers send status updates every few seconds</li>
+                    <li>✅ <strong>Crash Detection:</strong> Stale workers automatically detected and marked</li>
+                    <li>✅ <strong>Error Recovery:</strong> Failed workers don't affect others</li>
                 </ul>
                 <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
