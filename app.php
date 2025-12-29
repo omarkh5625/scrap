@@ -2636,11 +2636,27 @@ class Router {
                         // Create job for immediate processing
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
-                        // Start job processing with specified workers
-                        self::spawnParallelWorkers($jobId, $workerCount);
+                        // Prepare queue items but DON'T spawn workers yet
+                        self::createQueueItems($jobId, $workerCount);
                         
-                        // Redirect to dashboard with job ID
+                        // Send redirect response immediately (don't block UI)
                         header('Location: ?page=dashboard&job_id=' . $jobId);
+                        
+                        // Close connection to user BEFORE spawning workers
+                        if (function_exists('fastcgi_finish_request')) {
+                            fastcgi_finish_request();
+                        } else {
+                            if (ob_get_level() > 0) {
+                                ob_end_flush();
+                            }
+                            flush();
+                        }
+                        
+                        // Now spawn workers in background after response sent
+                        ignore_user_abort(true);
+                        set_time_limit(300);
+                        self::autoSpawnWorkers($workerCount);
+                        
                         exit;
                     }
                 } catch (Exception $e) {
@@ -3017,6 +3033,49 @@ class Router {
      * دالة تشغيل العمال بالتوازي (Parallel Workers)
      * تقوم بإنشاء queue items وتشغيل العمال مباشرة من Dashboard
      * بدون الحاجة لصفحة Workers منفصلة
+     */
+    /**
+     * Create queue items for a job without spawning workers
+     * This allows sending response to user before starting background processing
+     */
+    private static function createQueueItems(int $jobId, int $workerCount): void {
+        $job = Job::getById($jobId);
+        if (!$job) {
+            error_log("✗ ERROR: Cannot create queue items - Job {$jobId} not found");
+            return;
+        }
+        
+        $maxResults = (int)$job['max_results'];
+        $resultsPerWorker = (int)ceil($maxResults / $workerCount);
+        
+        error_log("Creating queue for job {$jobId}: {$maxResults} total results, {$workerCount} workers, ~{$resultsPerWorker} per worker");
+        
+        // Create queue items for parallel processing
+        $db = Database::connect();
+        $queueItemsCreated = 0;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            $startOffset = $i * $resultsPerWorker;
+            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            
+            if ($workerMaxResults > 0) {
+                // Insert queue item
+                $stmt = $db->prepare("INSERT INTO job_queue (job_id, start_offset, max_results, status) VALUES (?, ?, ?, 'pending')");
+                $stmt->execute([$jobId, $startOffset, $workerMaxResults]);
+                $queueItemsCreated++;
+                error_log("  Queue item {$i}: offset {$startOffset}, max {$workerMaxResults}");
+            }
+        }
+        
+        // Mark job as running immediately
+        error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}");
+        Job::updateStatus($jobId, 'running', 0);
+    }
+    
+    /**
+     * Spawn workers for a job (creates queue items AND spawns workers)
+     * Note: This blocks until workers are spawned. Use createQueueItems() + autoSpawnWorkers() 
+     * separately if you need to send response to user first.
      */
     private static function spawnParallelWorkers(int $jobId, int $workerCount): void {
         $job = Job::getById($jobId);
@@ -3452,11 +3511,27 @@ class Router {
                     // Create job for immediate processing
                     $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                     
-                    // Start job processing with calculated workers
-                    self::spawnParallelWorkers($jobId, $workerCount);
+                    // Prepare queue items but DON'T spawn workers yet
+                    self::createQueueItems($jobId, $workerCount);
                     
-                    // Redirect to dashboard with job ID
+                    // Send redirect response immediately (don't block UI)
                     header('Location: ?page=dashboard&job_id=' . $jobId);
+                    
+                    // Close connection to user BEFORE spawning workers
+                    if (function_exists('fastcgi_finish_request')) {
+                        fastcgi_finish_request();
+                    } else {
+                        if (ob_get_level() > 0) {
+                            ob_end_flush();
+                        }
+                        flush();
+                    }
+                    
+                    // Now spawn workers in background after response sent
+                    ignore_user_abort(true);
+                    set_time_limit(300);
+                    self::autoSpawnWorkers($workerCount);
+                    
                     exit;
                 } else {
                     $error = 'Query and API Key are required';
