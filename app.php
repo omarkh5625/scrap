@@ -1738,6 +1738,13 @@ class Router {
             exit;
         }
         
+        // Worker endpoints don't require authentication (they use internal spawning)
+        // These are triggered by the server itself, not external users
+        if ($page === 'process-queue-worker') {
+            self::handleProcessQueueWorker();
+            return;
+        }
+        
         // Require authentication for all other pages
         Auth::requireAuth();
         
@@ -1766,9 +1773,6 @@ class Router {
                 break;
             case 'start-worker':
                 self::handleStartWorker();
-                break;
-            case 'process-queue-worker':
-                self::handleProcessQueueWorker();
                 break;
             case 'api':
                 self::handleAPI();
@@ -2578,6 +2582,7 @@ class Router {
                 // Execute and wait for initial response
                 $response = curl_exec($ch);
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
                 $curlError = curl_error($ch);
                 curl_close($ch);
                 
@@ -2589,16 +2594,31 @@ class Router {
                         error_log("  Worker response: " . $decoded['status']);
                     }
                 } else {
+                    // Build detailed error message
                     $errorMsg = "Worker {$i} spawn failed - HTTP {$httpCode}";
                     if ($curlError) {
-                        $errorMsg .= ": {$curlError}";
+                        $errorMsg .= " | cURL Error: {$curlError}";
                     }
+                    if ($httpCode === 302) {
+                        $errorMsg .= " | Redirect detected (authentication issue?)";
+                        if ($effectiveUrl && $effectiveUrl !== $baseUrl . '?page=process-queue-worker') {
+                            $errorMsg .= " | Redirected to: {$effectiveUrl}";
+                        }
+                    }
+                    // Include response snippet for debugging
+                    if ($response) {
+                        $responseSnippet = substr($response, 0, 200);
+                        $errorMsg .= " | Response: " . $responseSnippet;
+                        error_log("  Response body: " . $responseSnippet);
+                    }
+                    
                     $errors[] = $errorMsg;
                     error_log("✗ {$errorMsg}");
                     
-                    // Log to database for UI display
-                    $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'spawn_error', ?, 'error')");
-                    $stmt->execute([$jobId, $errorMsg]);
+                    // Log to database for UI display with detailed error
+                    $detailedError = $errorMsg . " | URL: " . $baseUrl . '?page=process-queue-worker';
+                    $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, error_details, severity) VALUES (NULL, ?, 'spawn_error', ?, ?, 'error')");
+                    $stmt->execute([$jobId, "Worker {$i} failed to spawn", $detailedError]);
                 }
             } catch (Exception $e) {
                 $errorMsg = "Worker {$i} spawn exception: " . $e->getMessage();
@@ -2728,18 +2748,22 @@ class Router {
                     // Check if workers actually started
                     $job = Job::getById($jobId);
                     if ($job['status'] === 'failed') {
-                        // Workers failed to spawn - get errors
+                        // Workers failed to spawn - get errors with details
                         $db = Database::connect();
-                        $stmt = $db->prepare("SELECT error_message FROM worker_errors WHERE job_id = ? ORDER BY created_at DESC LIMIT 5");
+                        $stmt = $db->prepare("SELECT error_message, error_details FROM worker_errors WHERE job_id = ? ORDER BY created_at DESC LIMIT 10");
                         $stmt->execute([$jobId]);
                         $errors = $stmt->fetchAll();
                         
                         $errorMessages = [];
                         foreach ($errors as $err) {
-                            $errorMessages[] = $err['error_message'];
+                            if (!empty($err['error_details'])) {
+                                $errorMessages[] = $err['error_details'];
+                            } else {
+                                $errorMessages[] = $err['error_message'];
+                            }
                         }
                         
-                        $error = 'Failed to start workers: ' . implode('; ', $errorMessages);
+                        $error = 'Failed to start workers: ' . implode(' | ', $errorMessages);
                     } else if ($job['status'] === 'running') {
                         // Success - at least one worker started
                         $success = true;
@@ -2760,8 +2784,9 @@ class Router {
         self::renderLayout('New Job', function() use ($success, $jobId, $error, $warnings) {
             ?>
             <?php if ($error): ?>
-                <div class="alert alert-error">
-                    ✗ <?php echo htmlspecialchars($error); ?>
+                <div class="alert alert-error" style="white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px;">
+                    <strong style="font-size: 14px;">✗ Error:</strong><br>
+                    <?php echo htmlspecialchars($error); ?>
                 </div>
             <?php endif; ?>
             
