@@ -375,6 +375,31 @@ class EmailExtractor {
         return array_unique($emails);
     }
     
+    public static function extractEmailsFromUrl(string $url, int $timeout = 5): array {
+        $emails = [];
+        
+        try {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+            curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            
+            $content = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            
+            if ($httpCode === 200 && $content) {
+                $emails = self::extractEmails($content);
+            }
+        } catch (Exception $e) {
+            // Silently fail - page scraping is optional
+        }
+        
+        return $emails;
+    }
+    
     public static function isValidEmail(string $email): bool {
         // Basic validation
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
@@ -557,6 +582,9 @@ class Worker {
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
+        // Check if deep scraping is enabled
+        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
+        
         $processed = 0;
         $page = 1;
         
@@ -579,6 +607,14 @@ class Worker {
                 // Extract emails from title, link, and snippet
                 $textToScan = $title . ' ' . $link . ' ' . $snippet;
                 $emails = EmailExtractor::extractEmails($textToScan);
+                
+                // Deep scraping: fetch page content if enabled
+                if ($deepScraping && $link && count($emails) < 5) {
+                    echo "  - Deep scraping: {$link}\n";
+                    $pageEmails = EmailExtractor::extractEmailsFromUrl($link);
+                    $emails = array_merge($emails, $pageEmails);
+                    $emails = array_unique($emails);
+                }
                 
                 foreach ($emails as $email) {
                     if ($processed >= $maxResults) {
@@ -660,6 +696,9 @@ class Worker {
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
+        // Check if deep scraping is enabled
+        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
+        
         $processed = 0;
         $page = (int)($startOffset / 10) + 1;
         
@@ -682,6 +721,13 @@ class Worker {
                 // Extract emails from title, link, and snippet
                 $textToScan = $title . ' ' . $link . ' ' . $snippet;
                 $emails = EmailExtractor::extractEmails($textToScan);
+                
+                // Deep scraping: fetch page content if enabled
+                if ($deepScraping && $link && count($emails) < 5) {
+                    $pageEmails = EmailExtractor::extractEmailsFromUrl($link);
+                    $emails = array_merge($emails, $pageEmails);
+                    $emails = array_unique($emails);
+                }
                 
                 foreach ($emails as $email) {
                     if ($processed >= $maxResults) {
@@ -1323,6 +1369,15 @@ class Router {
                     <div class="form-group">
                         <label>Rate Limit (seconds between requests)</label>
                         <input type="number" step="0.1" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.5'); ?>">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Deep Scraping</label>
+                        <select name="setting_deep_scraping">
+                            <option value="1" <?php echo ($settings['deep_scraping'] ?? '1') === '1' ? 'selected' : ''; ?>>Enabled</option>
+                            <option value="0" <?php echo ($settings['deep_scraping'] ?? '1') === '0' ? 'selected' : ''; ?>>Disabled</option>
+                        </select>
+                        <small>When enabled, workers will fetch and scan page content for emails (slower but more comprehensive)</small>
                     </div>
                     
                     <button type="submit" class="btn btn-primary">Save Settings</button>
