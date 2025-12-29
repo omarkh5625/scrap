@@ -476,8 +476,20 @@ class Auth {
 // ============================================================================
 
 class BloomFilter {
+    private static array $cache = [];
+    private static int $cacheSize = 10000;
+    
     public static function add(string $email): void {
         $hash = self::normalize($email);
+        
+        // Add to in-memory cache
+        self::$cache[$hash] = true;
+        
+        // Trim cache if too large
+        if (count(self::$cache) > self::$cacheSize) {
+            self::$cache = array_slice(self::$cache, -self::$cacheSize, null, true);
+        }
+        
         $db = Database::connect();
         
         try {
@@ -490,13 +502,111 @@ class BloomFilter {
     
     public static function exists(string $email): bool {
         $hash = self::normalize($email);
+        
+        // Check in-memory cache first (much faster)
+        if (isset(self::$cache[$hash])) {
+            return true;
+        }
+        
         $db = Database::connect();
         
         $stmt = $db->prepare("SELECT COUNT(*) as count FROM bloomfilter WHERE hash = ?");
         $stmt->execute([$hash]);
         $result = $stmt->fetch();
         
-        return $result['count'] > 0;
+        $exists = $result['count'] > 0;
+        
+        // Cache the result
+        if ($exists) {
+            self::$cache[$hash] = true;
+        }
+        
+        return $exists;
+    }
+    
+    /**
+     * Bulk check multiple emails at once - much faster than individual checks
+     */
+    public static function filterExisting(array $emails): array {
+        if (empty($emails)) {
+            return [];
+        }
+        
+        $unique = [];
+        $hashes = [];
+        
+        foreach ($emails as $email) {
+            $hash = self::normalize($email);
+            
+            // Skip if already in memory cache
+            if (isset(self::$cache[$hash])) {
+                continue;
+            }
+            
+            $hashes[$hash] = $email;
+        }
+        
+        if (empty($hashes)) {
+            return [];
+        }
+        
+        // Bulk query database
+        $db = Database::connect();
+        $placeholders = implode(',', array_fill(0, count($hashes), '?'));
+        $stmt = $db->prepare("SELECT hash FROM bloomfilter WHERE hash IN ($placeholders)");
+        $stmt->execute(array_keys($hashes));
+        
+        $existingHashes = [];
+        while ($row = $stmt->fetch()) {
+            $existingHashes[$row['hash']] = true;
+            // Add to cache
+            self::$cache[$row['hash']] = true;
+        }
+        
+        // Return emails that don't exist yet
+        foreach ($hashes as $hash => $email) {
+            if (!isset($existingHashes[$hash])) {
+                $unique[] = $email;
+            }
+        }
+        
+        return $unique;
+    }
+    
+    /**
+     * Bulk add multiple emails at once
+     */
+    public static function addBulk(array $emails): void {
+        if (empty($emails)) {
+            return;
+        }
+        
+        $hashes = [];
+        foreach ($emails as $email) {
+            $hash = self::normalize($email);
+            $hashes[] = $hash;
+            self::$cache[$hash] = true;
+        }
+        
+        // Trim cache if too large
+        if (count(self::$cache) > self::$cacheSize) {
+            self::$cache = array_slice(self::$cache, -self::$cacheSize, null, true);
+        }
+        
+        if (empty($hashes)) {
+            return;
+        }
+        
+        $db = Database::connect();
+        
+        try {
+            // Build bulk insert
+            $values = implode(',', array_fill(0, count($hashes), '(?)'));
+            $stmt = $db->prepare("INSERT IGNORE INTO bloomfilter (hash) VALUES $values");
+            $stmt->execute($hashes);
+        } catch (PDOException $e) {
+            // Silently fail - duplicates are expected
+        }
     }
     
     private static function normalize(string $email): string {
@@ -556,6 +666,46 @@ class EmailExtractor {
         return $emails;
     }
     
+    /**
+     * Extract emails from multiple URLs in parallel using curl_multi
+     * Returns array with url => [emails] mapping
+     */
+    public static function extractEmailsFromUrlsParallel(array $urls, int $timeout = 5): array {
+        $results = [];
+        
+        if (empty($urls)) {
+            return $results;
+        }
+        
+        $curlMulti = new CurlMultiManager(min(count($urls), 50));
+        
+        // Add all URLs to the multi handle
+        foreach ($urls as $url) {
+            $curlMulti->addUrl($url, [
+                'timeout' => $timeout,
+                'connect_timeout' => 3
+            ], $url);
+        }
+        
+        // Execute all requests in parallel
+        $responses = $curlMulti->execute();
+        
+        // Process results
+        foreach ($responses as $response) {
+            $url = $response['user_data'];
+            $results[$url] = [];
+            
+            if ($response['http_code'] === 200 && !empty($response['content'])) {
+                $emails = self::extractEmails($response['content']);
+                $results[$url] = $emails;
+            }
+        }
+        
+        $curlMulti->close();
+        
+        return $results;
+    }
+    
     public static function isValidEmail(string $email): bool {
         // Basic validation
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
@@ -590,6 +740,154 @@ class EmailExtractor {
             default:
                 return true;
         }
+    }
+}
+
+// ============================================================================
+// CURL MULTI MANAGER CLASS - For Parallel HTTP Requests
+// ============================================================================
+
+class CurlMultiManager {
+    private $multiHandle;
+    private array $handles = [];
+    private array $handleData = [];
+    private int $maxConnections;
+    
+    public function __construct(int $maxConnections = 50) {
+        $this->maxConnections = $maxConnections;
+        $this->multiHandle = curl_multi_init();
+        
+        // Set max total connections and max per host
+        if (defined('CURLMOPT_MAX_TOTAL_CONNECTIONS')) {
+            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_TOTAL_CONNECTIONS, $maxConnections);
+        }
+        if (defined('CURLMOPT_MAX_HOST_CONNECTIONS')) {
+            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_HOST_CONNECTIONS, 10);
+        }
+    }
+    
+    /**
+     * Add a URL to fetch in parallel
+     */
+    public function addUrl(string $url, array $options = [], $userData = null): void {
+        $ch = curl_init($url);
+        
+        // Default options for performance
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $options['timeout'] ?? 10);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $options['connect_timeout'] ?? 5);
+        curl_setopt($ch, CURLOPT_USERAGENT, $options['user_agent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        curl_setopt($ch, CURLOPT_ENCODING, ''); // Enable compression
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        
+        // HTTP/2 for better performance (if available)
+        if (defined('CURL_HTTP_VERSION_2_0')) {
+            curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+        }
+        
+        // Keep-alive for connection reuse
+        curl_setopt($ch, CURLOPT_TCP_KEEPALIVE, 1);
+        curl_setopt($ch, CURLOPT_TCP_KEEPIDLE, 120);
+        curl_setopt($ch, CURLOPT_TCP_KEEPINTVL, 60);
+        
+        // POST request if needed
+        if (isset($options['post']) && $options['post']) {
+            curl_setopt($ch, CURLOPT_POST, true);
+            if (isset($options['postfields'])) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $options['postfields']);
+            }
+        }
+        
+        // Custom headers
+        if (isset($options['headers'])) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $options['headers']);
+        }
+        
+        $handleId = (int)$ch;
+        $this->handles[$handleId] = $ch;
+        $this->handleData[$handleId] = [
+            'url' => $url,
+            'user_data' => $userData,
+            'started' => microtime(true)
+        ];
+        
+        curl_multi_add_handle($this->multiHandle, $ch);
+    }
+    
+    /**
+     * Execute all pending requests in parallel
+     */
+    public function execute(): array {
+        $results = [];
+        
+        // Execute all handles
+        do {
+            $status = curl_multi_exec($this->multiHandle, $active);
+            
+            // Wait for activity on any curl handle
+            if ($active) {
+                curl_multi_select($this->multiHandle, 0.1);
+            }
+        } while ($active && $status == CURLM_OK);
+        
+        // Collect results
+        foreach ($this->handles as $handleId => $ch) {
+            $content = curl_multi_getcontent($ch);
+            $info = curl_getinfo($ch);
+            $error = curl_error($ch);
+            
+            $elapsed = microtime(true) - $this->handleData[$handleId]['started'];
+            
+            $results[] = [
+                'url' => $this->handleData[$handleId]['url'],
+                'user_data' => $this->handleData[$handleId]['user_data'],
+                'content' => $content,
+                'http_code' => $info['http_code'],
+                'error' => $error,
+                'elapsed' => $elapsed,
+                'info' => $info
+            ];
+            
+            curl_multi_remove_handle($this->multiHandle, $ch);
+            curl_close($ch);
+        }
+        
+        // Clear handles for next batch
+        $this->handles = [];
+        $this->handleData = [];
+        
+        return $results;
+    }
+    
+    /**
+     * Get number of handles currently registered
+     */
+    public function getHandleCount(): int {
+        return count($this->handles);
+    }
+    
+    /**
+     * Check if we're at max capacity
+     */
+    public function isFull(): bool {
+        return count($this->handles) >= $this->maxConnections;
+    }
+    
+    /**
+     * Close the multi handle
+     */
+    public function close(): void {
+        if ($this->multiHandle) {
+            curl_multi_close($this->multiHandle);
+            $this->multiHandle = null;
+        }
+    }
+    
+    public function __destruct() {
+        $this->close();
     }
 }
 
@@ -662,6 +960,69 @@ class Job {
         } catch (PDOException $e) {
             // Duplicate hash, skip
             return false;
+        }
+    }
+    
+    /**
+     * Bulk add emails - much faster than individual inserts
+     * Returns number of emails actually added
+     */
+    public static function addEmailsBulk(int $jobId, array $emails, ?string $country = null, array $sources = []): int {
+        if (empty($emails)) {
+            return 0;
+        }
+        
+        $db = Database::connect();
+        $added = 0;
+        
+        // Filter out duplicates using BloomFilter batch method (much faster)
+        $uniqueEmails = BloomFilter::filterExisting($emails);
+        
+        if (empty($uniqueEmails)) {
+            return 0;
+        }
+        
+        // Build bulk insert query
+        $values = [];
+        $params = [];
+        
+        foreach ($uniqueEmails as $email) {
+            $emailHash = hash('sha256', strtolower($email));
+            $domain = EmailExtractor::getDomain($email);
+            $sourceUrl = $sources[$email]['url'] ?? null;
+            $sourceTitle = $sources[$email]['title'] ?? null;
+            
+            $values[] = "(?, ?, ?, ?, ?, ?, ?)";
+            $params[] = $jobId;
+            $params[] = $email;
+            $params[] = $emailHash;
+            $params[] = $domain;
+            $params[] = $country;
+            $params[] = $sourceUrl;
+            $params[] = $sourceTitle;
+        }
+        
+        try {
+            $sql = "INSERT IGNORE INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES " . implode(", ", $values);
+            $stmt = $db->prepare($sql);
+            $stmt->execute($params);
+            $added = $stmt->rowCount();
+            
+            // Add to BloomFilter in bulk (much faster)
+            BloomFilter::addBulk($uniqueEmails);
+            
+            return $added;
+        } catch (PDOException $e) {
+            error_log("Bulk insert error: " . $e->getMessage());
+            // Fallback to individual inserts if bulk fails
+            foreach ($uniqueEmails as $email) {
+                $sourceUrl = $sources[$email]['url'] ?? null;
+                $sourceTitle = $sources[$email]['title'] ?? null;
+                if (self::addEmail($jobId, $email, $country, $sourceUrl, $sourceTitle)) {
+                    $added++;
+                }
+            }
+            return $added;
         }
     }
 }
@@ -917,6 +1278,82 @@ class Worker {
         }
     }
     
+    /**
+     * Process multiple search results with parallel deep scraping
+     * Much faster than processing one-by-one
+     */
+    public static function processResultsBatchWithParallelScraping(
+        array $results,
+        int $jobId,
+        ?string $country,
+        ?string $emailFilter,
+        int &$processed,
+        int $maxResults
+    ): void {
+        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
+        $deepScrapingThreshold = (int)(Settings::get('deep_scraping_threshold', '5'));
+        
+        // First pass: extract emails from search results metadata
+        $allEmails = [];
+        $urlsToScrape = [];
+        $sources = [];
+        
+        foreach ($results as $result) {
+            $title = $result['title'] ?? '';
+            $link = $result['link'] ?? '';
+            $snippet = $result['snippet'] ?? '';
+            
+            // Extract from metadata
+            $textToScan = $title . ' ' . $link . ' ' . $snippet;
+            $emails = EmailExtractor::extractEmails($textToScan);
+            
+            foreach ($emails as $email) {
+                $allEmails[] = $email;
+                $sources[$email] = ['url' => $link, 'title' => $title];
+            }
+            
+            // Determine if we need to deep scrape this URL
+            if ($deepScraping && $link && count($emails) < $deepScrapingThreshold) {
+                $urlsToScrape[] = $link;
+            }
+        }
+        
+        // Second pass: parallel deep scraping if enabled and needed
+        if (!empty($urlsToScrape)) {
+            $scrapedResults = EmailExtractor::extractEmailsFromUrlsParallel($urlsToScrape, 5);
+            
+            foreach ($scrapedResults as $url => $emails) {
+                foreach ($emails as $email) {
+                    $allEmails[] = $email;
+                    if (!isset($sources[$email])) {
+                        $sources[$email] = ['url' => $url, 'title' => ''];
+                    }
+                }
+            }
+        }
+        
+        // Remove duplicates
+        $allEmails = array_unique($allEmails);
+        
+        // Filter and add emails in bulk
+        $emailsToAdd = [];
+        foreach ($allEmails as $email) {
+            if ($processed >= $maxResults) {
+                break;
+            }
+            
+            if (EmailExtractor::matchesFilter($emailFilter, $email)) {
+                $emailsToAdd[] = $email;
+                $processed++;
+            }
+        }
+        
+        // Bulk insert for better performance
+        if (!empty($emailsToAdd)) {
+            Job::addEmailsBulk($jobId, $emailsToAdd, $country, $sources);
+        }
+    }
+    
     public static function processJob(int $jobId): void {
         $job = Job::getById($jobId);
         if (!$job) {
@@ -955,18 +1392,9 @@ class Worker {
             $pagesProcessed++;
             $emailsBefore = $processed;
             
-            foreach ($data['organic'] as $result) {
-                if ($processed >= $maxToProcess) {
-                    break;
-                }
-                
-                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxToProcess);
-                
-                $progress = (int)(($processed / $maxToProcess) * 100);
-                
-                if ($processed > 0 && $processed % 10 === 0) {
-                    echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
-                }
+            // Use batch processing for better performance
+            if (isset($data['organic']) && count($data['organic']) > 0) {
+                self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxToProcess);
             }
             
             $emailsExtractedThisPage = $processed - $emailsBefore;
@@ -974,14 +1402,18 @@ class Worker {
             // Update worker statistics
             self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
             
+            if ($processed > 0 && $processed % 10 === 0) {
+                echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
+            }
+            
             if (!isset($data['organic']) || count($data['organic']) === 0) {
                 break;
             }
             
             $page++;
             
-            // Rate limiting: use configurable setting or default 0.5 seconds
-            $rateLimit = (float)(Settings::get('rate_limit', '0.5'));
+            // Reduced rate limiting when using parallel scraping (already more efficient)
+            $rateLimit = (float)(Settings::get('rate_limit', '0.3'));
             usleep((int)($rateLimit * 1000000));
         }
         
@@ -1128,17 +1560,12 @@ class Worker {
                     $pagesProcessed++;
                     $emailsBefore = $processed;
                     
-                    foreach ($data['organic'] as $result) {
-                        if ($processed >= $maxResults) {
-                            break;
-                        }
-                        
-                        try {
-                            self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
-                        } catch (Exception $e) {
-                            error_log("Error processing result: " . $e->getMessage());
-                            self::logError($workerId, $jobId, 'processing_error', "Error processing search result", $e->getMessage(), 'warning');
-                        }
+                    try {
+                        // Use batch processing with parallel scraping for much better performance
+                        self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxResults);
+                    } catch (Exception $e) {
+                        error_log("Error processing batch: " . $e->getMessage());
+                        self::logError($workerId, $jobId, 'processing_error', "Error processing search results batch", $e->getMessage(), 'warning');
                     }
                     
                     $emailsExtractedThisPage = $processed - $emailsBefore;
@@ -1154,8 +1581,8 @@ class Worker {
                     
                     $page++;
                     
-                    // Rate limiting: use configurable setting or default 0.5 seconds
-                    $rateLimit = (float)(Settings::get('rate_limit', '0.5'));
+                    // Reduced rate limiting when using parallel scraping
+                    $rateLimit = (float)(Settings::get('rate_limit', '0.3'));
                     usleep((int)($rateLimit * 1000000));
                 } catch (Exception $e) {
                     error_log("Error in page processing loop: " . $e->getMessage());
@@ -2317,7 +2744,8 @@ class Router {
                     
                     <div class="form-group">
                         <label>Rate Limit (seconds between requests)</label>
-                        <input type="number" step="0.1" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.5'); ?>">
+                        <input type="number" step="0.1" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.3'); ?>">
+                        <small>Optimized for parallel processing: 0.1-0.5 seconds recommended with curl_multi</small>
                     </div>
                     
                     <div class="form-group">
