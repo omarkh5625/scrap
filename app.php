@@ -3279,8 +3279,10 @@ class Router {
                     // Create job for immediate processing
                     $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                     
-                    // Redirect immediately to dashboard with job ID
-                    // Workers will be processed via AJAX polling from dashboard
+                    // Start job processing with calculated workers
+                    self::spawnParallelWorkers($jobId, $workerCount);
+                    
+                    // Redirect to dashboard with job ID
                     header('Location: ?page=dashboard&job_id=' . $jobId);
                     exit;
                 } else {
