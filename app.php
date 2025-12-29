@@ -348,89 +348,12 @@ class BloomFilter {
 class Job {
     public static function create(int $userId, string $query, string $apiKey, int $maxResults): int {
         $db = Database::connect();
-        $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results) VALUES (?, ?, ?, ?)");
+        $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, status) VALUES (?, ?, ?, ?, 'completed')");
         $stmt->execute([$userId, $query, $apiKey, $maxResults]);
         
         $jobId = (int)$db->lastInsertId();
         
-        // Automatically spawn a worker to process this job
-        self::spawnWorker();
-        
         return $jobId;
-    }
-    
-    private static function spawnWorker(): void {
-        // Only spawn workers in web mode, not CLI
-        if (php_sapi_name() === 'cli') {
-            return;
-        }
-        
-        $workerName = 'auto-worker-' . uniqid();
-        $phpBinary = PHP_BINARY;
-        $scriptPath = __FILE__;
-        
-        // Check OS type
-        $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
-        
-        // Log attempt for debugging
-        error_log("Attempting to spawn worker: {$workerName}");
-        
-        try {
-            if ($isWindows) {
-                // Windows: use popen with START command
-                $command = "start /B \"{$phpBinary}\" \"{$scriptPath}\" {$workerName}";
-                $handle = popen($command, 'r');
-                if ($handle) {
-                    pclose($handle);
-                    error_log("Worker spawned successfully on Windows");
-                }
-            } else {
-                // Unix/Linux: Try multiple methods in order of preference
-                
-                // Method 1: proc_open (best for detaching)
-                if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
-                    $descriptors = [
-                        0 => ['file', '/dev/null', 'r'],  // stdin
-                        1 => ['file', '/dev/null', 'w'],  // stdout
-                        2 => ['file', '/dev/null', 'w']   // stderr
-                    ];
-                    
-                    $process = @proc_open(
-                        "{$phpBinary} {$scriptPath} {$workerName} &",
-                        $descriptors,
-                        $pipes,
-                        null,
-                        null,
-                        ['bypass_shell' => false]
-                    );
-                    
-                    if (is_resource($process)) {
-                        // Don't wait - this allows the process to run independently
-                        error_log("Worker spawned successfully with proc_open");
-                        return; // Success
-                    }
-                }
-                
-                // Method 2: exec (fallback)
-                if (function_exists('exec') && !in_array('exec', explode(',', ini_get('disable_functions')))) {
-                    @exec("{$phpBinary} {$scriptPath} {$workerName} > /dev/null 2>&1 &");
-                    error_log("Worker spawned successfully with exec");
-                    return; // Success
-                }
-                
-                // Method 3: shell_exec (another fallback)
-                if (function_exists('shell_exec') && !in_array('shell_exec', explode(',', ini_get('disable_functions')))) {
-                    @shell_exec("{$phpBinary} {$scriptPath} {$workerName} > /dev/null 2>&1 &");
-                    error_log("Worker spawned successfully with shell_exec");
-                    return; // Success
-                }
-                
-                // If we reach here, all methods failed
-                error_log("WARNING: Could not spawn worker - all process execution functions are disabled or failed");
-            }
-        } catch (Exception $e) {
-            error_log("ERROR spawning worker: " . $e->getMessage());
-        }
     }
     
     public static function getAll(int $userId): array {
@@ -626,6 +549,56 @@ class Worker {
         
         return null;
     }
+    
+    public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
+        $job = Job::getById($jobId);
+        if (!$job) {
+            return;
+        }
+        
+        $apiKey = $job['api_key'];
+        $query = $job['query'];
+        
+        $processed = 0;
+        $page = (int)($startOffset / 10) + 1;
+        
+        while ($processed < $maxResults) {
+            $data = self::searchSerper($apiKey, $query, $page);
+            
+            if (!$data || !isset($data['organic'])) {
+                break;
+            }
+            
+            foreach ($data['organic'] as $result) {
+                if ($processed >= $maxResults) {
+                    break;
+                }
+                
+                $title = $result['title'] ?? '';
+                $link = $result['link'] ?? '';
+                $snippet = $result['snippet'] ?? '';
+                
+                if ($link) {
+                    Job::addResult($jobId, $title, $link, $snippet);
+                    $processed++;
+                }
+            }
+            
+            if (!isset($data['organic']) || count($data['organic']) === 0) {
+                break;
+            }
+            
+            $page++;
+            
+            // Rate limiting: use configurable setting or default 0.5 seconds
+            $rateLimit = (float)(Settings::get('rate_limit', '0.5'));
+            usleep((int)($rateLimit * 1000000));
+        }
+        
+        // Update progress
+        $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
+        Job::updateStatus($jobId, 'completed', min($progress, 100));
+    }
 }
 
 // ============================================================================
@@ -817,14 +790,10 @@ class Router {
                 $stmt->execute([$userId]);
                 $totalResults = $stmt->fetch()['total'];
                 
-                $stmt = $db->query("SELECT COUNT(*) as total FROM workers WHERE status = 'running'");
-                $activeWorkers = $stmt->fetch()['total'];
-                
                 echo json_encode([
                     'totalJobs' => $totalJobs,
                     'completedJobs' => $completedJobs,
-                    'totalResults' => $totalResults,
-                    'activeWorkers' => $activeWorkers
+                    'totalResults' => $totalResults
                 ]);
                 break;
                 
@@ -1023,13 +992,6 @@ class Router {
                         <div class="stat-label">Total Results</div>
                     </div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-icon">⚙️</div>
-                    <div class="stat-content">
-                        <div class="stat-value" id="active-workers">-</div>
-                        <div class="stat-label">Active Workers</div>
-                    </div>
-                </div>
             </div>
             
             <div class="card">
@@ -1094,7 +1056,6 @@ class Router {
                             document.getElementById('total-jobs').textContent = data.totalJobs;
                             document.getElementById('completed-jobs').textContent = data.completedJobs;
                             document.getElementById('total-results').textContent = data.totalResults;
-                            document.getElementById('active-workers').textContent = data.activeWorkers;
                         });
                 }
                 
@@ -1107,60 +1068,52 @@ class Router {
     
     private static function renderNewJob(): void {
         $success = false;
-        $canSpawnWorkers = false;
+        $resultsCount = 0;
         
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $query = $_POST['query'] ?? '';
             $apiKey = $_POST['api_key'] ?? '';
             $maxResults = (int)($_POST['max_results'] ?? 100);
+            $workerCount = (int)($_POST['worker_count'] ?? 1);
             
             if ($query && $apiKey) {
-                Job::create(Auth::getUserId(), $query, $apiKey, $maxResults);
+                // Create job and process immediately
+                $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults);
+                
+                // Process immediately with multiple workers
+                $resultsPerWorker = (int)ceil($maxResults / $workerCount);
+                
+                for ($i = 0; $i < $workerCount; $i++) {
+                    $startOffset = $i * $resultsPerWorker;
+                    $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+                    
+                    if ($workerMaxResults > 0) {
+                        // Process synchronously
+                        Worker::processJobImmediately($jobId, $startOffset, $workerMaxResults);
+                    }
+                }
+                
+                // Get final results count
+                $results = Job::getResults($jobId);
+                $resultsCount = count($results);
                 $success = true;
             }
         }
         
-        // Check if we can spawn workers automatically
-        $disabledFunctions = explode(',', ini_get('disable_functions'));
-        $canSpawnWorkers = function_exists('proc_open') && !in_array('proc_open', $disabledFunctions)
-                        || function_exists('exec') && !in_array('exec', $disabledFunctions)
-                        || function_exists('shell_exec') && !in_array('shell_exec', $disabledFunctions);
-        
-        self::renderLayout('New Job', function() use ($success, $canSpawnWorkers) {
+        self::renderLayout('New Job', function() use ($success, $resultsCount) {
             ?>
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job created successfully! 
-                    <?php if ($canSpawnWorkers): ?>
-                        Worker started automatically to process your job.
-                    <?php else: ?>
-                        Please start a worker manually to process the job.
-                    <?php endif; ?>
+                    ✓ Job completed successfully! Found <?php echo $resultsCount; ?> results.
                     <a href="?page=dashboard">Go to Dashboard</a>
-                </div>
-            <?php endif; ?>
-            
-            <?php if (!$canSpawnWorkers): ?>
-                <div class="card" style="background: #fff5e5; border: 1px solid #ffa500; margin-bottom: 20px;">
-                    <h3 style="color: #d68910; margin-bottom: 10px;">⚠️ Manual Worker Required</h3>
-                    <p style="margin-bottom: 10px;">
-                        Automatic worker spawning is disabled on this server. You need to start a worker manually to process jobs.
-                    </p>
-                    <p style="margin-bottom: 5px;"><strong>Run this command in terminal:</strong></p>
-                    <pre class="code-block" style="margin-bottom: 10px;">php <?php echo __FILE__; ?> worker-1</pre>
-                    <p style="font-size: 14px; color: #666;">
-                        <strong>Tip:</strong> Keep the worker running in the background or use a cron job to start workers automatically.
-                    </p>
                 </div>
             <?php endif; ?>
             
             <div class="card">
                 <h2>Create New Job</h2>
-                <?php if ($canSpawnWorkers): ?>
-                    <p style="margin-bottom: 20px; color: #4a5568;">
-                        ⚡ Workers will start automatically when you create a job - no need to run them manually!
-                    </p>
-                <?php endif; ?>
+                <p style="margin-bottom: 20px; color: #4a5568;">
+                    ⚡ Jobs are processed immediately - results appear instantly!
+                </p>
                 <form method="POST">
                     <div class="form-group">
                         <label>Search Query *</label>
@@ -1178,7 +1131,13 @@ class Router {
                         <input type="number" name="max_results" value="100" min="1" max="1000">
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Create Job & Auto-Start Worker</button>
+                    <div class="form-group">
+                        <label>Number of Workers</label>
+                        <input type="number" name="worker_count" value="1" min="1" max="10">
+                        <small>More workers = faster processing (parallel execution)</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">Process Job Immediately</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
