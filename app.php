@@ -957,7 +957,7 @@ class Router {
     }
     
     private static function handleSetup(): void {
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $host = $_POST['db_host'] ?? '';
             $database = $_POST['db_name'] ?? '';
             $username = $_POST['db_user'] ?? '';
@@ -980,7 +980,7 @@ class Router {
     }
     
     private static function handleLogin(): void {
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $username = $_POST['username'] ?? '';
             $password = $_POST['password'] ?? '';
             
@@ -1068,7 +1068,7 @@ class Router {
     
     private static function handleWorkerProcessing(): void {
         // This handles async HTTP worker requests (used when exec() is disabled)
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $jobId = (int)($_POST['job_id'] ?? 0);
             $startOffset = (int)($_POST['start_offset'] ?? 0);
             $maxResults = (int)($_POST['max_results'] ?? 100);
@@ -1234,7 +1234,7 @@ class Router {
     }
     
     private static function renderDashboard(): void {
-        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             if ($_POST['action'] === 'delete_job') {
                 $jobId = (int)$_POST['job_id'];
                 $db = Database::connect();
@@ -1455,7 +1455,7 @@ class Router {
         $jobId = 0;
         $error = null;
         
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
                 $query = $_POST['query'] ?? '';
                 $apiKey = $_POST['api_key'] ?? '';
@@ -1582,7 +1582,7 @@ class Router {
     }
     
     private static function renderSettings(): void {
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             foreach ($_POST as $key => $value) {
                 if (strpos($key, 'setting_') === 0) {
                     $settingKey = substr($key, 8);
