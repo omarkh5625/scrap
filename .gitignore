@@ -1,0 +1,26 @@
+# PHP Error Logs
+php_errors.log
+error_log
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node modules (if any)
+node_modules/
+
+# Environment files
+.env
+.env.local
