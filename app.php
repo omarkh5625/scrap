@@ -372,35 +372,64 @@ class Job {
         // Check OS type
         $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
         
-        if ($isWindows) {
-            // Windows: use popen with START command
-            $command = "start /B {$phpBinary} {$scriptPath} {$workerName} > NUL 2>&1";
-            pclose(popen($command, 'r'));
-        } else {
-            // Unix/Linux: use proc_open for better control
-            $descriptors = [
-                0 => ['pipe', 'r'],  // stdin
-                1 => ['pipe', 'w'],  // stdout
-                2 => ['pipe', 'w']   // stderr
-            ];
-            
-            $command = "{$phpBinary} {$scriptPath} {$workerName} > /dev/null 2>&1 &";
-            
-            // Try proc_open first
-            if (function_exists('proc_open')) {
-                $process = proc_open($command, $descriptors, $pipes);
-                if (is_resource($process)) {
-                    // Close pipes
-                    foreach ($pipes as $pipe) {
-                        fclose($pipe);
-                    }
-                    // Don't wait for the process
-                    proc_close($process);
+        // Log attempt for debugging
+        error_log("Attempting to spawn worker: {$workerName}");
+        
+        try {
+            if ($isWindows) {
+                // Windows: use popen with START command
+                $command = "start /B \"{$phpBinary}\" \"{$scriptPath}\" {$workerName}";
+                $handle = popen($command, 'r');
+                if ($handle) {
+                    pclose($handle);
+                    error_log("Worker spawned successfully on Windows");
                 }
             } else {
-                // Fallback to exec
-                exec($command);
+                // Unix/Linux: Try multiple methods in order of preference
+                
+                // Method 1: proc_open (best for detaching)
+                if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+                    $descriptors = [
+                        0 => ['file', '/dev/null', 'r'],  // stdin
+                        1 => ['file', '/dev/null', 'w'],  // stdout
+                        2 => ['file', '/dev/null', 'w']   // stderr
+                    ];
+                    
+                    $process = @proc_open(
+                        "{$phpBinary} {$scriptPath} {$workerName} &",
+                        $descriptors,
+                        $pipes,
+                        null,
+                        null,
+                        ['bypass_shell' => false]
+                    );
+                    
+                    if (is_resource($process)) {
+                        // Don't wait - this allows the process to run independently
+                        error_log("Worker spawned successfully with proc_open");
+                        return; // Success
+                    }
+                }
+                
+                // Method 2: exec (fallback)
+                if (function_exists('exec') && !in_array('exec', explode(',', ini_get('disable_functions')))) {
+                    @exec("{$phpBinary} {$scriptPath} {$workerName} > /dev/null 2>&1 &");
+                    error_log("Worker spawned successfully with exec");
+                    return; // Success
+                }
+                
+                // Method 3: shell_exec (another fallback)
+                if (function_exists('shell_exec') && !in_array('shell_exec', explode(',', ini_get('disable_functions')))) {
+                    @shell_exec("{$phpBinary} {$scriptPath} {$workerName} > /dev/null 2>&1 &");
+                    error_log("Worker spawned successfully with shell_exec");
+                    return; // Success
+                }
+                
+                // If we reach here, all methods failed
+                error_log("WARNING: Could not spawn worker - all process execution functions are disabled or failed");
             }
+        } catch (Exception $e) {
+            error_log("ERROR spawning worker: " . $e->getMessage());
         }
     }
     
@@ -1078,6 +1107,7 @@ class Router {
     
     private static function renderNewJob(): void {
         $success = false;
+        $canSpawnWorkers = false;
         
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $query = $_POST['query'] ?? '';
@@ -1090,20 +1120,47 @@ class Router {
             }
         }
         
-        self::renderLayout('New Job', function() use ($success) {
+        // Check if we can spawn workers automatically
+        $disabledFunctions = explode(',', ini_get('disable_functions'));
+        $canSpawnWorkers = function_exists('proc_open') && !in_array('proc_open', $disabledFunctions)
+                        || function_exists('exec') && !in_array('exec', $disabledFunctions)
+                        || function_exists('shell_exec') && !in_array('shell_exec', $disabledFunctions);
+        
+        self::renderLayout('New Job', function() use ($success, $canSpawnWorkers) {
             ?>
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job created successfully! Worker started automatically to process your job.
+                    ✓ Job created successfully! 
+                    <?php if ($canSpawnWorkers): ?>
+                        Worker started automatically to process your job.
+                    <?php else: ?>
+                        Please start a worker manually to process the job.
+                    <?php endif; ?>
                     <a href="?page=dashboard">Go to Dashboard</a>
+                </div>
+            <?php endif; ?>
+            
+            <?php if (!$canSpawnWorkers): ?>
+                <div class="card" style="background: #fff5e5; border: 1px solid #ffa500; margin-bottom: 20px;">
+                    <h3 style="color: #d68910; margin-bottom: 10px;">⚠️ Manual Worker Required</h3>
+                    <p style="margin-bottom: 10px;">
+                        Automatic worker spawning is disabled on this server. You need to start a worker manually to process jobs.
+                    </p>
+                    <p style="margin-bottom: 5px;"><strong>Run this command in terminal:</strong></p>
+                    <pre class="code-block" style="margin-bottom: 10px;">php <?php echo __FILE__; ?> worker-1</pre>
+                    <p style="font-size: 14px; color: #666;">
+                        <strong>Tip:</strong> Keep the worker running in the background or use a cron job to start workers automatically.
+                    </p>
                 </div>
             <?php endif; ?>
             
             <div class="card">
                 <h2>Create New Job</h2>
-                <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Workers will start automatically when you create a job - no need to run them manually!
-                </p>
+                <?php if ($canSpawnWorkers): ?>
+                    <p style="margin-bottom: 20px; color: #4a5568;">
+                        ⚡ Workers will start automatically when you create a job - no need to run them manually!
+                    </p>
+                <?php endif; ?>
                 <form method="POST">
                     <div class="form-group">
                         <label>Search Query *</label>
