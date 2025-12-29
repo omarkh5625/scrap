@@ -3106,9 +3106,29 @@ class Router {
                                     <td><span class="status-badge status-<?php echo $job['status']; ?>"><?php echo ucfirst($job['status']); ?></span></td>
                                     <td>
                                         <div class="progress-bar">
-                                            <div class="progress-fill" style="width: <?php echo $job['progress']; ?>%"></div>
+                                            <div class="progress-fill job-progress-fill-<?php echo $job['id']; ?>" style="width: <?php echo $job['progress']; ?>%"></div>
                                         </div>
-                                        <span class="progress-text"><?php echo $job['progress']; ?>%</span>
+                                        <span class="progress-text job-progress-text-<?php echo $job['id']; ?>"><?php echo $job['progress']; ?>%</span>
+                                        
+                                        <?php if ($job['status'] === 'running' || $job['status'] === 'pending'): ?>
+                                        <!-- Live Job Progress Details -->
+                                        <div class="live-progress-details" id="live-progress-<?php echo $job['id']; ?>" style="margin-top: 8px; padding: 8px; background: #f7fafc; border-radius: 4px; font-size: 11px; display: none;">
+                                            <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+                                                <div style="flex: 1; min-width: 80px;">
+                                                    <div style="font-weight: 600; color: #10b981;" class="job-emails-collected-<?php echo $job['id']; ?>">0</div>
+                                                    <div style="color: #718096;">Collected</div>
+                                                </div>
+                                                <div style="flex: 1; min-width: 80px;">
+                                                    <div style="font-weight: 600; color: #3182ce;" class="job-emails-target-<?php echo $job['id']; ?>">-</div>
+                                                    <div style="color: #718096;">Target</div>
+                                                </div>
+                                                <div style="flex: 1; min-width: 80px;">
+                                                    <div style="font-weight: 600; color: #8b5cf6;" class="job-active-workers-<?php echo $job['id']; ?>">0</div>
+                                                    <div style="color: #718096;">Workers</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <?php endif; ?>
                                     </td>
                                     <td>
                                         <?php
@@ -3116,7 +3136,7 @@ class Router {
                                         $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
                                         $stmt->execute([$job['id']]);
                                         $count = $stmt->fetch()['count'];
-                                        echo $count;
+                                        echo '<span class="job-email-count-' . $job['id'] . '">' . $count . '</span>';
                                         ?>
                                     </td>
                                     <td><?php echo $job['email_filter'] ? ucfirst($job['email_filter']) : 'All'; ?></td>
@@ -3174,6 +3194,83 @@ class Router {
                 
                 updateStats();
                 setInterval(updateStats, 3000); // Update every 3 seconds for real-time feeling
+                
+                // Update live progress for all running/pending jobs
+                function updateAllJobsLiveProgress() {
+                    // Get all running and pending jobs
+                    const runningJobs = <?php 
+                        $runningJobIds = [];
+                        foreach ($jobs as $job) {
+                            if ($job['status'] === 'running' || $job['status'] === 'pending') {
+                                $runningJobIds[] = $job['id'];
+                            }
+                        }
+                        echo json_encode($runningJobIds);
+                    ?>;
+                    
+                    if (runningJobs.length === 0) {
+                        return;
+                    }
+                    
+                    // Update each running job
+                    runningJobs.forEach(jobId => {
+                        fetch('?page=api&action=job-worker-status&job_id=' + jobId)
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.error) {
+                                    return;
+                                }
+                                
+                                const job = data.job;
+                                const emailsCollected = data.emails_collected || 0;
+                                const emailsRequired = data.emails_required || 0;
+                                const completionPercentage = data.completion_percentage || 0;
+                                const activeWorkers = data.active_workers || 0;
+                                
+                                // Update progress bar
+                                const progressFill = document.querySelector('.job-progress-fill-' + jobId);
+                                const progressText = document.querySelector('.job-progress-text-' + jobId);
+                                if (progressFill) {
+                                    progressFill.style.width = completionPercentage + '%';
+                                }
+                                if (progressText) {
+                                    progressText.textContent = completionPercentage + '%';
+                                }
+                                
+                                // Update email count
+                                const emailCount = document.querySelector('.job-email-count-' + jobId);
+                                if (emailCount) {
+                                    emailCount.textContent = emailsCollected;
+                                }
+                                
+                                // Show and update live progress details
+                                const liveProgress = document.getElementById('live-progress-' + jobId);
+                                if (liveProgress) {
+                                    liveProgress.style.display = 'block';
+                                    
+                                    const collectedEl = document.querySelector('.job-emails-collected-' + jobId);
+                                    const targetEl = document.querySelector('.job-emails-target-' + jobId);
+                                    const workersEl = document.querySelector('.job-active-workers-' + jobId);
+                                    
+                                    if (collectedEl) collectedEl.textContent = emailsCollected;
+                                    if (targetEl) targetEl.textContent = emailsRequired;
+                                    if (workersEl) workersEl.textContent = activeWorkers;
+                                    
+                                    // Hide live progress if job is completed
+                                    if (job.status === 'completed' || job.status === 'failed') {
+                                        liveProgress.style.display = 'none';
+                                    }
+                                }
+                            })
+                            .catch(err => console.error('Error updating job ' + jobId + ':', err));
+                    });
+                }
+                
+                // Initial update
+                updateAllJobsLiveProgress();
+                
+                // Update all running jobs every 3 seconds
+                setInterval(updateAllJobsLiveProgress, 3000);
                 
                 // Job progress widget logic
                 <?php if ($newJobId > 0): ?>
