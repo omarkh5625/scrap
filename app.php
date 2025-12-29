@@ -1,5 +1,5 @@
+<?php declare(strict_types=1);
 
-<?php
 /**
  * Complete PHP Email Extraction System - Single File Application
  * PHP 8.0+ Required
@@ -18,8 +18,6 @@
  * - CLI Worker Support
  * - Regex Email Extraction
  */
-
-declare(strict_types=1);
 
 // ============================================================================
 // CONFIGURATION SECTION - DO NOT EDIT MANUALLY AFTER INSTALLATION
