@@ -3127,32 +3127,95 @@ class Router {
                     .then(response => response.json())
                     .then(data => {
                         if (data.success) {
-                            // Show success message inline
-                            const successDiv = document.createElement('div');
-                            successDiv.className = 'alert alert-success';
-                            successDiv.style.marginBottom = '20px';
-                            successDiv.innerHTML = `
-                                <strong>✓ Job #${data.job_id} created successfully!</strong><br>
-                                ${data.worker_count} workers are now processing in the background.<br><br>
-                                <a href="?page=results&job_id=${data.job_id}" class="btn btn-primary" style="margin-right: 10px;">View Job Progress</a>
-                                <a href="?page=workers" class="btn">View All Workers</a>
+                            // Show live progress widget (same as New Job page)
+                            const progressWidget = document.createElement('div');
+                            progressWidget.innerHTML = `
+                                <div class="alert alert-success" style="margin-bottom: 20px;">
+                                    <strong>✓ Job #${data.job_id} created successfully with ${data.worker_count} workers!</strong>
+                                </div>
+                                <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                                    <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
+                                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                                        <div id="dashboard-progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                                            <span id="dashboard-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-emails-collected">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-emails-target">Loading...</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-active-workers">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-job-status">starting</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top: 15px; text-align: right;">
+                                        <a href="?page=results&job_id=${data.job_id}" class="btn" style="background: white; color: #10b981; margin-right: 10px;">View Full Results</a>
+                                        <a href="?page=workers" class="btn" style="background: rgba(255,255,255,0.2); color: white;">View Workers</a>
+                                    </div>
+                                </div>
                             `;
                             
-                            // Insert success message before form
+                            // Insert progress widget before form
                             const form = document.getElementById('dashboard-job-form');
-                            form.parentNode.insertBefore(successDiv, form);
+                            form.parentNode.insertBefore(progressWidget, form);
                             
-                            // Scroll to show the message
-                            successDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            // Scroll to show the widget
+                            progressWidget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            
+                            // Start live updates (efficient polling)
+                            let updateCount = 0;
+                            const maxUpdates = 200;
+                            
+                            function updateDashboardProgress() {
+                                if (updateCount++ >= maxUpdates) return;
+                                
+                                fetch('?page=api&action=job-worker-status&job_id=' + data.job_id)
+                                    .then(response => response.json())
+                                    .then(status => {
+                                        if (status.error) return;
+                                        
+                                        const percentage = status.completion_percentage || 0;
+                                        const collected = status.emails_collected || 0;
+                                        const target = status.emails_required || 0;
+                                        const workers = status.active_workers || 0;
+                                        const jobStatus = status.job ? status.job.status : 'running';
+                                        
+                                        document.getElementById('dashboard-progress-bar').style.width = percentage + '%';
+                                        document.getElementById('dashboard-progress-text').textContent = percentage + '%';
+                                        document.getElementById('dashboard-emails-collected').textContent = collected;
+                                        document.getElementById('dashboard-emails-target').textContent = target;
+                                        document.getElementById('dashboard-active-workers').textContent = workers;
+                                        document.getElementById('dashboard-job-status').textContent = jobStatus;
+                                        
+                                        if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+                                            setTimeout(updateDashboardProgress, 3000);
+                                        } else if (jobStatus === 'completed') {
+                                            document.getElementById('dashboard-job-status').textContent = '✅ Completed';
+                                        }
+                                    })
+                                    .catch(error => {
+                                        console.error('Progress update error:', error);
+                                        setTimeout(updateDashboardProgress, 5000);
+                                    });
+                            }
+                            
+                            setTimeout(updateDashboardProgress, 1000);
                             
                             // Reset button and form
                             submitBtn.disabled = false;
                             submitBtn.textContent = '🚀 Start Extraction';
                             submitBtn.style.background = 'white';
                             form.reset();
-                            
-                            // Auto-remove success message after 10 seconds
-                            setTimeout(() => successDiv.remove(), 10000);
                         } else {
                             // Show error in styled notification
                             const errorDiv = document.createElement('div');
@@ -3810,20 +3873,93 @@ class Router {
                         loadingOverlay.style.display = 'none';
                         
                         if (data.success) {
-                            // Show success message in alert area instead of alert()
+                            // Show live progress widget
                             const alertArea = document.getElementById('alert-area');
                             alertArea.innerHTML = `
                                 <div class="alert alert-success" style="margin-bottom: 20px;">
-                                    <strong>✓ Job #${data.job_id} created successfully!</strong><br>
-                                    ${data.worker_count} workers are now processing in the background.<br><br>
-                                    <a href="?page=results&job_id=${data.job_id}" class="btn btn-primary" style="margin-right: 10px;">View Job Progress</a>
-                                    <a href="?page=dashboard" class="btn">Go to Dashboard</a>
-                                    <a href="?page=workers" class="btn">View All Workers</a>
+                                    <strong>✓ Job #${data.job_id} created successfully with ${data.worker_count} workers!</strong>
+                                </div>
+                                <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                                    <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
+                                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                                        <div id="live-progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                                            <span id="live-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-emails-collected">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-emails-target">${data.job_id ? 'Loading...' : '-'}</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-active-workers">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-job-status">starting</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top: 15px; text-align: right;">
+                                        <a href="?page=results&job_id=${data.job_id}" class="btn" style="background: white; color: #10b981; margin-right: 10px;">View Full Results</a>
+                                        <a href="?page=workers" class="btn" style="background: rgba(255,255,255,0.2); color: white;">View Workers</a>
+                                    </div>
                                 </div>
                             `;
                             
                             // Scroll to top to show the message
                             window.scrollTo(0, 0);
+                            
+                            // Start live updates using efficient short polling (appears instant)
+                            let updateCount = 0;
+                            const maxUpdates = 200; // Stop after ~10 minutes (200 * 3s)
+                            
+                            function updateLiveProgress() {
+                                if (updateCount++ >= maxUpdates) {
+                                    return; // Stop updating after max updates
+                                }
+                                
+                                fetch('?page=api&action=job-worker-status&job_id=' + data.job_id)
+                                    .then(response => response.json())
+                                    .then(status => {
+                                        if (status.error) return;
+                                        
+                                        const percentage = status.completion_percentage || 0;
+                                        const collected = status.emails_collected || 0;
+                                        const target = status.emails_required || 0;
+                                        const workers = status.active_workers || 0;
+                                        const jobStatus = status.job ? status.job.status : 'running';
+                                        
+                                        // Update UI
+                                        document.getElementById('live-progress-bar').style.width = percentage + '%';
+                                        document.getElementById('live-progress-text').textContent = percentage + '%';
+                                        document.getElementById('live-emails-collected').textContent = collected;
+                                        document.getElementById('live-emails-target').textContent = target;
+                                        document.getElementById('live-active-workers').textContent = workers;
+                                        document.getElementById('live-job-status').textContent = jobStatus;
+                                        
+                                        // Continue updates if job is not complete
+                                        if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+                                            setTimeout(updateLiveProgress, 3000);
+                                        } else {
+                                            // Job complete - show message
+                                            if (jobStatus === 'completed') {
+                                                document.getElementById('live-job-status').textContent = '✅ Completed';
+                                            }
+                                        }
+                                    })
+                                    .catch(error => {
+                                        console.error('Progress update error:', error);
+                                        setTimeout(updateLiveProgress, 5000); // Retry with longer delay
+                                    });
+                            }
+                            
+                            // Start updates immediately
+                            setTimeout(updateLiveProgress, 1000); // First update after 1 second
                             
                             // Re-enable and reset the form for creating another job
                             submitBtn.disabled = false;
