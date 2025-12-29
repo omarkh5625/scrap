@@ -1,6 +1,6 @@
 # Scrap - PHP Email Extraction System
 
-A powerful PHP 8.0+ email extraction system with advanced worker management and real-time monitoring.
+A powerful PHP 8.0+ email extraction system with queue-based worker management and real-time monitoring.
 
 ## Features
 
@@ -8,48 +8,55 @@ A powerful PHP 8.0+ email extraction system with advanced worker management and 
 - 🔐 **Authentication System** - Secure user management
 - 📊 **Dashboard** - Real-time statistics and job monitoring
 - 📧 **Email Extraction** - Intelligent email harvesting from search results
-- 👥 **Worker Management** - Advanced parallel processing with real-time status
-- 🔄 **Async Background Workers** - Support for 1-1000 parallel workers
+- 👥 **Queue-Based Worker Management** - Reliable parallel processing with job queue
+- 🔄 **Persistent Workers** - CLI workers that poll for work
 - 🎯 **Email Type Filtering** - Gmail, Yahoo, Business domains
 - 🌍 **Country Targeting** - Geographic search result filtering
 - 📤 **Results Export** - CSV and JSON export formats
 - 🔍 **Google Serper.dev Integration** - Professional search API
 - 🛡️ **BloomFilter Deduplication** - Efficient duplicate prevention
-- ⚡ **CLI Worker Support** - Command-line worker processes
+- ⚡ **CLI Worker Support** - Reliable command-line worker processes
 - 🎨 **Modern UI** - Clean, responsive interface
 
-## Worker Status Monitoring
+## Worker System (Queue-Based)
 
-### Enhanced Worker Management
+### How It Works
 
-The system now includes comprehensive worker monitoring inspired by professional mail sender systems:
+The system uses a **queue-based architecture** for reliable job processing:
 
-#### Real-Time Statistics
-- **Active Workers** - Count of currently running workers
-- **Idle Workers** - Count of workers waiting for jobs
-- **Pages Processed** - Total number of search result pages scraped
-- **Emails Extracted** - Total emails found by all workers
-- **Average Runtime** - Mean runtime across all workers
-- **Performance Metrics** - Individual worker statistics
+1. **Job Creation** - Jobs are split into chunks and added to a processing queue
+2. **Worker Polling** - CLI workers continuously poll the queue for pending chunks
+3. **Chunk Processing** - Workers pick up chunks, process them, and mark as complete
+4. **Progress Tracking** - Job progress calculated from completed chunks
+5. **Reliability** - If a worker stops, pending chunks remain in queue for other workers
 
-#### Worker Details
+### Why Queue-Based?
+
+✓ **Works on cPanel** - No dependency on exec() or HTTP
+✓ **Reliable** - Work isn't lost if a worker stops
+✓ **Scalable** - Add more workers anytime
+✓ **Visible** - See pending work in the queue
+✓ **Standard** - Industry-standard pattern used by professional systems
+
+### Real-Time Statistics
+
+The Workers page shows:
+- **Active/Idle Workers** - How many workers are running
+- **Queue Status** - Pending, processing, and completed chunks
+- **Pages Processed** - Total search pages scraped
+- **Emails Extracted** - Total emails found
+- **Processing Rate** - Percentage of queue completed
+- **Worker Performance** - Individual worker metrics
+
+### Worker Details
+
 Each worker tracks:
 - Current status (idle/running/stopped)
-- Current job ID (if processing)
+- Current job and chunk being processed
 - Pages processed count
 - Emails extracted count
 - Total runtime
 - Last heartbeat timestamp
-
-### Accessing Worker Status
-
-Navigate to **Workers** page from the sidebar to view:
-- Live worker statistics dashboard
-- Active worker table with real-time updates
-- Performance metrics
-- Status indicators
-
-The page auto-refreshes every 3 seconds to show current system state.
 
 ## Installation
 
@@ -71,27 +78,39 @@ The page auto-refreshes every 3 seconds to show current system state.
    - Maximum emails to extract
    - Country target (optional)
    - Email type filter (all/gmail/yahoo/business)
-   - Number of parallel workers (1-1000)
-5. Click **Start Processing Immediately**
+   - Number of work chunks (1-1000)
+5. Click **Create Job & Queue for Processing**
+
+### Starting Workers
+
+**Required**: You must start CLI workers to process jobs
+
+```bash
+php app.php worker-1
+```
+
+Start multiple workers for parallel processing:
+```bash
+php app.php worker-1 &
+php app.php worker-2 &
+php app.php worker-3 &
+```
+
+Each worker:
+- Registers itself in the database
+- Polls the queue every few seconds
+- Picks up pending chunks
+- Processes emails
+- Updates statistics
+- Returns to polling
 
 ### Monitoring Workers
 
-**Option 1: Web Interface**
+**Web Interface:**
 - Go to **Workers** page to see real-time status
-- View statistics: active workers, pages processed, emails extracted
+- View statistics: active workers, queue status, processing rate
 - Monitor individual worker performance
-
-**Option 2: CLI Workers**
-```bash
-php app.php worker-name
-```
-
-Example:
-```bash
-php app.php worker-1
-php app.php worker-2
-php app.php worker-3
-```
+- See pending work in the queue
 
 ### Viewing Results
 
@@ -109,15 +128,7 @@ Access **Settings** page to configure:
 - Rate limiting (seconds between requests)
 - Deep scraping (fetch full page content)
 - Deep scraping threshold
-
-### Worker Configuration
-
-Workers automatically:
-- Register on startup
-- Track performance metrics
-- Update heartbeat every 3 seconds
-- Process jobs with dynamic task assignment
-- Report statistics in real-time
+- Worker polling interval
 
 ## Technical Details
 
@@ -125,25 +136,27 @@ Workers automatically:
 
 - `users` - User accounts
 - `jobs` - Extraction jobs
+- `job_queue` - Work chunks for parallel processing
 - `emails` - Extracted email results
 - `workers` - Worker registration and statistics
 - `bloomfilter` - Deduplication hash storage
 - `settings` - System configuration
 
-### Worker Statistics Schema
+### Job Queue Schema
 
 ```sql
-CREATE TABLE workers (
+CREATE TABLE job_queue (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    worker_name VARCHAR(100) UNIQUE NOT NULL,
-    status ENUM('idle', 'running', 'stopped'),
-    current_job_id INT NULL,
-    last_heartbeat TIMESTAMP NULL,
+    job_id INT NOT NULL,
+    start_offset INT NOT NULL,
+    max_results INT NOT NULL,
+    status ENUM('pending', 'processing', 'completed', 'failed'),
+    worker_id INT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    pages_processed INT DEFAULT 0,
-    emails_extracted INT DEFAULT 0,
-    runtime_seconds INT DEFAULT 0,
-    INDEX idx_status (status)
+    started_at TIMESTAMP NULL,
+    completed_at TIMESTAMP NULL,
+    INDEX idx_status (status),
+    INDEX idx_job (job_id)
 );
 ```
 
@@ -152,32 +165,33 @@ CREATE TABLE workers (
 - `?page=api&action=stats` - Job statistics
 - `?page=api&action=workers` - Worker list
 - `?page=api&action=worker-stats` - Worker statistics
+- `?page=api&action=queue-stats` - Queue metrics
 - `?page=api&action=jobs` - Job list
-
-## Requirements
-
-- PHP 8.0 or higher
-- MySQL 5.7 or higher
-- cURL extension
-- PDO MySQL extension
-- Serper.dev API key
 
 ## Performance
 
-- Supports 1-1000 parallel workers
-- Automatic load distribution
+- Supports unlimited workers (limited by server resources)
+- Queue-based distribution prevents race conditions
 - Real-time progress tracking
 - Efficient memory usage with BloomFilter
 - Rate limiting to prevent API throttling
-- Background processing with instant UI response
+- Workers can be started/stopped without data loss
 
 ## Security
 
 - Password hashing with bcrypt
 - SQL injection prevention with PDO
-- CSRF protection
 - Session management
 - Input validation and sanitization
+
+## Compatibility
+
+- **PHP 8.0+** required
+- **MySQL 5.7+** required
+- **cURL extension** required
+- **PDO MySQL extension** required
+- **Works on cPanel** and shared hosting
+- **No exec() required** - uses queue polling
 
 ## Support
 
