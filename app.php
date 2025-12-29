@@ -735,6 +735,8 @@ class Worker {
         
         $data = json_encode($payload);
         
+        error_log("searchSerper: Calling API with query='{$query}', page={$page}, country={$country}");
+        
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POST, true);
@@ -746,20 +748,41 @@ class Worker {
         
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
         curl_close($ch);
         
+        if ($curlError) {
+            error_log("searchSerper: cURL error: {$curlError}");
+            return null;
+        }
+        
+        error_log("searchSerper: HTTP code={$httpCode}");
+        
         if ($httpCode === 200 && $response) {
-            return json_decode($response, true);
+            $result = json_decode($response, true);
+            if ($result) {
+                error_log("searchSerper: Success, got " . (isset($result['organic']) ? count($result['organic']) : 0) . " organic results");
+                return $result;
+            } else {
+                error_log("searchSerper: JSON decode failed");
+            }
+        } else {
+            error_log("searchSerper: Non-200 response or empty body. Response: " . substr($response, 0, 500));
         }
         
         return null;
     }
     
     public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
+        error_log("processJobImmediately called: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults}");
+        
         $job = Job::getById($jobId);
         if (!$job) {
+            error_log("processJobImmediately: Job {$jobId} not found");
             return;
         }
+        
+        error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
         
         $apiKey = $job['api_key'];
         $query = $job['query'];
@@ -769,12 +792,23 @@ class Worker {
         $processed = 0;
         $page = (int)($startOffset / 10) + 1;
         
+        error_log("processJobImmediately: Starting from page {$page}");
+        
         while ($processed < $maxResults) {
+            error_log("processJobImmediately: Calling searchSerper, page={$page}");
             $data = self::searchSerper($apiKey, $query, $page, $country);
             
-            if (!$data || !isset($data['organic'])) {
+            if (!$data) {
+                error_log("processJobImmediately: searchSerper returned null/false");
                 break;
             }
+            
+            if (!isset($data['organic'])) {
+                error_log("processJobImmediately: No organic results in response");
+                break;
+            }
+            
+            error_log("processJobImmediately: Got " . count($data['organic']) . " organic results");
             
             foreach ($data['organic'] as $result) {
                 if ($processed >= $maxResults) {
@@ -783,6 +817,8 @@ class Worker {
                 
                 self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
             }
+            
+            error_log("processJobImmediately: Processed {$processed} so far");
             
             if (!isset($data['organic']) || count($data['organic']) === 0) {
                 break;
@@ -798,11 +834,15 @@ class Worker {
         // Update progress
         $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
         
+        error_log("processJobImmediately: Completed. Processed {$processed} emails, progress={$progress}%");
+        
         // If this worker has completed its portion and progress is 100%, mark job as completed
         if ($progress >= 100) {
             Job::updateStatus($jobId, 'completed', 100);
+            error_log("processJobImmediately: Job {$jobId} marked as completed");
         } else {
             Job::updateStatus($jobId, 'running', min($progress, 100));
+            error_log("processJobImmediately: Job {$jobId} progress updated to " . min($progress, 100) . "%");
         }
     }
 }
