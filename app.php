@@ -749,7 +749,7 @@ class EmailExtractor {
         
         // Check for placeholder/example emails
         $localPart = explode('@', $email)[0];
-        $junkPatterns = ['example', 'test', 'noreply', 'no-reply', 'admin@', 'info@', 'contact@', 'support@'];
+        $junkPatterns = ['example', 'test', 'noreply', 'no-reply', 'admin', 'info', 'contact', 'support'];
         foreach ($junkPatterns as $pattern) {
             if (stripos($localPart, $pattern) !== false || stripos($email, $pattern) !== false) {
                 return false;
@@ -2649,7 +2649,7 @@ class Router {
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Workers * 🚀</label>
                             <input type="number" name="worker_count" value="20" min="1" max="1000" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
-                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">20-50 workers = 100k emails in ~3 min</small>
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Estimated: 20-50 workers ≈ 100k emails in ~3 min*</small>
                         </div>
                         
                         <div>
@@ -2687,11 +2687,14 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
                     <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
-                        <li>Use 20-50 workers for fastest extraction (100k emails in ~3 minutes)</li>
+                        <li>Use 20-50 workers for fastest extraction (estimated: 100k emails in ~3 minutes)*</li>
                         <li>Business email filter removes junk and social media emails</li>
                         <li>Specific queries (industry + location) yield better quality emails</li>
                         <li>System automatically filters famous sites and placeholder emails</li>
                     </ul>
+                    <small style="display: block; margin-top: 8px; color: rgba(255,255,255,0.7); font-size: 11px;">
+                        * Performance depends on query quality, network speed, API limits, and data availability
+                    </small>
                 </div>
             </div>
             
