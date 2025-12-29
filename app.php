@@ -1160,20 +1160,28 @@ class Job {
 // ============================================================================
 
 class Worker {
-    // Configuration constants
+    // Configuration constants - Enhanced for 300 worker support
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 100; // Maximum workers to spawn automatically for maximum performance
+    private const AUTO_MAX_WORKERS = 300; // Maximum workers to spawn automatically - increased from 100 to 300
     private const OPTIMAL_RESULTS_PER_WORKER = 100; // Optimal number of results per worker for best performance
+    private const WORKER_HEARTBEAT_TIMEOUT = 300; // 5 minutes - consider worker dead if no heartbeat
+    private const WORKER_BATCH_SIZE = 50; // Spawn workers in batches to prevent resource spikes
+    
+    // Timing constants for worker spawning (configurable for different environments)
+    private const WORKER_SPAWN_DELAY_MS = 5; // Milliseconds between worker spawns within batch (reduced from 10)
+    private const BATCH_DELAY_MS = 100; // Milliseconds between batches
+    private const MAX_BACKGROUND_RUNTIME = 600; // Maximum runtime for background processing (10 minutes)
     
     /**
      * Calculate optimal worker count based on job size
      * Automatically determines the best number of workers for maximum performance
+     * Enhanced to support up to 300 workers efficiently
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
         // Calculate based on optimal results per worker
         $calculatedWorkers = (int)ceil($maxResults / self::OPTIMAL_RESULTS_PER_WORKER);
         
-        // Cap at maximum workers to avoid resource exhaustion
+        // Cap at maximum workers to avoid resource exhaustion (now 300 instead of 100)
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
@@ -1271,6 +1279,62 @@ class Worker {
         
         // Log the crash as a critical error
         self::logError($workerId, null, 'worker_crash', $reason, null, 'critical');
+    }
+    
+    /**
+     * Clean up old completed/stopped workers to prevent database bloat
+     * Important for 300 worker scenarios to keep database performant
+     * Only removes truly inactive workers (stopped status and old idle workers)
+     */
+    public static function cleanupOldWorkers(int $ageHours = 24): int {
+        $db = Database::connect();
+        
+        // Delete workers that are stopped or idle for long time and older than specified hours
+        // Idle workers are only deleted if they're old AND haven't sent heartbeat recently
+        $stmt = $db->prepare("
+            DELETE FROM workers 
+            WHERE (
+                status = 'stopped' 
+                OR (
+                    status = 'idle' 
+                    AND (last_heartbeat IS NULL OR last_heartbeat < DATE_SUB(NOW(), INTERVAL 1 HOUR))
+                )
+            )
+            AND created_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
+        ");
+        $stmt->execute([$ageHours]);
+        $deletedCount = $stmt->rowCount();
+        
+        if ($deletedCount > 0) {
+            error_log("cleanupOldWorkers: Deleted {$deletedCount} old worker records");
+        }
+        
+        return $deletedCount;
+    }
+    
+    /**
+     * Get count of workers by status - useful for monitoring at scale
+     */
+    public static function getWorkerCountByStatus(): array {
+        $db = Database::connect();
+        
+        $stmt = $db->query("
+            SELECT status, COUNT(*) as count 
+            FROM workers 
+            GROUP BY status
+        ");
+        
+        $counts = [
+            'running' => 0,
+            'idle' => 0,
+            'stopped' => 0
+        ];
+        
+        foreach ($stmt->fetchAll() as $row) {
+            $counts[$row['status']] = (int)$row['count'];
+        }
+        
+        return $counts;
     }
     
     public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
@@ -1564,15 +1628,14 @@ class Worker {
     public static function processJob(int $jobId): void {
         $job = Job::getById($jobId);
         if (!$job) {
+            error_log("processJob: Job {$jobId} not found");
             return;
         }
         
-        echo "Processing job #{$jobId}: {$job['query']}\n";
+        error_log("processJob: Processing job #{$jobId}: {$job['query']}");
         
-        // Register this worker for tracking
-        $workerName = 'cli-worker-' . getmypid();
-        $workerId = self::register($workerName);
-        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+        // NOTE: Worker should already be registered by caller
+        // Do NOT register a new worker here to avoid duplicates
         
         $apiKey = $job['api_key'];
         $query = $job['query'];
@@ -1585,6 +1648,8 @@ class Worker {
         $maxToProcess = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : $maxResults;
         $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
         
+        error_log("processJob: Job {$jobId} - offset {$startOffset}, max {$maxToProcess}, queue_id " . ($queueId ?? 'none'));
+        
         $processed = 0;
         $pagesProcessed = 0;
         $page = (int)($startOffset / 10) + 1;
@@ -1593,6 +1658,7 @@ class Worker {
             $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
+                error_log("processJob: No data returned for job {$jobId} page {$page}");
                 break;
             }
             
@@ -1605,13 +1671,7 @@ class Worker {
             }
             
             $emailsExtractedThisPage = $processed - $emailsBefore;
-            
-            // Update worker statistics
-            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
-            
-            if ($processed > 0 && $processed % 10 === 0) {
-                echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
-            }
+            error_log("processJob: Job {$jobId} page {$page} - extracted {$emailsExtractedThisPage} emails (total: {$processed}/{$maxToProcess})");
             
             if (!isset($data['organic']) || count($data['organic']) === 0) {
                 break;
@@ -1627,15 +1687,13 @@ class Worker {
         // Mark queue item as complete
         if ($queueId) {
             self::markQueueItemComplete($queueId);
+            error_log("processJob: Marked queue item {$queueId} as complete");
         }
         
         // Update overall job progress
         self::updateJobProgress($jobId);
         
-        echo "Job chunk completed! Processed {$processed} emails\n";
-        
-        // Mark worker as idle
-        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+        error_log("processJob: Job {$jobId} chunk completed! Processed {$processed} emails from {$pagesProcessed} pages");
     }
     
     public static function updateJobProgress(int $jobId): void {
@@ -1852,9 +1910,22 @@ class Router {
             return;
         }
         
-        // Handle login/logout
+        // ========================================================================
+        // SEPARATION OF UI AND BACKEND - Route based on request method
+        // ========================================================================
+        // GET requests = UI rendering (user interface)
+        // POST requests = Backend processing (data submission, API calls)
+        // This prevents UI blocking when backend processes are running
+        // ========================================================================
+        
+        $requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
         $page = $_GET['page'] ?? 'dashboard';
         
+        // ========================================================================
+        // BACKEND ROUTES (POST/API) - No UI rendering, pure backend logic
+        // ========================================================================
+        
+        // Handle login/logout
         if ($page === 'login') {
             self::handleLogin();
             return;
@@ -1873,36 +1944,52 @@ class Router {
             return;
         }
         
-        // Require authentication for all other pages
+        // Backend API endpoints - no UI rendering
+        if ($page === 'api') {
+            Auth::requireAuth();
+            self::handleAPI();
+            return;
+        }
+        
+        // Worker processing endpoints - backend only
+        if ($page === 'process-worker' || $page === 'start-worker') {
+            if ($requestMethod === 'POST') {
+                if ($page === 'process-worker') {
+                    self::handleWorkerProcessing();
+                } else {
+                    self::handleStartWorker();
+                }
+                return;
+            }
+        }
+        
+        // Export endpoints - backend only
+        if ($page === 'export') {
+            Auth::requireAuth();
+            self::handleExport();
+            return;
+        }
+        
+        // ========================================================================
+        // UI ROUTES (GET) - User interface rendering only
+        // ========================================================================
+        
+        // Require authentication for all UI pages
         Auth::requireAuth();
         
-        // Route to appropriate page
+        // Route to appropriate UI page
         switch ($page) {
             case 'dashboard':
                 self::renderDashboard();
                 break;
             case 'new-job':
             case 'workers':
-                // Redirect old pages to dashboard
+            case 'settings':
+                // Redirect all old pages to dashboard (Settings removed as per user request)
                 header('Location: ?page=dashboard');
                 exit;
-            case 'settings':
-                self::renderSettings();
-                break;
             case 'results':
                 self::renderResults();
-                break;
-            case 'export':
-                self::handleExport();
-                break;
-            case 'process-worker':
-                self::handleWorkerProcessing();
-                break;
-            case 'start-worker':
-                self::handleStartWorker();
-                break;
-            case 'api':
-                self::handleAPI();
                 break;
             default:
                 self::renderDashboard();
@@ -1943,13 +2030,27 @@ class Router {
         $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
         
         while (true) {
+            // Update heartbeat regularly - CRITICAL for worker monitoring
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
             $job = Worker::getNextJob();
             
             if ($job) {
+                echo "Got job #{$job['id']}\n";
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                Worker::processJob($job['id']);
+                
+                try {
+                    Worker::processJob($job['id']);
+                    echo "Job #{$job['id']} completed\n";
+                } catch (Exception $e) {
+                    echo "Error processing job #{$job['id']}: {$e->getMessage()}\n";
+                    Worker::logError($workerId, $job['id'], 'cli_worker_error', $e->getMessage(), $e->getTraceAsString());
+                }
+                
+                // Update heartbeat after job completion
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } else {
+                // No jobs found, but still update heartbeat to show worker is alive
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             }
             
@@ -2030,7 +2131,19 @@ class Router {
                 break;
                 
             case 'worker-stats':
-                echo json_encode(Worker::getStats());
+                // Probabilistic cleanup to prevent database bloat without affecting all requests
+                // Runs approximately 10% of the time (1 in 10 requests)
+                // This approach distributes cleanup overhead across requests
+                // For production with high traffic, consider moving to a dedicated cron job
+                if (rand(1, 10) === 1) {
+                    Worker::cleanupOldWorkers(24); // Clean workers older than 24 hours
+                }
+                
+                // Get and return worker statistics
+                $stats = Worker::getStats();
+                $stats['worker_counts'] = Worker::getWorkerCountByStatus();
+                
+                echo json_encode($stats);
                 break;
                 
             case 'diagnostic':
@@ -2096,6 +2209,24 @@ class Router {
                 }
                 
                 echo json_encode(Worker::getErrors($unresolvedOnly));
+                break;
+                
+            case 'cleanup-stale-workers':
+                // Manual cleanup endpoint for stale workers
+                $timeoutSeconds = (int)($_GET['timeout'] ?? 300);
+                $staleWorkers = Worker::detectStaleWorkers($timeoutSeconds);
+                $cleanedCount = 0;
+                
+                foreach ($staleWorkers as $worker) {
+                    Worker::markWorkerAsCrashed($worker['id'], 'Manual cleanup: Worker has not sent heartbeat for over ' . $timeoutSeconds . ' seconds.');
+                    $cleanedCount++;
+                }
+                
+                echo json_encode([
+                    'success' => true,
+                    'cleaned_count' => $cleanedCount,
+                    'message' => "Cleaned up {$cleanedCount} stale workers"
+                ]);
                 break;
                 
             case 'job-worker-status':
@@ -2343,8 +2474,10 @@ class Router {
                 
                 // Process queue items until empty or timeout
                 $startTime = time();
-                $maxRuntime = 300; // 5 minutes max per worker
+                $maxRuntime = 600; // 10 minutes max per worker (increased from 5)
                 $itemsProcessed = 0;
+                $noJobCounter = 0; // Counter for consecutive checks with no jobs
+                $maxNoJobChecks = 10; // Allow 10 checks before timing out (50 seconds)
                 
                 while ((time() - $startTime) < $maxRuntime) {
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
@@ -2352,6 +2485,7 @@ class Router {
                     $job = Worker::getNextJob();
                     
                     if ($job) {
+                        $noJobCounter = 0; // Reset counter when job found
                         error_log("handleStartWorker: Worker {$workerName} got job #{$job['id']}");
                         Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                         
@@ -2359,23 +2493,32 @@ class Router {
                             Worker::processJob($job['id']);
                             $itemsProcessed++;
                             error_log("handleStartWorker: Worker {$workerName} completed job #{$job['id']} (total: {$itemsProcessed})");
+                            
+                            // Update heartbeat after successful job
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         } catch (Exception $e) {
                             error_log("handleStartWorker: Worker {$workerName} error processing job #{$job['id']}: " . $e->getMessage());
+                            Worker::logError($workerId, $job['id'], 'worker_processing_error', $e->getMessage(), $e->getTraceAsString());
+                            
+                            // Update heartbeat even after error
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         }
-                        
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     } else {
-                        // No jobs available, sleep briefly
+                        $noJobCounter++;
+                        // No jobs available, sleep briefly and update heartbeat
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         usleep(500000); // 0.5 seconds
-                    }
-                    
-                    // If no items to process, check less frequently
-                    if ($itemsProcessed === 0 && (time() - $startTime) > 30) {
-                        error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found in 30 seconds");
-                        break;
+                        
+                        // Only exit if we've checked many times with no jobs AND processed nothing
+                        if ($itemsProcessed === 0 && $noJobCounter >= $maxNoJobChecks) {
+                            error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found after {$noJobCounter} checks");
+                            break;
+                        }
                     }
                 }
                 
+                // Final heartbeat before shutdown
+                Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
                 error_log("handleStartWorker: Worker {$workerName} shutting down after processing {$itemsProcessed} items");
                 
             } catch (Exception $e) {
@@ -2641,29 +2784,49 @@ class Router {
                     if (!$query || !$apiKey) {
                         $error = 'Query and API Key are required';
                     } else {
+                        // CRITICAL: Clean up any stale workers BEFORE creating new job
+                        // This prevents confusion with old workers showing as "active"
+                        error_log("=== CLEANING UP STALE WORKERS BEFORE NEW JOB ===");
+                        $staleWorkers = Worker::detectStaleWorkers(60); // Workers idle for 1+ minute
+                        foreach ($staleWorkers as $worker) {
+                            Worker::markWorkerAsCrashed($worker['id'], 'Auto-cleanup: Worker stale before new job creation');
+                        }
+                        error_log("Cleaned up " . count($staleWorkers) . " stale workers");
+                        
+                        // Also clean up old workers (24+ hours old)
+                        Worker::cleanupOldWorkers(1); // Clean workers older than 1 hour
+                        
                         // Create job for immediate processing
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
-                        // Prepare queue items but DON'T spawn workers yet
+                        // Prepare queue items for workers
                         self::createQueueItems($jobId, $workerCount);
                         
+                        // Log job creation
+                        error_log("✓ Job {$jobId} created with {$workerCount} workers queued for {$maxResults} emails");
+                        
                         // Send redirect response immediately (don't block UI)
-                        header('Location: ?page=dashboard&job_id=' . $jobId);
+                        header('Location: ?page=results&job_id=' . $jobId);
                         
                         // Close connection to user BEFORE spawning workers
                         if (function_exists('fastcgi_finish_request')) {
                             fastcgi_finish_request();
+                            error_log("✓ Response sent to user via fastcgi_finish_request, now spawning {$workerCount} workers");
                         } else {
                             if (ob_get_level() > 0) {
                                 ob_end_flush();
                             }
                             flush();
+                            error_log("✓ Response flushed to user, now spawning {$workerCount} workers");
                         }
                         
                         // Now spawn workers in background after response sent
                         ignore_user_abort(true);
-                        set_time_limit(300);
+                        set_time_limit(600); // 10 minutes for spawning
+                        
+                        error_log("=== STARTING WORKER SPAWN FOR JOB {$jobId} ===");
                         self::autoSpawnWorkers($workerCount);
+                        error_log("=== COMPLETED WORKER SPAWN FOR JOB {$jobId} ===");
                         
                         exit;
                     }
@@ -2787,7 +2950,7 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
                     <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
-                        <li>🚀 Workers spawn automatically based on job size (up to 100 workers for maximum speed)</li>
+                        <li>🚀 Workers spawn automatically based on job size (up to 300 workers for maximum speed)</li>
                         <li>Business email filter removes junk and social media emails</li>
                         <li>Specific queries (industry + location) yield better quality emails</li>
                         <li>System automatically filters famous sites and placeholder emails</li>
@@ -3217,6 +3380,13 @@ class Router {
     private static function autoSpawnWorkers(int $workerCount): void {
         error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
         
+        // ========================================================================
+        // ENHANCED WORKER SPAWNING FOR 300 WORKERS
+        // ========================================================================
+        // Strategy: Spawn workers in batches to prevent resource spikes
+        // This ensures system stability when spawning large number of workers
+        // ========================================================================
+        
         // For restricted hosting environments (exec disabled, no cron), 
         // process work directly in background after closing connection
         // This ensures extraction starts immediately without blocking UI
@@ -3224,13 +3394,13 @@ class Router {
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method");
-            // Method 1: Spawn background PHP processes (only if exec available)
+            error_log("autoSpawnWorkers: Using exec() method with batch spawning");
+            // Method 1: Spawn background PHP processes in batches (only if exec available)
             self::spawnWorkersViaExec($workerCount);
         } else {
             // Method 2: Direct background processing (no exec, no HTTP, no cron needed)
             // Process work in same request but after closing connection to user
-            error_log("autoSpawnWorkers: exec() not available, using direct background processing");
+            error_log("autoSpawnWorkers: exec() not available, using direct background processing with batching");
             self::processWorkersInBackground($workerCount);
         }
     }
@@ -3238,28 +3408,51 @@ class Router {
     private static function spawnWorkersViaExec(int $workerCount): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
+        $batchSize = Worker::WORKER_BATCH_SIZE; // 50 workers per batch
         
-        for ($i = 0; $i < $workerCount; $i++) {
-            // Build command to run worker in queue mode
-            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
-            $cmd = sprintf(
-                '%s %s %s > /dev/null 2>&1 &',
-                escapeshellarg($phpBinary),
-                escapeshellarg($scriptPath),
-                escapeshellarg($workerName)
-            );
+        error_log("spawnWorkersViaExec: Spawning {$workerCount} workers in batches of {$batchSize}");
+        
+        // Spawn workers in batches to prevent resource exhaustion
+        $batches = (int)ceil($workerCount / $batchSize);
+        
+        for ($batch = 0; $batch < $batches; $batch++) {
+            $batchStart = $batch * $batchSize;
+            $batchEnd = min($batchStart + $batchSize, $workerCount);
+            $currentBatchSize = $batchEnd - $batchStart;
             
-            // Execute in background
-            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-                // Windows
-                pclose(popen("start /B " . $cmd, "r"));
-            } else {
-                // Unix/Linux
-                exec($cmd);
+            error_log("  Batch " . ($batch + 1) . "/{$batches}: Spawning workers {$batchStart}-" . ($batchEnd - 1) . " ({$currentBatchSize} workers)");
+            
+            for ($i = $batchStart; $i < $batchEnd; $i++) {
+                // Build command to run worker in queue mode
+                $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+                $cmd = sprintf(
+                    '%s %s %s > /dev/null 2>&1 &',
+                    escapeshellarg($phpBinary),
+                    escapeshellarg($scriptPath),
+                    escapeshellarg($workerName)
+                );
+                
+                // Execute in background
+                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                    // Windows
+                    pclose(popen("start /B " . $cmd, "r"));
+                } else {
+                    // Unix/Linux
+                    exec($cmd);
+                }
+                
+                // Small delay between worker spawns in same batch to prevent fork bomb
+                usleep(self::WORKER_SPAWN_DELAY_MS * 1000); // Convert ms to microseconds
             }
             
-            error_log("Spawned worker: {$workerName}");
+            // Small delay between batches to allow workers to initialize
+            if ($batch < $batches - 1) {
+                usleep(self::BATCH_DELAY_MS * 1000); // Convert ms to microseconds
+                error_log("  Batch " . ($batch + 1) . " spawned. Waiting before next batch...");
+            }
         }
+        
+        error_log("spawnWorkersViaExec: All {$workerCount} workers spawned in {$batches} batches");
     }
     
     private static function spawnWorkersViaHttp(int $workerCount): int {
@@ -3405,55 +3598,85 @@ class Router {
      * Process workers in background after closing connection
      * This method works without exec, HTTP workers, or cron
      * Connection must be closed BEFORE calling this method
+     * Enhanced to handle 300 workers with batching strategy
      */
     private static function processWorkersInBackground(int $workerCount): void {
         error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers");
         
+        // ========================================================================
+        // ENHANCED BACKGROUND PROCESSING FOR 300 WORKERS
+        // ========================================================================
+        // Strategy: Process workers in batches with staggered execution
+        // This prevents memory exhaustion and database connection overload
+        // ========================================================================
+        
         // Connection should already be closed by caller
         // Just ensure we can continue after user disconnect
         ignore_user_abort(true);
-        set_time_limit(300); // 5 minutes max to prevent runaway processes
+        set_time_limit(self::MAX_BACKGROUND_RUNTIME); // Configurable timeout (10 minutes by default)
         
         // Now process work in background - user has already received response
         try {
             $db = Database::connect();
             
-            // Process queue items with multiple simulated workers
+            // Process queue items with multiple simulated workers in batches
+            $batchSize = self::WORKER_BATCH_SIZE; // 50 workers per batch
             $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
             $totalProcessed = 0;
             $startTime = time();
-            $maxRuntime = 300; // 5 minutes total
+            $maxRuntime = self::MAX_BACKGROUND_RUNTIME; // Use configurable timeout
             
-            for ($workerIndex = 0; $workerIndex < $workerCount; $workerIndex++) {
+            // Calculate number of batches
+            $batches = (int)ceil($workerCount / $batchSize);
+            error_log("processWorkersInBackground: Processing {$workerCount} workers in {$batches} batches of up to {$batchSize}");
+            
+            for ($batch = 0; $batch < $batches; $batch++) {
                 // Check if we've exceeded max runtime
                 if ((time() - $startTime) >= $maxRuntime) {
                     error_log("processWorkersInBackground: Max runtime reached, stopping");
                     break;
                 }
                 
-                $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
+                $batchStart = $batch * $batchSize;
+                $batchEnd = min($batchStart + $batchSize, $workerCount);
+                $currentBatchSize = $batchEnd - $batchStart;
                 
-                try {
-                    $workerId = Worker::register($workerName);
-                    if (!$workerId) {
-                        error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
-                        continue;
+                error_log("processWorkersInBackground: Processing batch " . ($batch + 1) . "/{$batches} (workers {$batchStart}-" . ($batchEnd - 1) . ")");
+                
+                // Process workers in this batch
+                for ($workerIndex = $batchStart; $workerIndex < $batchEnd; $workerIndex++) {
+                    // Check runtime periodically
+                    if ((time() - $startTime) >= $maxRuntime) {
+                        error_log("processWorkersInBackground: Max runtime reached in batch, stopping");
+                        break 2; // Break out of both loops
                     }
-                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered with ID {$workerId}");
                     
-                    // Each simulated worker processes items from the queue
-                    $itemsProcessed = 0;
+                    $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
                     
-                    for ($i = 0; $i < $maxItemsPerWorker; $i++) {
+                    try {
+                        $workerId = Worker::register($workerName);
+                        if (!$workerId) {
+                            error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
+                            continue;
+                        }
+                        
+                        // Send initial heartbeat
                         Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         
-                        $job = Worker::getNextJob();
+                        // Each simulated worker processes items from the queue
+                        $itemsProcessed = 0;
                         
-                        if ($job) {
-                            // Check if job has reached target email count
-                            $jobId = (int)$job['id'];
-                            $jobDetails = Job::getById($jobId);
-                            if ($jobDetails) {
+                        for ($i = 0; $i < $maxItemsPerWorker; $i++) {
+                            // Update heartbeat regularly - CRITICAL for monitoring
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                            
+                            $job = Worker::getNextJob();
+                            
+                            if ($job) {
+                                // Check if job has reached target email count
+                                $jobId = (int)$job['id'];
+                                $jobDetails = Job::getById($jobId);
+                                if ($jobDetails) {
                                 $emailsCollected = Job::getEmailCount($jobId);
                                 $maxResults = (int)$jobDetails['max_results'];
                                 
@@ -3465,20 +3688,20 @@ class Router {
                                 }
                             }
                             
-                            error_log("processWorkersInBackground: Worker {$workerIndex} processing job #{$job['id']}");
                             Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                             
                             try {
                                 Worker::processJob($job['id']);
                                 $itemsProcessed++;
                                 $totalProcessed++;
-                                error_log("processWorkersInBackground: Worker {$workerIndex} completed job #{$job['id']}");
+                                
+                                // Update heartbeat after processing
+                                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                                 
                                 // Check again after processing if target reached
                                 if ($jobDetails) {
                                     $emailsCollected = Job::getEmailCount($jobId);
                                     if ($emailsCollected >= $maxResults) {
-                                        error_log("processWorkersInBackground: Job {$jobId} reached target after processing, stopping");
                                         Worker::checkAndUpdateJobCompletion($jobId);
                                         break; // Stop processing more items for this worker
                                     }
@@ -3486,23 +3709,38 @@ class Router {
                             } catch (Exception $e) {
                                 error_log("processWorkersInBackground: Worker {$workerIndex} error on job #{$job['id']}: " . $e->getMessage());
                                 Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
+                                
+                                // Update heartbeat even after error
+                                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                             }
                         } else {
-                            // No more jobs in queue
-                            error_log("processWorkersInBackground: Worker {$workerIndex} - no more jobs available");
+                            // No more jobs in queue - mark worker as idle before breaking
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                             break;
                         }
                     }
                     
-                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                    error_log("processWorkersInBackground: Worker {$workerIndex} completed {$itemsProcessed} items");
+                    // Final heartbeat update before worker finishes - mark as STOPPED
+                    Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
+                    error_log("processWorkersInBackground: Worker {$workerIndex} ({$workerName}) finished and marked as stopped");
                     
                 } catch (Exception $e) {
                     error_log("processWorkersInBackground: Worker {$workerIndex} fatal error: " . $e->getMessage());
+                    // Mark worker as stopped even on error
+                    if ($workerId) {
+                        Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
+                    }
                 }
             }
             
-            error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers");
+            // Small delay between batches to prevent resource spikes (consistent with exec spawning)
+            if ($batch < $batches - 1) {
+                usleep(self::BATCH_DELAY_MS * 1000); // Convert ms to microseconds
+                error_log("processWorkersInBackground: Batch " . ($batch + 1) . " complete. Waiting before next batch...");
+            }
+        }
+            
+            error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers in {$batches} batches");
             
         } catch (Exception $e) {
             error_log("processWorkersInBackground: Fatal error: " . $e->getMessage());
@@ -3648,29 +3886,37 @@ class Router {
             </div>
             
             <div class="card">
-                <h2>ℹ️ How It Works</h2>
+                <h2>ℹ️ How It Works - Enhanced for 300 Workers</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>System automatically calculates and spawns optimal number of workers (up to 100)</li>
-                    <li>Job is split into chunks for parallel processing</li>
-                    <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously</li>
+                    <li>System automatically calculates and spawns optimal number of workers (up to 300)</li>
+                    <li><strong>Workers spawn in batches of 50</strong> with small delays to prevent resource spikes</li>
+                    <li>Job is split into chunks for parallel processing with transaction locking</li>
+                    <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously (up to 200 connections)</li>
                     <li>Emails are extracted and validated in batches</li>
                     <li>Duplicates are filtered using in-memory BloomFilter cache + database</li>
                     <li>Results appear in real-time on the dashboard</li>
+                    <li>Old workers are automatically cleaned up after 24 hours</li>
                 </ol>
                 <p style="margin-top: 15px;">
                     <strong>⚡ Performance Optimizations:</strong>
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
-                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size</li>
-                    <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections with curl_multi</li>
+                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size (up to 300)</li>
+                    <li><strong>Batch Spawning Strategy:</strong> Workers spawn in groups of 50 for stability</li>
+                    <li><strong>Parallel HTTP Requests:</strong> Up to 200 simultaneous connections with curl_multi</li>
                     <li><strong>Batch Processing:</strong> URLs scraped in parallel, emails inserted in bulk</li>
+                    <li><strong>Transaction Locking:</strong> Prevents race conditions in queue management</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support for faster requests</li>
                     <li><strong>Memory Caching:</strong> BloomFilter cache reduces database queries by ~90%</li>
                     <li><strong>Optimized Rate Limiting:</strong> 0.1s default with parallel processing</li>
+                    <li><strong>Automatic Cleanup:</strong> Old workers removed periodically to prevent database bloat</li>
                 </ul>
                 <p style="margin-top: 15px;">
-                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity when you click "🚀 Start Extraction". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
+                    <strong>🔒 UI/Backend Separation:</strong> The UI returns instantly (GET requests) while workers process in the background (POST/API requests). This ensures the interface never hangs, even with 300 workers running.
+                </p>
+                <p style="margin-top: 15px;">
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity when you click "🚀 Start Extraction". Works on all hosting environments including cPanel!
                 </p>
             </div>
             <?php
@@ -3862,9 +4108,14 @@ class Router {
             <div class="card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                     <h2>Active Workers</h2>
-                    <div class="worker-status-indicator">
-                        <span class="status-dot" id="worker-status-dot"></span>
-                        <span id="worker-status-text">Monitoring...</span>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="btn btn-sm" onclick="cleanupStaleWorkers()" style="background: #ed8936; color: white;">
+                            🧹 Cleanup Stale Workers
+                        </button>
+                        <div class="worker-status-indicator">
+                            <span class="status-dot" id="worker-status-dot"></span>
+                            <span id="worker-status-text">Monitoring...</span>
+                        </div>
                     </div>
                 </div>
                 <div id="workers-list">Loading...</div>
@@ -3872,6 +4123,11 @@ class Router {
             
             <div class="card">
                 <h2>🚨 System Alerts & Errors</h2>
+                <div style="background: #ebf8ff; border: 1px solid #90cdf4; padding: 15px; border-radius: 6px; margin-bottom: 15px;">
+                    <strong>💡 نصيحة / Tip:</strong> إذا رأيت عمال متوقفة (stale workers)، استخدم زر "🧹 Cleanup Stale Workers" أعلاه لتنظيفها.
+                    <br>
+                    العمال يرسلون heartbeat كل بضع ثوان للإشارة إلى أنهم نشطون. إذا لم يرسلوا heartbeat لمدة 5 دقائق، يتم اعتبارهم متوقفين.
+                </div>
                 <div id="worker-errors-list">Loading...</div>
             </div>
             
@@ -3882,18 +4138,30 @@ class Router {
                 <p>Example:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-1</pre>
                 <p style="margin-top: 15px; color: #718096;">
-                    <strong>⚡ Automatic Worker Spawning:</strong>
+                    <strong>⚡ Automatic Worker Spawning (Enhanced for 300 Workers):</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ System automatically spawns optimal workers based on job size (up to 100)</li>
+                    <li>✅ System automatically spawns optimal workers based on job size (up to 300)</li>
+                    <li>✅ <strong>Batch Spawning:</strong> Workers spawn in batches of 50 to prevent resource spikes</li>
+                    <li>✅ <strong>Staggered Execution:</strong> 0.1s delay between batches ensures stability</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum performance</li>
+                </ul>
+                <p style="margin-top: 15px; color: #718096;">
+                    <strong>🔧 Worker Management Features:</strong>
+                </p>
+                <ul style="color: #718096; padding-left: 20px;">
+                    <li>✅ <strong>Transaction Locking:</strong> Prevents race conditions in queue management</li>
+                    <li>✅ <strong>Automatic Cleanup:</strong> Old workers removed after 24 hours to prevent bloat</li>
+                    <li>✅ <strong>Heartbeat Monitoring:</strong> Workers send status updates every few seconds</li>
+                    <li>✅ <strong>Crash Detection:</strong> Stale workers automatically detected and marked</li>
+                    <li>✅ <strong>Error Recovery:</strong> Failed workers don't affect others</li>
                 </ul>
                 <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 100 simultaneous)</li>
+                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 200 simultaneous)</li>
                     <li>✅ <strong>Bulk operations</strong> for database inserts and email validation</li>
                     <li>✅ <strong>In-memory caching</strong> for BloomFilter (10K item cache)</li>
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
@@ -3970,6 +4238,29 @@ class Router {
                         }
                     })
                     .catch(err => console.error('Error resolving error:', err));
+                }
+                
+                function cleanupStaleWorkers() {
+                    if (!confirm('هل تريد تنظيف العمال المتوقفة؟\nCleanup stale workers that have not sent heartbeat?')) {
+                        return;
+                    }
+                    
+                    fetch('?page=api&action=cleanup-stale-workers')
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data.success) {
+                                alert('✓ تم التنظيف بنجاح!\nCleaned: ' + data.cleaned_count + ' workers\n' + data.message);
+                                updateWorkers();
+                                updateWorkerStats();
+                                updateWorkerErrors();
+                            } else {
+                                alert('✗ خطأ في التنظيف\nCleanup failed');
+                            }
+                        })
+                        .catch(err => {
+                            console.error('Error cleaning up workers:', err);
+                            alert('✗ خطأ في التنظيف\nError: ' + err.message);
+                        });
                 }
                 
                 function updateWorkerStats() {
@@ -4337,9 +4628,6 @@ class Router {
                 <nav class="nav">
                     <a href="?page=dashboard" class="nav-item <?php echo ($_GET['page'] ?? 'dashboard') === 'dashboard' ? 'active' : ''; ?>">
                         📊 Dashboard
-                    </a>
-                    <a href="?page=settings" class="nav-item <?php echo ($_GET['page'] ?? '') === 'settings' ? 'active' : ''; ?>">
-                        🔧 Settings
                     </a>
                     <a href="?page=logout" class="nav-item">
                         🚪 Logout
