@@ -125,6 +125,35 @@ class Database {
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 ");
             }
+            
+            // Migration: Add worker statistics columns if they don't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM workers LIKE 'pages_processed'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN pages_processed INT DEFAULT 0 AFTER last_heartbeat");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN emails_extracted INT DEFAULT 0 AFTER pages_processed");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN runtime_seconds INT DEFAULT 0 AFTER emails_extracted");
+            }
+            
+            // Migration: Create job_queue table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'job_queue'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS job_queue (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        job_id INT NOT NULL,
+                        start_offset INT NOT NULL,
+                        max_results INT NOT NULL,
+                        status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+                        worker_id INT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP NULL,
+                        completed_at TIMESTAMP NULL,
+                        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                        INDEX idx_status (status),
+                        INDEX idx_job (job_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
             // Don't die on migration errors, just log them
@@ -235,6 +264,9 @@ class Database {
                     current_job_id INT NULL,
                     last_heartbeat TIMESTAMP NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    pages_processed INT DEFAULT 0,
+                    emails_extracted INT DEFAULT 0,
+                    runtime_seconds INT DEFAULT 0,
                     INDEX idx_status (status)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
@@ -245,6 +277,23 @@ class Database {
                     setting_key VARCHAR(100) UNIQUE NOT NULL,
                     setting_value TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS job_queue (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    job_id INT NOT NULL,
+                    start_offset INT NOT NULL,
+                    max_results INT NOT NULL,
+                    status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+                    worker_id INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP NULL,
+                    completed_at TIMESTAMP NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                    INDEX idx_status (status),
+                    INDEX idx_job (job_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
@@ -596,10 +645,53 @@ class Worker {
         }
     }
     
-    public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null): void {
+    public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
         $db = Database::connect();
-        $stmt = $db->prepare("UPDATE workers SET status = ?, current_job_id = ?, last_heartbeat = NOW() WHERE id = ?");
-        $stmt->execute([$status, $jobId, $workerId]);
+        
+        // Simple runtime calculation based on created_at (cached in single query)
+        $stmt = $db->prepare("
+            UPDATE workers 
+            SET status = ?, 
+                current_job_id = ?, 
+                last_heartbeat = NOW(), 
+                pages_processed = pages_processed + ?, 
+                emails_extracted = emails_extracted + ?, 
+                runtime_seconds = TIMESTAMPDIFF(SECOND, created_at, NOW())
+            WHERE id = ?
+        ");
+        $stmt->execute([$status, $jobId, $pagesProcessed, $emailsExtracted, $workerId]);
+    }
+    
+    public static function getStats(): array {
+        $db = Database::connect();
+        
+        // Get active workers count
+        $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE status = 'running'");
+        $activeWorkers = $stmt->fetch()['count'];
+        
+        // Get idle workers count
+        $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE status = 'idle'");
+        $idleWorkers = $stmt->fetch()['count'];
+        
+        // Get total pages processed
+        $stmt = $db->query("SELECT SUM(pages_processed) as total FROM workers");
+        $totalPages = $stmt->fetch()['total'] ?? 0;
+        
+        // Get total emails extracted
+        $stmt = $db->query("SELECT SUM(emails_extracted) as total FROM workers");
+        $totalEmails = $stmt->fetch()['total'] ?? 0;
+        
+        // Get average runtime
+        $stmt = $db->query("SELECT AVG(runtime_seconds) as avg FROM workers WHERE runtime_seconds > 0");
+        $avgRuntime = (int)($stmt->fetch()['avg'] ?? 0);
+        
+        return [
+            'active_workers' => $activeWorkers,
+            'idle_workers' => $idleWorkers,
+            'total_pages' => $totalPages,
+            'total_emails' => $totalEmails,
+            'avg_runtime' => $avgRuntime
+        ];
     }
     
     public static function getNextJob(): ?array {
@@ -609,6 +701,33 @@ class Worker {
         $db->beginTransaction();
         
         try {
+            // First check job_queue for pending chunks
+            $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+            $stmt->execute();
+            $queueItem = $stmt->fetch();
+            
+            if ($queueItem) {
+                // Mark this queue item as processing
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueItem['id']]);
+                
+                // Get the job details
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+                $stmt->execute([$queueItem['job_id']]);
+                $job = $stmt->fetch();
+                
+                if ($job) {
+                    // Add queue info to job
+                    $job['queue_id'] = $queueItem['id'];
+                    $job['queue_start_offset'] = $queueItem['start_offset'];
+                    $job['queue_max_results'] = $queueItem['max_results'];
+                }
+                
+                $db->commit();
+                return $job ?: null;
+            }
+            
+            // Fallback to old method: check for pending jobs without queue
             $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
             $stmt->execute();
             $job = $stmt->fetch();
@@ -622,8 +741,21 @@ class Worker {
             return $job ?: null;
         } catch (PDOException $e) {
             $db->rollBack();
+            error_log("getNextJob error: " . $e->getMessage());
             return null;
         }
+    }
+    
+    public static function markQueueItemComplete(int $queueId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$queueId]);
+    }
+    
+    public static function markQueueItemFailed(int $queueId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$queueId]);
     }
     
     public static function processResultWithDeepScraping(
@@ -674,36 +806,54 @@ class Worker {
         
         echo "Processing job #{$jobId}: {$job['query']}\n";
         
+        // Register this worker for tracking
+        $workerName = 'cli-worker-' . getmypid();
+        $workerId = self::register($workerName);
+        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+        
         $apiKey = $job['api_key'];
         $query = $job['query'];
         $maxResults = (int)$job['max_results'];
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
-        $processed = 0;
-        $page = 1;
+        // Check if this is a queue-based job chunk
+        $startOffset = isset($job['queue_start_offset']) ? (int)$job['queue_start_offset'] : 0;
+        $maxToProcess = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : $maxResults;
+        $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
         
-        while ($processed < $maxResults) {
+        $processed = 0;
+        $pagesProcessed = 0;
+        $page = (int)($startOffset / 10) + 1;
+        
+        while ($processed < $maxToProcess) {
             $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
                 break;
             }
             
+            $pagesProcessed++;
+            $emailsBefore = $processed;
+            
             foreach ($data['organic'] as $result) {
-                if ($processed >= $maxResults) {
+                if ($processed >= $maxToProcess) {
                     break;
                 }
                 
-                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
+                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxToProcess);
                 
-                $progress = (int)(($processed / $maxResults) * 100);
-                Job::updateStatus($jobId, 'running', $progress);
+                $progress = (int)(($processed / $maxToProcess) * 100);
                 
                 if ($processed > 0 && $processed % 10 === 0) {
-                    echo "  - Progress: {$processed}/{$maxResults} emails\n";
+                    echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
                 }
             }
+            
+            $emailsExtractedThisPage = $processed - $emailsBefore;
+            
+            // Update worker statistics
+            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
             
             if (!isset($data['organic']) || count($data['organic']) === 0) {
                 break;
@@ -716,8 +866,42 @@ class Worker {
             usleep((int)($rateLimit * 1000000));
         }
         
-        Job::updateStatus($jobId, 'completed', 100);
-        echo "Job #{$jobId} completed! Total emails: {$processed}\n";
+        // Mark queue item as complete
+        if ($queueId) {
+            self::markQueueItemComplete($queueId);
+        }
+        
+        // Update overall job progress
+        self::updateJobProgress($jobId);
+        
+        echo "Job chunk completed! Processed {$processed} emails\n";
+        
+        // Mark worker as idle
+        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+    }
+    
+    public static function updateJobProgress(int $jobId): void {
+        $db = Database::connect();
+        
+        // Get total queue items and completed items
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM job_queue WHERE job_id = ?");
+        $stmt->execute([$jobId]);
+        $total = $stmt->fetch()['total'];
+        
+        $stmt = $db->prepare("SELECT COUNT(*) as completed FROM job_queue WHERE job_id = ? AND status = 'completed'");
+        $stmt->execute([$jobId]);
+        $completed = $stmt->fetch()['completed'];
+        
+        if ($total > 0) {
+            $progress = (int)(($completed / $total) * 100);
+            
+            // If all queue items are completed, mark job as completed
+            if ($completed === $total) {
+                Job::updateStatus($jobId, 'completed', 100);
+            } else {
+                Job::updateStatus($jobId, 'running', $progress);
+            }
+        }
     }
     
     private static function searchSerper(string $apiKey, string $query, int $page = 1, ?string $country = null): ?array {
@@ -784,12 +968,18 @@ class Worker {
         
         error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
         
+        // Register this worker for tracking
+        $workerName = 'worker-' . getmypid() . '-' . time();
+        $workerId = self::register($workerName);
+        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+        
         $apiKey = $job['api_key'];
         $query = $job['query'];
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
         $processed = 0;
+        $pagesProcessed = 0;
         $page = (int)($startOffset / 10) + 1;
         
         error_log("processJobImmediately: Starting from page {$page}");
@@ -810,6 +1000,9 @@ class Worker {
             
             error_log("processJobImmediately: Got " . count($data['organic']) . " organic results");
             
+            $pagesProcessed++;
+            $emailsBefore = $processed;
+            
             foreach ($data['organic'] as $result) {
                 if ($processed >= $maxResults) {
                     break;
@@ -817,6 +1010,11 @@ class Worker {
                 
                 self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
             }
+            
+            $emailsExtractedThisPage = $processed - $emailsBefore;
+            
+            // Update worker heartbeat with stats
+            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
             
             error_log("processJobImmediately: Processed {$processed} so far");
             
@@ -844,6 +1042,9 @@ class Worker {
             Job::updateStatus($jobId, 'running', min($progress, 100));
             error_log("processJobImmediately: Job {$jobId} progress updated to " . min($progress, 100) . "%");
         }
+        
+        // Mark worker as idle when done
+        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
     }
 }
 
@@ -940,6 +1141,9 @@ class Router {
             case 'process-worker':
                 self::handleWorkerProcessing();
                 break;
+            case 'start-worker':
+                self::handleStartWorker();
+                break;
             case 'api':
                 self::handleAPI();
                 break;
@@ -982,14 +1186,14 @@ class Router {
         $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
         
         while (true) {
-            Worker::updateHeartbeat($workerId, 'idle');
+            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
             $job = Worker::getNextJob();
             
             if ($job) {
-                Worker::updateHeartbeat($workerId, 'running', $job['id']);
+                Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                 Worker::processJob($job['id']);
-                Worker::updateHeartbeat($workerId, 'idle');
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             }
             
             sleep($pollingInterval);
@@ -1066,6 +1270,28 @@ class Router {
                 
             case 'workers':
                 echo json_encode(Worker::getAll());
+                break;
+                
+            case 'worker-stats':
+                echo json_encode(Worker::getStats());
+                break;
+                
+            case 'queue-stats':
+                $db = Database::connect();
+                $stmt = $db->query("SELECT COUNT(*) as pending FROM job_queue WHERE status = 'pending'");
+                $pending = $stmt->fetch()['pending'];
+                
+                $stmt = $db->query("SELECT COUNT(*) as processing FROM job_queue WHERE status = 'processing'");
+                $processing = $stmt->fetch()['processing'];
+                
+                $stmt = $db->query("SELECT COUNT(*) as completed FROM job_queue WHERE status = 'completed'");
+                $completed = $stmt->fetch()['completed'];
+                
+                echo json_encode([
+                    'pending' => $pending,
+                    'processing' => $processing,
+                    'completed' => $completed
+                ]);
                 break;
                 
             case 'jobs':
@@ -1153,6 +1379,79 @@ class Router {
                 } catch (Exception $e) {
                     error_log("HTTP Worker #{$workerIndex} error for job {$jobId}: " . $e->getMessage());
                 }
+            }
+        }
+        exit;
+    }
+    
+    private static function handleStartWorker(): void {
+        // This starts a worker that polls the queue
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $workerName = $_POST['worker_name'] ?? 'http-worker-' . uniqid();
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            
+            error_log("HTTP Worker {$workerName} starting...");
+            
+            // Close connection immediately so client doesn't wait
+            ignore_user_abort(true);
+            set_time_limit(0);
+            
+            // Calculate content before sending
+            $response = json_encode(['status' => 'started', 'worker' => $workerName]);
+            
+            // Send minimal response
+            header('Content-Type: application/json');
+            header('Content-Length: ' . strlen($response));
+            header('Connection: close');
+            echo $response;
+            
+            // Flush all output buffers
+            if (ob_get_level() > 0) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Close the session if it's open
+            if (session_id()) {
+                session_write_close();
+            }
+            
+            // Give time for connection to close
+            usleep(100000); // 0.1 seconds
+            
+            // Now run worker loop in background
+            try {
+                error_log("Worker {$workerName} entering queue polling mode");
+                
+                $workerId = Worker::register($workerName);
+                
+                // Process queue items until empty or timeout
+                $startTime = time();
+                $maxRuntime = 300; // 5 minutes max per worker
+                $itemsProcessed = 0;
+                
+                while ((time() - $startTime) < $maxRuntime) {
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    
+                    $job = Worker::getNextJob();
+                    
+                    if ($job) {
+                        Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                        Worker::processJob($job['id']);
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        $itemsProcessed++;
+                    } else {
+                        // No more jobs in queue, exit
+                        break;
+                    }
+                    
+                    // Small sleep between checks
+                    sleep(1);
+                }
+                
+                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} items.");
+            } catch (Exception $e) {
+                error_log("HTTP Worker {$workerName} error: " . $e->getMessage());
             }
         }
         exit;
@@ -1396,98 +1695,107 @@ class Router {
         $maxResults = (int)$job['max_results'];
         $resultsPerWorker = (int)ceil($maxResults / $workerCount);
         
-        // Update job to running status immediately
-        Job::updateStatus($jobId, 'running', 0);
-        
-        // Check if exec() is available
-        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
-        
-        if ($execAvailable) {
-            // Method 1: Spawn background PHP processes (preferred)
-            self::spawnWorkersViaExec($jobId, $workerCount, $resultsPerWorker, $maxResults);
-        } else {
-            // Method 2: Use async HTTP requests (fallback for restricted hosting)
-            self::spawnWorkersViaHttp($jobId, $workerCount, $resultsPerWorker, $maxResults);
-        }
-    }
-    
-    private static function spawnWorkersViaExec(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
-        $phpBinary = PHP_BINARY;
-        $scriptPath = __FILE__;
+        // Create queue items for parallel processing
+        $db = Database::connect();
         
         for ($i = 0; $i < $workerCount; $i++) {
             $startOffset = $i * $resultsPerWorker;
             $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
             
             if ($workerMaxResults > 0) {
-                // Build command to run worker
-                $cmd = sprintf(
-                    '%s %s process-job %d %d %d > /dev/null 2>&1 &',
-                    escapeshellarg($phpBinary),
-                    escapeshellarg($scriptPath),
-                    $jobId,
-                    $startOffset,
-                    $workerMaxResults
-                );
-                
-                // Execute in background
-                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-                    // Windows
-                    pclose(popen("start /B " . $cmd, "r"));
-                } else {
-                    // Unix/Linux
-                    exec($cmd);
-                }
+                // Insert queue item
+                $stmt = $db->prepare("INSERT INTO job_queue (job_id, start_offset, max_results, status) VALUES (?, ?, ?, 'pending')");
+                $stmt->execute([$jobId, $startOffset, $workerMaxResults]);
             }
+        }
+        
+        // Update job status to pending (workers will pick it up from queue)
+        Job::updateStatus($jobId, 'pending', 0);
+        
+        error_log("Created {$workerCount} queue items for job {$jobId}. Auto-spawning workers...");
+        
+        // Auto-spawn workers to process the queue immediately
+        self::autoSpawnWorkers($workerCount);
+    }
+    
+    private static function autoSpawnWorkers(int $workerCount): void {
+        // Check if exec() is available
+        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+        
+        if ($execAvailable) {
+            // Method 1: Spawn background PHP processes (preferred)
+            self::spawnWorkersViaExec($workerCount);
+        } else {
+            // Method 2: Use async HTTP requests (fallback for restricted hosting)
+            self::spawnWorkersViaHttp($workerCount);
         }
     }
     
-    private static function spawnWorkersViaHttp(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
+    private static function spawnWorkersViaExec(int $workerCount): void {
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            // Build command to run worker in queue mode
+            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+            $cmd = sprintf(
+                '%s %s %s > /dev/null 2>&1 &',
+                escapeshellarg($phpBinary),
+                escapeshellarg($scriptPath),
+                escapeshellarg($workerName)
+            );
+            
+            // Execute in background
+            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                // Windows
+                pclose(popen("start /B " . $cmd, "r"));
+            } else {
+                // Unix/Linux
+                exec($cmd);
+            }
+            
+            error_log("Spawned worker: {$workerName}");
+        }
+    }
+    
+    private static function spawnWorkersViaHttp(int $workerCount): void {
         // Get the current URL
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
-        error_log("Spawning {$workerCount} workers via HTTP for job {$jobId}");
+        error_log("Spawning {$workerCount} HTTP workers");
         
         for ($i = 0; $i < $workerCount; $i++) {
-            $startOffset = $i * $resultsPerWorker;
-            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
             
-            if ($workerMaxResults > 0) {
-                // Create async HTTP request to trigger worker
-                $ch = curl_init($baseUrl . '?page=process-worker');
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_POST, true);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
-                    'job_id' => $jobId,
-                    'start_offset' => $startOffset,
-                    'max_results' => $workerMaxResults,
-                    'worker_index' => $i,
-                    'worker_token' => md5($jobId . $startOffset . 'secret')
-                ]));
-                curl_setopt($ch, CURLOPT_TIMEOUT, 5); // Give it 5 seconds to establish connection
-                curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
-                
-                // Execute async (don't wait for response)
-                $result = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                
-                if ($httpCode !== 200) {
-                    error_log("Failed to spawn worker #{$i} for job {$jobId}, HTTP code: {$httpCode}");
-                } else {
-                    error_log("Successfully spawned worker #{$i} for job {$jobId}");
-                }
-                
-                curl_close($ch);
-                
-                // Small delay between spawning workers to avoid overwhelming the server
-                usleep(50000); // 0.05 seconds
+            // Create async HTTP request to trigger worker
+            $ch = curl_init($baseUrl . '?page=start-worker');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'worker_name' => $workerName,
+                'worker_index' => $i
+            ]));
+            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Short timeout to just start the worker
+            curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            
+            // Execute async (don't wait for response)
+            curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            
+            if ($httpCode === 200) {
+                error_log("Successfully spawned HTTP worker: {$workerName}");
+            } else {
+                error_log("Failed to spawn HTTP worker #{$i}, HTTP code: {$httpCode}");
             }
+            
+            curl_close($ch);
+            
+            // Small delay between spawning workers
+            usleep(50000); // 0.05 seconds
         }
-        
-        error_log("All {$workerCount} workers spawned for job {$jobId}");
     }
     
     private static function renderNewJob(): void {
@@ -1531,16 +1839,17 @@ class Router {
             
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job #<?php echo $jobId; ?> created and processing started immediately! <?php echo $_POST['worker_count'] ?? 5; ?> parallel workers are running in the background.
-                    <a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
-                    <a href="?page=dashboard">Go to Dashboard</a>
+                    ✓ Job #<?php echo $jobId; ?> created and processing started! <?php echo $_POST['worker_count'] ?? 5; ?> workers have been spawned automatically.
+                    <br><a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
+                    <a href="?page=dashboard">Go to Dashboard</a> | 
+                    <a href="?page=workers">View Workers</a>
                 </div>
             <?php endif; ?>
             
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Jobs start processing immediately with parallel workers! No need to start CLI workers.
+                    ⚡ Workers start automatically when you create a job! Results appear in real-time.
                 </p>
                 <form method="POST">
                     <div class="form-group">
@@ -1595,10 +1904,10 @@ class Router {
                     <div class="form-group">
                         <label>Parallel Workers</label>
                         <input type="number" name="worker_count" value="5" min="1" max="1000">
-                        <small>Number of parallel workers to spawn (1-1000). More workers = faster processing</small>
+                        <small>Number of parallel workers to spawn automatically (1-1000). More workers = faster processing</small>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Start Processing Immediately</button>
+                    <button type="submit" class="btn btn-primary">Create Job & Start Processing</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
@@ -1607,14 +1916,14 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>Parallel workers start immediately in the background</li>
-                    <li>Emails are extracted from search results using regex patterns</li>
+                    <li>Workers start automatically in the background</li>
+                    <li>Job is split into chunks for parallel processing</li>
+                    <li>Workers pick up chunks from the queue and extract emails</li>
                     <li>Duplicates are automatically filtered out</li>
                     <li>Results appear in real-time on the dashboard</li>
                 </ol>
                 <p style="margin-top: 15px;">
-                    <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Start Processing Immediately". No manual CLI worker setup needed! The UI returns instantly while workers process in the background.
-                </p>
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Create Job & Start Processing". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
                 </p>
             </div>
             <?php
@@ -1707,9 +2016,92 @@ class Router {
     private static function renderWorkers(): void {
         self::renderLayout('Workers Control', function() {
             ?>
+            <!-- Worker Statistics Dashboard -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="active-workers">-</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">💤</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="idle-workers">-</div>
+                        <div class="stat-label">Idle Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📋</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="pending-queue">-</div>
+                        <div class="stat-label">Pending in Queue</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚙️</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="processing-queue">-</div>
+                        <div class="stat-label">Processing Now</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">📄</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-pages">-</div>
+                        <div class="stat-label">Pages Processed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-worker-emails">-</div>
+                        <div class="stat-label">Emails Extracted</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="completed-queue">-</div>
+                        <div class="stat-label">Completed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏱️</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="avg-runtime">-</div>
+                        <div class="stat-label">Avg Runtime</div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="card">
-                <h2>Active Workers</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h2>Active Workers</h2>
+                    <div class="worker-status-indicator">
+                        <span class="status-dot" id="worker-status-dot"></span>
+                        <span id="worker-status-text">Monitoring...</span>
+                    </div>
+                </div>
                 <div id="workers-list">Loading...</div>
+            </div>
+            
+            <div class="card">
+                <h2>Performance Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">Queue Processing Rate</div>
+                        <div class="metric-value" id="queue-rate">-</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Last Update</div>
+                        <div class="metric-value" id="last-update">-</div>
+                    </div>
+                </div>
             </div>
             
             <div class="card">
@@ -1718,9 +2110,65 @@ class Router {
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-name</pre>
                 <p>Example:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-1</pre>
+                <p style="margin-top: 15px; color: #718096;">
+                    <strong>Note:</strong> Workers automatically track their performance metrics including pages processed, emails extracted, and runtime.
+                </p>
             </div>
             
             <script>
+                function formatRuntime(seconds) {
+                    if (seconds < 60) return seconds + 's';
+                    if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+                    return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
+                }
+                
+                function updateWorkerStats() {
+                    fetch('?page=api&action=worker-stats')
+                        .then(res => res.json())
+                        .then(stats => {
+                            document.getElementById('active-workers').textContent = stats.active_workers;
+                            document.getElementById('idle-workers').textContent = stats.idle_workers;
+                            document.getElementById('total-pages').textContent = stats.total_pages;
+                            document.getElementById('total-worker-emails').textContent = stats.total_emails;
+                            document.getElementById('avg-runtime').textContent = formatRuntime(stats.avg_runtime);
+                            
+                            // Update status indicator
+                            const statusDot = document.getElementById('worker-status-dot');
+                            const statusText = document.getElementById('worker-status-text');
+                            
+                            if (stats.active_workers > 0) {
+                                statusDot.style.background = '#48bb78';
+                                statusText.textContent = stats.active_workers + ' worker(s) active';
+                            } else if (stats.idle_workers > 0) {
+                                statusDot.style.background = '#ecc94b';
+                                statusText.textContent = 'Workers idle';
+                            } else {
+                                statusDot.style.background = '#cbd5e0';
+                                statusText.textContent = 'No workers';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching worker stats:', err));
+                    
+                    // Update queue stats
+                    fetch('?page=api&action=queue-stats')
+                        .then(res => res.json())
+                        .then(queue => {
+                            document.getElementById('pending-queue').textContent = queue.pending;
+                            document.getElementById('processing-queue').textContent = queue.processing;
+                            document.getElementById('completed-queue').textContent = queue.completed;
+                            
+                            // Calculate processing rate
+                            const total = queue.pending + queue.processing + queue.completed;
+                            if (total > 0) {
+                                const rate = Math.round((queue.completed / total) * 100) + '%';
+                                document.getElementById('queue-rate').textContent = rate;
+                            } else {
+                                document.getElementById('queue-rate').textContent = '0%';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching queue stats:', err));
+                }
+                
                 function updateWorkers() {
                     fetch('?page=api&action=workers')
                         .then(res => res.json())
@@ -1728,31 +2176,48 @@ class Router {
                             const container = document.getElementById('workers-list');
                             
                             if (workers.length === 0) {
-                                container.innerHTML = '<p class="empty-state">No workers running</p>';
+                                container.innerHTML = '<p class="empty-state">No workers registered yet. Start a worker using the command below.</p>';
                                 return;
                             }
                             
-                            let html = '<table class="data-table"><thead><tr><th>Worker</th><th>Status</th><th>Current Job</th><th>Last Heartbeat</th></tr></thead><tbody>';
+                            let html = '<table class="data-table"><thead><tr><th>Worker</th><th>Status</th><th>Current Job</th><th>Pages</th><th>Emails</th><th>Runtime</th><th>Last Heartbeat</th></tr></thead><tbody>';
                             
                             workers.forEach(worker => {
                                 const lastHeartbeat = worker.last_heartbeat ? new Date(worker.last_heartbeat).toLocaleString() : 'Never';
-                                const jobInfo = worker.current_job_id ? '#' + worker.current_job_id : '-';
+                                const jobInfo = worker.current_job_id ? '<a href="?page=results&job_id=' + worker.current_job_id + '">#' + worker.current_job_id + '</a>' : '-';
+                                const runtime = formatRuntime(worker.runtime_seconds || 0);
                                 
                                 html += `<tr>
-                                    <td>${worker.worker_name}</td>
+                                    <td><strong>${worker.worker_name}</strong></td>
                                     <td><span class="status-badge status-${worker.status}">${worker.status}</span></td>
                                     <td>${jobInfo}</td>
+                                    <td>${worker.pages_processed || 0}</td>
+                                    <td>${worker.emails_extracted || 0}</td>
+                                    <td>${runtime}</td>
                                     <td>${lastHeartbeat}</td>
                                 </tr>`;
                             });
                             
                             html += '</tbody></table>';
                             container.innerHTML = html;
+                            
+                            // Update last update time
+                            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                        })
+                        .catch(err => {
+                            console.error('Error fetching workers:', err);
                         });
                 }
                 
+                // Initial load
+                updateWorkerStats();
                 updateWorkers();
-                setInterval(updateWorkers, 3000);
+                
+                // Update every 3 seconds
+                setInterval(() => {
+                    updateWorkerStats();
+                    updateWorkers();
+                }, 3000);
             </script>
             <?php
         });
@@ -2354,6 +2819,60 @@ class Router {
             border-radius: 6px;
             font-family: 'Courier New', monospace;
             overflow-x: auto;
+        }
+        
+        /* Worker Status Indicator */
+        .worker-status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #48bb78;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        /* Metrics Grid */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        
+        .metric-item {
+            padding: 15px;
+            background: #f7fafc;
+            border-radius: 6px;
+        }
+        
+        .metric-label {
+            font-size: 13px;
+            color: #718096;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #2d3748;
+        }
+        
+        .worker-detail {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f7fafc;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #4a5568;
         }
         
         /* Responsive */
