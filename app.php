@@ -351,7 +351,57 @@ class Job {
         $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results) VALUES (?, ?, ?, ?)");
         $stmt->execute([$userId, $query, $apiKey, $maxResults]);
         
-        return (int)$db->lastInsertId();
+        $jobId = (int)$db->lastInsertId();
+        
+        // Automatically spawn a worker to process this job
+        self::spawnWorker();
+        
+        return $jobId;
+    }
+    
+    private static function spawnWorker(): void {
+        // Only spawn workers in web mode, not CLI
+        if (php_sapi_name() === 'cli') {
+            return;
+        }
+        
+        $workerName = 'auto-worker-' . uniqid();
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        // Check OS type
+        $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+        
+        if ($isWindows) {
+            // Windows: use popen with START command
+            $command = "start /B {$phpBinary} {$scriptPath} {$workerName} > NUL 2>&1";
+            pclose(popen($command, 'r'));
+        } else {
+            // Unix/Linux: use proc_open for better control
+            $descriptors = [
+                0 => ['pipe', 'r'],  // stdin
+                1 => ['pipe', 'w'],  // stdout
+                2 => ['pipe', 'w']   // stderr
+            ];
+            
+            $command = "{$phpBinary} {$scriptPath} {$workerName} > /dev/null 2>&1 &";
+            
+            // Try proc_open first
+            if (function_exists('proc_open')) {
+                $process = proc_open($command, $descriptors, $pipes);
+                if (is_resource($process)) {
+                    // Close pipes
+                    foreach ($pipes as $pipe) {
+                        fclose($pipe);
+                    }
+                    // Don't wait for the process
+                    proc_close($process);
+                }
+            } else {
+                // Fallback to exec
+                exec($command);
+            }
+        }
     }
     
     public static function getAll(int $userId): array {
@@ -1027,6 +1077,8 @@ class Router {
     }
     
     private static function renderNewJob(): void {
+        $success = false;
+        
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $query = $_POST['query'] ?? '';
             $apiKey = $_POST['api_key'] ?? '';
@@ -1034,15 +1086,24 @@ class Router {
             
             if ($query && $apiKey) {
                 Job::create(Auth::getUserId(), $query, $apiKey, $maxResults);
-                header('Location: ?page=dashboard');
-                exit;
+                $success = true;
             }
         }
         
-        self::renderLayout('New Job', function() {
+        self::renderLayout('New Job', function() use ($success) {
             ?>
+            <?php if ($success): ?>
+                <div class="alert alert-success">
+                    ✓ Job created successfully! Worker started automatically to process your job.
+                    <a href="?page=dashboard">Go to Dashboard</a>
+                </div>
+            <?php endif; ?>
+            
             <div class="card">
                 <h2>Create New Job</h2>
+                <p style="margin-bottom: 20px; color: #4a5568;">
+                    ⚡ Workers will start automatically when you create a job - no need to run them manually!
+                </p>
                 <form method="POST">
                     <div class="form-group">
                         <label>Search Query *</label>
@@ -1060,7 +1121,7 @@ class Router {
                         <input type="number" name="max_results" value="100" min="1" max="1000">
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Create Job</button>
+                    <button type="submit" class="btn btn-primary">Create Job & Auto-Start Worker</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
