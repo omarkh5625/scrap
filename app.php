@@ -2038,13 +2038,27 @@ class Router {
         $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
         
         while (true) {
+            // Update heartbeat regularly - CRITICAL for worker monitoring
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
             $job = Worker::getNextJob();
             
             if ($job) {
+                echo "Got job #{$job['id']}\n";
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                Worker::processJob($job['id']);
+                
+                try {
+                    Worker::processJob($job['id']);
+                    echo "Job #{$job['id']} completed\n";
+                } catch (Exception $e) {
+                    echo "Error processing job #{$job['id']}: {$e->getMessage()}\n";
+                    Worker::logError($workerId, $job['id'], 'cli_worker_error', $e->getMessage(), $e->getTraceAsString());
+                }
+                
+                // Update heartbeat after job completion
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } else {
+                // No jobs found, but still update heartbeat to show worker is alive
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             }
             
@@ -2203,6 +2217,24 @@ class Router {
                 }
                 
                 echo json_encode(Worker::getErrors($unresolvedOnly));
+                break;
+                
+            case 'cleanup-stale-workers':
+                // Manual cleanup endpoint for stale workers
+                $timeoutSeconds = (int)($_GET['timeout'] ?? 300);
+                $staleWorkers = Worker::detectStaleWorkers($timeoutSeconds);
+                $cleanedCount = 0;
+                
+                foreach ($staleWorkers as $worker) {
+                    Worker::markWorkerAsCrashed($worker['id'], 'Manual cleanup: Worker has not sent heartbeat for over ' . $timeoutSeconds . ' seconds.');
+                    $cleanedCount++;
+                }
+                
+                echo json_encode([
+                    'success' => true,
+                    'cleaned_count' => $cleanedCount,
+                    'message' => "Cleaned up {$cleanedCount} stale workers"
+                ]);
                 break;
                 
             case 'job-worker-status':
@@ -2450,8 +2482,10 @@ class Router {
                 
                 // Process queue items until empty or timeout
                 $startTime = time();
-                $maxRuntime = 300; // 5 minutes max per worker
+                $maxRuntime = 600; // 10 minutes max per worker (increased from 5)
                 $itemsProcessed = 0;
+                $noJobCounter = 0; // Counter for consecutive checks with no jobs
+                $maxNoJobChecks = 10; // Allow 10 checks before timing out (50 seconds)
                 
                 while ((time() - $startTime) < $maxRuntime) {
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
@@ -2459,6 +2493,7 @@ class Router {
                     $job = Worker::getNextJob();
                     
                     if ($job) {
+                        $noJobCounter = 0; // Reset counter when job found
                         error_log("handleStartWorker: Worker {$workerName} got job #{$job['id']}");
                         Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                         
@@ -2466,23 +2501,32 @@ class Router {
                             Worker::processJob($job['id']);
                             $itemsProcessed++;
                             error_log("handleStartWorker: Worker {$workerName} completed job #{$job['id']} (total: {$itemsProcessed})");
+                            
+                            // Update heartbeat after successful job
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         } catch (Exception $e) {
                             error_log("handleStartWorker: Worker {$workerName} error processing job #{$job['id']}: " . $e->getMessage());
+                            Worker::logError($workerId, $job['id'], 'worker_processing_error', $e->getMessage(), $e->getTraceAsString());
+                            
+                            // Update heartbeat even after error
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         }
-                        
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     } else {
-                        // No jobs available, sleep briefly
+                        $noJobCounter++;
+                        // No jobs available, sleep briefly and update heartbeat
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         usleep(500000); // 0.5 seconds
-                    }
-                    
-                    // If no items to process, check less frequently
-                    if ($itemsProcessed === 0 && (time() - $startTime) > 30) {
-                        error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found in 30 seconds");
-                        break;
+                        
+                        // Only exit if we've checked many times with no jobs AND processed nothing
+                        if ($itemsProcessed === 0 && $noJobCounter >= $maxNoJobChecks) {
+                            error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found after {$noJobCounter} checks");
+                            break;
+                        }
                     }
                 }
                 
+                // Final heartbeat before shutdown
+                Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
                 error_log("handleStartWorker: Worker {$workerName} shutting down after processing {$itemsProcessed} items");
                 
             } catch (Exception $e) {
@@ -3604,10 +3648,14 @@ class Router {
                             continue;
                         }
                         
+                        // Send initial heartbeat
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        
                         // Each simulated worker processes items from the queue
                         $itemsProcessed = 0;
                         
                         for ($i = 0; $i < $maxItemsPerWorker; $i++) {
+                            // Update heartbeat regularly - CRITICAL for monitoring
                             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                             
                             $job = Worker::getNextJob();
@@ -3635,6 +3683,9 @@ class Router {
                                 $itemsProcessed++;
                                 $totalProcessed++;
                                 
+                                // Update heartbeat after processing
+                                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                                
                                 // Check again after processing if target reached
                                 if ($jobDetails) {
                                     $emailsCollected = Job::getEmailCount($jobId);
@@ -3646,13 +3697,18 @@ class Router {
                             } catch (Exception $e) {
                                 error_log("processWorkersInBackground: Worker {$workerIndex} error on job #{$job['id']}: " . $e->getMessage());
                                 Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
+                                
+                                // Update heartbeat even after error
+                                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                             }
                         } else {
-                            // No more jobs in queue
+                            // No more jobs in queue - mark worker as idle before breaking
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                             break;
                         }
                     }
                     
+                    // Final heartbeat update before worker finishes
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     
                 } catch (Exception $e) {
@@ -4035,9 +4091,14 @@ class Router {
             <div class="card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                     <h2>Active Workers</h2>
-                    <div class="worker-status-indicator">
-                        <span class="status-dot" id="worker-status-dot"></span>
-                        <span id="worker-status-text">Monitoring...</span>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="btn btn-sm" onclick="cleanupStaleWorkers()" style="background: #ed8936; color: white;">
+                            🧹 Cleanup Stale Workers
+                        </button>
+                        <div class="worker-status-indicator">
+                            <span class="status-dot" id="worker-status-dot"></span>
+                            <span id="worker-status-text">Monitoring...</span>
+                        </div>
                     </div>
                 </div>
                 <div id="workers-list">Loading...</div>
@@ -4045,6 +4106,11 @@ class Router {
             
             <div class="card">
                 <h2>🚨 System Alerts & Errors</h2>
+                <div style="background: #ebf8ff; border: 1px solid #90cdf4; padding: 15px; border-radius: 6px; margin-bottom: 15px;">
+                    <strong>💡 نصيحة / Tip:</strong> إذا رأيت عمال متوقفة (stale workers)، استخدم زر "🧹 Cleanup Stale Workers" أعلاه لتنظيفها.
+                    <br>
+                    العمال يرسلون heartbeat كل بضع ثوان للإشارة إلى أنهم نشطون. إذا لم يرسلوا heartbeat لمدة 5 دقائق، يتم اعتبارهم متوقفين.
+                </div>
                 <div id="worker-errors-list">Loading...</div>
             </div>
             
@@ -4155,6 +4221,29 @@ class Router {
                         }
                     })
                     .catch(err => console.error('Error resolving error:', err));
+                }
+                
+                function cleanupStaleWorkers() {
+                    if (!confirm('هل تريد تنظيف العمال المتوقفة؟\nCleanup stale workers that have not sent heartbeat?')) {
+                        return;
+                    }
+                    
+                    fetch('?page=api&action=cleanup-stale-workers')
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data.success) {
+                                alert('✓ تم التنظيف بنجاح!\nCleaned: ' + data.cleaned_count + ' workers\n' + data.message);
+                                updateWorkers();
+                                updateWorkerStats();
+                                updateWorkerErrors();
+                            } else {
+                                alert('✗ خطأ في التنظيف\nCleanup failed');
+                            }
+                        })
+                        .catch(err => {
+                            console.error('Error cleaning up workers:', err);
+                            alert('✗ خطأ في التنظيف\nError: ' + err.message);
+                        });
                 }
                 
                 function updateWorkerStats() {
