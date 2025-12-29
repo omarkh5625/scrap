@@ -2008,6 +2008,37 @@ class Router {
                 echo json_encode(Worker::getStats());
                 break;
                 
+            case 'diagnostic':
+                // Diagnostic endpoint to check system status
+                $db = Database::connect();
+                
+                // Check exec availability
+                $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+                
+                // Check for pending queue items
+                $stmt = $db->query("SELECT COUNT(*) as count FROM job_queue WHERE status = 'pending'");
+                $pendingQueueItems = $stmt->fetch()['count'];
+                
+                // Check for active workers
+                $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE last_heartbeat > DATE_SUB(NOW(), INTERVAL 30 SECOND)");
+                $activeWorkers = $stmt->fetch()['count'];
+                
+                // Check for running jobs
+                $stmt = $db->query("SELECT COUNT(*) as count FROM jobs WHERE status = 'running'");
+                $runningJobs = $stmt->fetch()['count'];
+                
+                echo json_encode([
+                    'exec_available' => $execAvailable,
+                    'pending_queue_items' => $pendingQueueItems,
+                    'active_workers' => $activeWorkers,
+                    'running_jobs' => $runningJobs,
+                    'php_version' => PHP_VERSION,
+                    'php_sapi' => php_sapi_name(),
+                    'fastcgi_available' => function_exists('fastcgi_finish_request'),
+                    'disabled_functions' => ini_get('disable_functions')
+                ]);
+                break;
+                
             case 'queue-stats':
                 $db = Database::connect();
                 $stmt = $db->query("SELECT COUNT(*) as pending FROM job_queue WHERE status = 'pending'");
@@ -2235,7 +2266,7 @@ class Router {
             $workerName = $_POST['worker_name'] ?? 'http-worker-' . uniqid();
             $workerIndex = (int)($_POST['worker_index'] ?? 0);
             
-            error_log("HTTP Worker {$workerName} starting...");
+            error_log("handleStartWorker: HTTP Worker {$workerName} starting...");
             
             // Close connection immediately so client doesn't wait
             ignore_user_abort(true);
@@ -2256,6 +2287,12 @@ class Router {
             }
             flush();
             
+            // Use fastcgi_finish_request if available (PHP-FPM)
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+                error_log("handleStartWorker: Used fastcgi_finish_request() for {$workerName}");
+            }
+            
             // Close the session if it's open
             if (session_id()) {
                 session_write_close();
@@ -2266,9 +2303,10 @@ class Router {
             
             // Now run worker loop in background
             try {
-                error_log("Worker {$workerName} entering queue polling mode");
+                error_log("handleStartWorker: Worker {$workerName} entering queue polling mode");
                 
                 $workerId = Worker::register($workerName);
+                error_log("handleStartWorker: Worker {$workerName} registered with ID {$workerId}");
                 
                 // Process queue items until empty or timeout
                 $startTime = time();
@@ -2281,25 +2319,38 @@ class Router {
                     $job = Worker::getNextJob();
                     
                     if ($job) {
+                        error_log("handleStartWorker: Worker {$workerName} got job #{$job['id']}");
                         Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                        Worker::processJob($job['id']);
+                        
+                        try {
+                            Worker::processJob($job['id']);
+                            $itemsProcessed++;
+                            error_log("handleStartWorker: Worker {$workerName} completed job #{$job['id']} (total: {$itemsProcessed})");
+                        } catch (Exception $e) {
+                            error_log("handleStartWorker: Worker {$workerName} error processing job #{$job['id']}: " . $e->getMessage());
+                        }
+                        
                         Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                        $itemsProcessed++;
                     } else {
-                        // No more jobs in queue, exit
-                        break;
+                        // No jobs available, sleep briefly
+                        usleep(500000); // 0.5 seconds
                     }
                     
-                    // Small sleep between checks
-                    sleep(1);
+                    // If no items to process, check less frequently
+                    if ($itemsProcessed === 0 && (time() - $startTime) > 30) {
+                        error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found in 30 seconds");
+                        break;
+                    }
                 }
                 
-                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} items.");
+                error_log("handleStartWorker: Worker {$workerName} shutting down after processing {$itemsProcessed} items");
+                
             } catch (Exception $e) {
-                error_log("HTTP Worker {$workerName} error: " . $e->getMessage());
+                error_log("handleStartWorker: Worker {$workerName} fatal error: " . $e->getMessage());
             }
+            
+            exit(0);
         }
-        exit;
     }
     
     private static function handleProcessQueueWorker(): void {
@@ -3079,16 +3130,22 @@ class Router {
     */
     
     private static function autoSpawnWorkers(int $workerCount): void {
+        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
+        
         // Check if exec() is available
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
+            error_log("autoSpawnWorkers: Using exec() method");
             // Method 1: Spawn background PHP processes (preferred)
             self::spawnWorkersViaExec($workerCount);
         } else {
+            error_log("autoSpawnWorkers: exec() not available, using HTTP method");
             // Method 2: Use async HTTP requests (fallback for restricted hosting)
             self::spawnWorkersViaHttp($workerCount);
         }
+        
+        error_log("autoSpawnWorkers: Completed spawning attempt for {$workerCount} workers");
     }
     
     private static function spawnWorkersViaExec(int $workerCount): void {
@@ -3125,10 +3182,14 @@ class Router {
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
-        error_log("Spawning {$workerCount} HTTP workers");
+        error_log("spawnWorkersViaHttp: Spawning {$workerCount} HTTP workers to {$baseUrl}");
+        
+        // Use curl_multi for truly async requests
+        $multiHandle = curl_multi_init();
+        $handles = [];
         
         for ($i = 0; $i < $workerCount; $i++) {
-            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+            $workerName = 'http-worker-' . uniqid() . '-' . $i;
             
             // Create async HTTP request to trigger worker
             $ch = curl_init($baseUrl . '?page=start-worker');
@@ -3138,24 +3199,45 @@ class Router {
                 'worker_name' => $workerName,
                 'worker_index' => $i
             ]));
-            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Short timeout to just start the worker
+            curl_setopt($ch, CURLOPT_TIMEOUT_MS, 500); // Very short timeout - just trigger
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, 500);
             curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
             
-            // Execute async (don't wait for response)
-            curl_exec($ch);
+            curl_multi_add_handle($multiHandle, $ch);
+            $handles[$i] = $ch;
+            
+            error_log("spawnWorkersViaHttp: Queued HTTP worker #{$i}: {$workerName}");
+        }
+        
+        // Execute all requests in parallel
+        $running = null;
+        do {
+            curl_multi_exec($multiHandle, $running);
+            curl_multi_select($multiHandle, 0.1);
+        } while ($running > 0);
+        
+        // Check results and clean up
+        $successCount = 0;
+        foreach ($handles as $i => $ch) {
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
             
-            if ($httpCode === 200) {
-                error_log("Successfully spawned HTTP worker: {$workerName}");
+            if ($httpCode === 200 || $httpCode === 0) { // 0 = timeout (expected for async)
+                error_log("spawnWorkersViaHttp: Worker #{$i} triggered (HTTP {$httpCode})");
+                $successCount++;
             } else {
-                error_log("Failed to spawn HTTP worker #{$i}, HTTP code: {$httpCode}");
+                error_log("spawnWorkersViaHttp: Worker #{$i} failed - HTTP {$httpCode}, Error: {$error}");
             }
             
+            curl_multi_remove_handle($multiHandle, $ch);
             curl_close($ch);
-            
-            // Small delay between spawning workers
-            usleep(50000); // 0.05 seconds
         }
+        
+        curl_multi_close($multiHandle);
+        
+        error_log("spawnWorkersViaHttp: Successfully triggered {$successCount}/{$workerCount} HTTP workers");
     }
     
     private static function renderNewJob(): void {
