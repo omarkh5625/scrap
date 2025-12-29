@@ -739,6 +739,12 @@ class EmailExtractor {
             return false;
         }
         
+        // Verify email structure
+        $parts = explode('@', $email);
+        if (count($parts) !== 2) {
+            return false;
+        }
+        
         // Get domain for additional checks
         $domain = self::getDomain($email);
         
@@ -748,7 +754,7 @@ class EmailExtractor {
         }
         
         // Check for placeholder/example emails
-        $localPart = explode('@', $email)[0];
+        $localPart = $parts[0];
         $junkPatterns = ['example', 'test', 'noreply', 'no-reply', 'admin', 'info', 'contact', 'support'];
         foreach ($junkPatterns as $pattern) {
             if (stripos($localPart, $pattern) !== false || stripos($email, $pattern) !== false) {
@@ -761,6 +767,7 @@ class EmailExtractor {
     
     /**
      * Check if domain is blacklisted (famous sites, social media, etc.)
+     * Note: gmail.com and yahoo.com are NOT blacklisted as they can be explicitly selected via filters
      */
     public static function isBlacklistedDomain(string $domain): bool {
         // Famous sites that don't provide value for email extraction
@@ -771,7 +778,7 @@ class EmailExtractor {
             'reddit.com', 'tumblr.com', 'whatsapp.com', 'telegram.org',
             
             // Search engines & tech giants
-            'google.com', 'gmail.com', 'yahoo.com', 'bing.com', 'yandex.com',
+            'google.com', 'bing.com', 'yandex.com',
             'amazon.com', 'microsoft.com', 'apple.com', 'cloudflare.com',
             
             // Common service providers
@@ -795,7 +802,7 @@ class EmailExtractor {
             'cnn.com', 'bbc.com', 'nytimes.com', 'forbes.com', 'techcrunch.com',
             
             // Government/education (usually not useful for marketing)
-            '.gov', '.edu', 'wikipedia.org', 'wikimedia.org'
+            'wikipedia.org', 'wikimedia.org'
         ];
         
         // Check exact match
