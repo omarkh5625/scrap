@@ -1987,6 +1987,24 @@ class Router {
                 }
                 break;
                 
+            case 'process-job-workers':
+                // Trigger worker processing for a job (called via AJAX after job creation)
+                $jobId = (int)($_POST['job_id'] ?? 0);
+                $workerCount = (int)($_POST['worker_count'] ?? 5);
+                
+                if ($jobId > 0) {
+                    // Process workers inline (this may take time)
+                    try {
+                        self::spawnParallelWorkers($jobId, $workerCount);
+                        echo json_encode(['success' => true, 'message' => 'Workers processing started']);
+                    } catch (Exception $e) {
+                        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                    }
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
             case 'resolve-error':
                 $errorId = (int)($_POST['error_id'] ?? 0);
                 if ($errorId > 0) {
@@ -2394,9 +2412,46 @@ class Router {
         }
         
         $jobs = Job::getAll(Auth::getUserId());
+        $newJobId = (int)($_GET['job_id'] ?? 0); // Check if redirected from job creation
         
-        self::renderLayout('Dashboard', function() use ($jobs) {
+        self::renderLayout('Dashboard', function() use ($jobs, $newJobId) {
             ?>
+            <?php if ($newJobId > 0): ?>
+                <!-- Job Progress Widget -->
+                <div id="job-progress-widget" class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
+                    <h2 style="color: white; margin-top: 0;">📊 Job Processing</h2>
+                    <div id="progress-content" style="font-size: 14px;">
+                        <p>🔄 Starting workers...</p>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                        <div id="progress-bar" style="background: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                            <span id="progress-text">0%</span>
+                        </div>
+                    </div>
+                    <div id="progress-details" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="emails-collected">0</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="emails-required">-</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="active-workers-count">0</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="job-status">pending</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 15px; text-align: right;">
+                        <a href="?page=results&job_id=<?php echo $newJobId; ?>" style="color: white; text-decoration: underline;">View Results</a>
+                    </div>
+                </div>
+            <?php endif; ?>
+            
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-icon">📊</div>
@@ -2490,6 +2545,96 @@ class Router {
                 
                 updateStats();
                 setInterval(updateStats, 5000);
+                
+                // Job progress widget logic
+                <?php if ($newJobId > 0): ?>
+                const jobId = <?php echo $newJobId; ?>;
+                let progressInterval = null;
+                let processingStarted = false;
+                
+                // Function to update job progress
+                function updateJobProgress() {
+                    fetch('?page=api&action=job-worker-status&job_id=' + jobId)
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.error) {
+                                console.error('Error fetching job status:', data.error);
+                                return;
+                            }
+                            
+                            const job = data.job;
+                            const emailsCollected = data.emails_collected;
+                            const emailsRequired = data.emails_required;
+                            const completionPercentage = data.completion_percentage;
+                            const activeWorkers = data.active_workers;
+                            
+                            // Update progress bar
+                            document.getElementById('progress-bar').style.width = completionPercentage + '%';
+                            document.getElementById('progress-text').textContent = completionPercentage + '%';
+                            
+                            // Update details
+                            document.getElementById('emails-collected').textContent = emailsCollected;
+                            document.getElementById('emails-required').textContent = emailsRequired;
+                            document.getElementById('active-workers-count').textContent = activeWorkers;
+                            document.getElementById('job-status').textContent = job.status;
+                            
+                            // Update progress content message
+                            let message = '';
+                            if (job.status === 'completed') {
+                                message = '✅ Job completed! ' + emailsCollected + ' emails extracted.';
+                                if (progressInterval) {
+                                    clearInterval(progressInterval);
+                                    progressInterval = null;
+                                }
+                                // Reload stats after completion
+                                updateStats();
+                            } else if (job.status === 'running') {
+                                message = '⚡ Processing... ' + activeWorkers + ' workers active.';
+                            } else if (job.status === 'failed') {
+                                message = '❌ Job failed. Check errors below.';
+                                if (progressInterval) {
+                                    clearInterval(progressInterval);
+                                    progressInterval = null;
+                                }
+                            } else {
+                                message = '🔄 Initializing workers...';
+                            }
+                            document.getElementById('progress-content').innerHTML = '<p>' + message + '</p>';
+                        })
+                        .catch(error => {
+                            console.error('Error updating job progress:', error);
+                        });
+                }
+                
+                // Start processing workers via AJAX (non-blocking)
+                function startJobProcessing() {
+                    if (processingStarted) return;
+                    processingStarted = true;
+                    
+                    fetch('?page=api&action=process-job-workers', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: 'job_id=' + jobId + '&worker_count=5'
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('Worker processing triggered:', data);
+                    })
+                    .catch(error => {
+                        console.error('Error starting workers:', error);
+                        document.getElementById('progress-content').innerHTML = '<p style="color: #fca5a5;">❌ Error starting workers: ' + error.message + '</p>';
+                    });
+                }
+                
+                // Start progress monitoring immediately
+                updateJobProgress();
+                progressInterval = setInterval(updateJobProgress, 3000); // Update every 3 seconds
+                
+                // Trigger worker processing after a short delay (let UI render first)
+                setTimeout(startJobProcessing, 500);
+                <?php endif; ?>
             </script>
             <?php
         });
@@ -2706,36 +2851,10 @@ class Router {
                     // Create job for immediate processing
                     $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                     
-                    // Spawn parallel workers in background immediately
-                    self::spawnParallelWorkers($jobId, $workerCount);
-                    
-                    // Check if workers actually started
-                    $job = Job::getById($jobId);
-                    if ($job['status'] === 'failed') {
-                        // Workers failed to spawn - get errors with details
-                        $db = Database::connect();
-                        $stmt = $db->prepare("SELECT error_message, error_details FROM worker_errors WHERE job_id = ? ORDER BY created_at DESC LIMIT 10");
-                        $stmt->execute([$jobId]);
-                        $errors = $stmt->fetchAll();
-                        
-                        $errorMessages = [];
-                        foreach ($errors as $err) {
-                            if (!empty($err['error_details'])) {
-                                $errorMessages[] = $err['error_details'];
-                            } else {
-                                $errorMessages[] = $err['error_message'];
-                            }
-                        }
-                        
-                        $error = 'Failed to start workers: ' . implode(' | ', $errorMessages);
-                    } else if ($job['status'] === 'running') {
-                        // Success - at least one worker started
-                        $success = true;
-                    } else {
-                        // Job created but workers haven't started yet
-                        $warnings[] = 'Job created but workers may take a moment to start. Check the Workers page for status.';
-                        $success = true;
-                    }
+                    // Redirect immediately to dashboard with job ID
+                    // Workers will be processed via AJAX polling from dashboard
+                    header('Location: ?page=dashboard&job_id=' . $jobId);
+                    exit;
                 } else {
                     $error = 'Query and API Key are required';
                 }
