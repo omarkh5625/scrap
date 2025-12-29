@@ -382,7 +382,6 @@ class EmailExtractor {
             curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
             curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
             curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
             
             $content = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -401,11 +400,6 @@ class EmailExtractor {
     public static function isValidEmail(string $email): bool {
         // Basic validation
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            return false;
-        }
-        
-        // Check for common invalid patterns
-        if (preg_match('/\.(png|jpg|jpeg|gif|pdf|doc|docx|zip|rar)$/i', $email)) {
             return false;
         }
         
@@ -566,6 +560,46 @@ class Worker {
         }
     }
     
+    public static function processResultWithDeepScraping(
+        array $result,
+        int $jobId,
+        ?string $country,
+        ?string $emailFilter,
+        int &$processed,
+        int $maxResults
+    ): void {
+        $title = $result['title'] ?? '';
+        $link = $result['link'] ?? '';
+        $snippet = $result['snippet'] ?? '';
+        
+        // Extract emails from title, link, and snippet
+        $textToScan = $title . ' ' . $link . ' ' . $snippet;
+        $emails = EmailExtractor::extractEmails($textToScan);
+        
+        // Deep scraping: fetch page content if enabled
+        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
+        $deepScrapingThreshold = (int)(Settings::get('deep_scraping_threshold', '5'));
+        
+        if ($deepScraping && $link && count($emails) < $deepScrapingThreshold) {
+            $pageEmails = EmailExtractor::extractEmailsFromUrl($link);
+            $emails = array_merge($emails, $pageEmails);
+            $emails = array_unique($emails);
+        }
+        
+        foreach ($emails as $email) {
+            if ($processed >= $maxResults) {
+                break;
+            }
+            
+            // Apply email filter first before adding
+            if (EmailExtractor::matchesFilter($emailFilter, $email)) {
+                if (Job::addEmail($jobId, $email, $country, $link, $title)) {
+                    $processed++;
+                }
+            }
+        }
+    }
+    
     public static function processJob(int $jobId): void {
         $job = Job::getById($jobId);
         if (!$job) {
@@ -579,9 +613,6 @@ class Worker {
         $maxResults = (int)$job['max_results'];
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
-        
-        // Check if deep scraping is enabled
-        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
         
         $processed = 0;
         $page = 1;
@@ -598,38 +629,13 @@ class Worker {
                     break;
                 }
                 
-                $title = $result['title'] ?? '';
-                $link = $result['link'] ?? '';
-                $snippet = $result['snippet'] ?? '';
+                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
                 
-                // Extract emails from title, link, and snippet
-                $textToScan = $title . ' ' . $link . ' ' . $snippet;
-                $emails = EmailExtractor::extractEmails($textToScan);
+                $progress = (int)(($processed / $maxResults) * 100);
+                Job::updateStatus($jobId, 'running', $progress);
                 
-                // Deep scraping: fetch page content if enabled
-                if ($deepScraping && $link && count($emails) < 5) {
-                    echo "  - Deep scraping: {$link}\n";
-                    $pageEmails = EmailExtractor::extractEmailsFromUrl($link);
-                    $emails = array_merge($emails, $pageEmails);
-                    $emails = array_unique($emails);
-                }
-                
-                foreach ($emails as $email) {
-                    if ($processed >= $maxResults) {
-                        break 2;
-                    }
-                    
-                    // Apply email filter
-                    if (EmailExtractor::matchesFilter($emailFilter, $email)) {
-                        if (Job::addEmail($jobId, $email, $country, $link, $title)) {
-                            $processed++;
-                            
-                            $progress = (int)(($processed / $maxResults) * 100);
-                            Job::updateStatus($jobId, 'running', $progress);
-                            
-                            echo "  - Added: {$email}\n";
-                        }
-                    }
+                if ($processed > 0 && $processed % 10 === 0) {
+                    echo "  - Progress: {$processed}/{$maxResults} emails\n";
                 }
             }
             
@@ -645,7 +651,7 @@ class Worker {
         }
         
         Job::updateStatus($jobId, 'completed', 100);
-        echo "Job #{$jobId} completed!\n";
+        echo "Job #{$jobId} completed! Total emails: {$processed}\n";
     }
     
     private static function searchSerper(string $apiKey, string $query, int $page = 1, ?string $country = null): ?array {
@@ -694,9 +700,6 @@ class Worker {
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
-        // Check if deep scraping is enabled
-        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
-        
         $processed = 0;
         $page = (int)($startOffset / 10) + 1;
         
@@ -712,33 +715,7 @@ class Worker {
                     break;
                 }
                 
-                $title = $result['title'] ?? '';
-                $link = $result['link'] ?? '';
-                $snippet = $result['snippet'] ?? '';
-                
-                // Extract emails from title, link, and snippet
-                $textToScan = $title . ' ' . $link . ' ' . $snippet;
-                $emails = EmailExtractor::extractEmails($textToScan);
-                
-                // Deep scraping: fetch page content if enabled
-                if ($deepScraping && $link && count($emails) < 5) {
-                    $pageEmails = EmailExtractor::extractEmailsFromUrl($link);
-                    $emails = array_merge($emails, $pageEmails);
-                    $emails = array_unique($emails);
-                }
-                
-                foreach ($emails as $email) {
-                    if ($processed >= $maxResults) {
-                        break 2;
-                    }
-                    
-                    // Apply email filter
-                    if (EmailExtractor::matchesFilter($emailFilter, $email)) {
-                        if (Job::addEmail($jobId, $email, $country, $link, $title)) {
-                            $processed++;
-                        }
-                    }
-                }
+                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
             }
             
             if (!isset($data['organic']) || count($data['organic']) === 0) {
@@ -1376,6 +1353,12 @@ class Router {
                             <option value="0" <?php echo ($settings['deep_scraping'] ?? '1') === '0' ? 'selected' : ''; ?>>Disabled</option>
                         </select>
                         <small>When enabled, workers will fetch and scan page content for emails (slower but more comprehensive)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Deep Scraping Threshold</label>
+                        <input type="number" name="setting_deep_scraping_threshold" value="<?php echo htmlspecialchars($settings['deep_scraping_threshold'] ?? '5'); ?>" min="1" max="20">
+                        <small>Only fetch page content if fewer than this many emails found in search result (1-20)</small>
                     </div>
                     
                     <button type="submit" class="btn btn-primary">Save Settings</button>
