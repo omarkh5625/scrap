@@ -3287,10 +3287,11 @@ class Router {
             }
         }
         
-        $db = Database::connect();
         $workerName = 'inline-worker-' . uniqid();
+        $workerId = null;
         
         try {
+            $db = Database::connect();
             $workerId = Worker::register($workerName);
             error_log("startInlineFallbackWorker: Registered worker {$workerName} (ID: {$workerId})");
             
@@ -3326,6 +3327,17 @@ class Router {
             
         } catch (Exception $e) {
             error_log("startInlineFallbackWorker: Fatal error: " . $e->getMessage());
+            
+            // Clean up worker registration if it was created
+            if ($workerId !== null) {
+                try {
+                    $db = Database::connect();
+                    $stmt = $db->prepare("UPDATE workers SET status = 'stopped', last_error = ? WHERE id = ?");
+                    $stmt->execute(['Fatal error: ' . $e->getMessage(), $workerId]);
+                } catch (Exception $cleanupError) {
+                    error_log("startInlineFallbackWorker: Cleanup error: " . $cleanupError->getMessage());
+                }
+            }
         }
     }
     
