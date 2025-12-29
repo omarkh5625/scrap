@@ -2741,15 +2741,28 @@ class Router {
                 $job = Worker::getNextJob();
                 
                 if ($job && (int)$job['id'] == $jobId) {
-                    // Process this queue item
+                    // Process this queue item with queue parameters
                     Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
                     error_log("  Worker {$workerName}: Processing queue item for job {$jobId}");
                     
-                    Worker::processJob($jobId);
+                    // Get queue parameters from the job
+                    $startOffset = isset($job['queue_start_offset']) ? (int)$job['queue_start_offset'] : 0;
+                    $maxResults = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : (int)$job['max_results'];
+                    $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
+                    
+                    error_log("    Queue item: offset={$startOffset}, max={$maxResults}, queue_id={$queueId}");
+                    
+                    // Process using the immediate method with queue parameters
+                    Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                    
+                    // Mark queue item as complete if we have queue_id
+                    if ($queueId) {
+                        Worker::markQueueItemComplete($queueId);
+                    }
                     
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     $successCount++;
-                    error_log("✓ Worker {$i} completed processing for job {$jobId}");
+                    error_log("✓ Worker {$i} completed processing queue item for job {$jobId}");
                 } else {
                     // No queue item available for this job
                     $successCount++; // Still count as success - worker was ready
