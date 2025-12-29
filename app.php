@@ -2755,27 +2755,27 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 16px;">💡 High-Yield Query Templates</h3>
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
-                        <button type="button" onclick="document.getElementById('dashboard-query').value='real estate agents'" 
+                        <button type="button" class="query-template" data-query="real estate agents" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🏘️ Real Estate Agents
                         </button>
-                        <button type="button" onclick="document.getElementById('dashboard-query').value='dentists near me'" 
+                        <button type="button" class="query-template" data-query="dentists near me" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🦷 Dentists
                         </button>
-                        <button type="button" onclick="document.getElementById('dashboard-query').value='lawyers attorney'" 
+                        <button type="button" class="query-template" data-query="lawyers attorney" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             ⚖️ Lawyers
                         </button>
-                        <button type="button" onclick="document.getElementById('dashboard-query').value='restaurants contact'" 
+                        <button type="button" class="query-template" data-query="restaurants contact" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🍽️ Restaurants
                         </button>
-                        <button type="button" onclick="document.getElementById('dashboard-query').value='plumbers contact email'" 
+                        <button type="button" class="query-template" data-query="plumbers contact email" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🔧 Plumbers
                         </button>
-                        <button type="button" onclick="document.getElementById('dashboard-query').value='marketing agencies'" 
+                        <button type="button" class="query-template" data-query="marketing agencies" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             📢 Marketing Agencies
                         </button>
@@ -2998,6 +2998,15 @@ class Router {
             </div>
             
             <script>
+                // Query template buttons event delegation
+                document.addEventListener('DOMContentLoaded', function() {
+                    document.querySelectorAll('.query-template').forEach(function(btn) {
+                        btn.addEventListener('click', function() {
+                            document.getElementById('dashboard-query').value = this.dataset.query;
+                        });
+                    });
+                });
+                
                 function updateStats() {
                     fetch('?page=api&action=stats')
                         .then(res => res.json())
@@ -3120,8 +3129,18 @@ class Router {
                                 window.location.href = '?page=dashboard&job_id=' + data.job_id;
                             }, 500);
                         } else {
-                            // Show error
-                            alert('Error: ' + (data.error || 'Unknown error occurred'));
+                            // Show error in styled notification
+                            const errorDiv = document.createElement('div');
+                            errorDiv.className = 'alert alert-error';
+                            errorDiv.style.marginBottom = '20px';
+                            errorDiv.innerHTML = '<strong>✗ Error:</strong><br>' + (data.error || 'Unknown error occurred');
+                            
+                            // Insert error before form
+                            const form = document.getElementById('dashboard-job-form');
+                            form.parentNode.insertBefore(errorDiv, form);
+                            
+                            // Auto-remove after 5 seconds
+                            setTimeout(() => errorDiv.remove(), 5000);
                             
                             // Re-enable submit button
                             submitBtn.disabled = false;
@@ -3129,8 +3148,18 @@ class Router {
                         }
                     })
                     .catch(error => {
-                        // Show error
-                        alert('Failed to create job: ' + error.message);
+                        // Show error in styled notification
+                        const errorDiv = document.createElement('div');
+                        errorDiv.className = 'alert alert-error';
+                        errorDiv.style.marginBottom = '20px';
+                        errorDiv.innerHTML = '<strong>✗ Error:</strong><br>Failed to create job: ' + error.message;
+                        
+                        // Insert error before form
+                        const form = document.getElementById('dashboard-job-form');
+                        form.parentNode.insertBefore(errorDiv, form);
+                        
+                        // Auto-remove after 5 seconds
+                        setTimeout(() => errorDiv.remove(), 5000);
                         
                         // Re-enable submit button
                         submitBtn.disabled = false;
