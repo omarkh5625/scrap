@@ -3795,15 +3795,13 @@ class Router {
                             // Show success alert
                             alert('✓ Job #' + data.job_id + ' created successfully with ' + data.worker_count + ' workers!\nWorkers are starting in the background...');
                             
-                            // Redirect immediately to results page
-                            window.location.href = '?page=results&job_id=' + data.job_id;
+                            // Add small delay (100ms) before redirect to prevent UI hanging
+                            setTimeout(function() {
+                                window.location.href = '?page=results&job_id=' + data.job_id;
+                            }, 100);
                         } else {
                             // Show error alert
                             alert('✗ Error: ' + (data.error || 'Unknown error occurred'));
-                            
-                            // Re-enable submit button
-                            submitBtn.disabled = false;
-                            submitBtn.textContent = '🚀 Start Extraction';
                             
                             // Re-enable submit button
                             submitBtn.disabled = false;
