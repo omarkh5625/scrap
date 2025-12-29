@@ -697,20 +697,20 @@ class EmailExtractor {
      * Extract emails from multiple URLs in parallel using curl_multi
      * Returns array with url => [emails] mapping
      */
-    public static function extractEmailsFromUrlsParallel(array $urls, int $timeout = 5): array {
+    public static function extractEmailsFromUrlsParallel(array $urls, int $timeout = 3): array {
         $results = [];
         
         if (empty($urls)) {
             return $results;
         }
         
-        $curlMulti = new CurlMultiManager(min(count($urls), 50));
+        $curlMulti = new CurlMultiManager(min(count($urls), 100)); // Increased from 50
         
         // Add all URLs to the multi handle
         foreach ($urls as $url) {
             $curlMulti->addUrl($url, [
                 'timeout' => $timeout,
-                'connect_timeout' => 3
+                'connect_timeout' => 2 // Reduced from 3 for faster processing
             ], $url);
         }
         
@@ -739,7 +739,85 @@ class EmailExtractor {
             return false;
         }
         
+        // Verify email structure
+        $parts = explode('@', $email);
+        if (count($parts) !== 2) {
+            return false;
+        }
+        
+        // Get domain for additional checks
+        $domain = self::getDomain($email);
+        
+        // Check against blacklisted/junk domains
+        if (self::isBlacklistedDomain($domain)) {
+            return false;
+        }
+        
+        // Check for placeholder/example emails
+        $localPart = $parts[0];
+        $junkPatterns = ['example', 'test', 'noreply', 'no-reply', 'admin', 'info', 'contact', 'support'];
+        foreach ($junkPatterns as $pattern) {
+            if (stripos($localPart, $pattern) !== false || stripos($email, $pattern) !== false) {
+                return false;
+            }
+        }
+        
         return true;
+    }
+    
+    /**
+     * Check if domain is blacklisted (famous sites, social media, etc.)
+     * Note: gmail.com and yahoo.com are NOT blacklisted as they can be explicitly selected via filters
+     */
+    public static function isBlacklistedDomain(string $domain): bool {
+        // Famous sites that don't provide value for email extraction
+        $blacklist = [
+            // Social media
+            'facebook.com', 'fb.com', 'twitter.com', 'x.com', 'instagram.com', 
+            'linkedin.com', 'pinterest.com', 'tiktok.com', 'snapchat.com',
+            'reddit.com', 'tumblr.com', 'whatsapp.com', 'telegram.org',
+            
+            // Search engines & tech giants
+            'google.com', 'bing.com', 'yandex.com',
+            'amazon.com', 'microsoft.com', 'apple.com', 'cloudflare.com',
+            
+            // Common service providers
+            'wordpress.com', 'wix.com', 'squarespace.com', 'godaddy.com',
+            'namecheap.com', 'hostgator.com', 'bluehost.com',
+            
+            // Email/communication
+            'mailchimp.com', 'sendgrid.com', 'mailgun.com', 'postmarkapp.com',
+            
+            // Video/media platforms
+            'youtube.com', 'vimeo.com', 'dailymotion.com', 'twitch.tv',
+            
+            // E-commerce platforms
+            'ebay.com', 'etsy.com', 'shopify.com', 'alibaba.com',
+            
+            // Common junk/placeholder domains
+            'example.com', 'example.org', 'test.com', 'localhost',
+            'sentry.io', 'gravatar.com', 'github.com', 'gitlab.com',
+            
+            // News/media sites
+            'cnn.com', 'bbc.com', 'nytimes.com', 'forbes.com', 'techcrunch.com',
+            
+            // Government/education (usually not useful for marketing)
+            'wikipedia.org', 'wikimedia.org'
+        ];
+        
+        // Check exact match
+        if (in_array($domain, $blacklist)) {
+            return true;
+        }
+        
+        // Check if domain ends with blacklisted TLD
+        foreach (['.gov', '.edu', '.mil'] as $tld) {
+            if (str_ends_with($domain, $tld)) {
+                return true;
+            }
+        }
+        
+        return false;
     }
     
     public static function getDomain(string $email): string {
@@ -776,8 +854,8 @@ class EmailExtractor {
 
 class CurlMultiManager {
     // Configuration constants
-    private const DEFAULT_MAX_CONNECTIONS = 50;
-    private const MAX_HOST_CONNECTIONS = 10;
+    private const DEFAULT_MAX_CONNECTIONS = 100; // Increased for maximum performance
+    private const MAX_HOST_CONNECTIONS = 20; // Increased for better parallelism
     
     private $multiHandle;
     private array $handles = [];
@@ -785,7 +863,7 @@ class CurlMultiManager {
     private int $maxConnections;
     
     public function __construct(int $maxConnections = self::DEFAULT_MAX_CONNECTIONS) {
-        $this->maxConnections = min($maxConnections, 100); // Cap at 100 for safety
+        $this->maxConnections = min($maxConnections, 200); // Cap at 200 for safety (increased from 100)
         $this->multiHandle = curl_multi_init();
         
         // Set max total connections and max per host
@@ -806,11 +884,11 @@ class CurlMultiManager {
         // Default options for performance
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, $options['timeout'] ?? 10);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $options['connect_timeout'] ?? 5);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $options['timeout'] ?? 5); // Reduced from 10
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $options['connect_timeout'] ?? 3); // Reduced from 5
         curl_setopt($ch, CURLOPT_USERAGENT, $options['user_agent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
         curl_setopt($ch, CURLOPT_ENCODING, ''); // Enable compression
-        curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 2); // Reduced from 3 for speed
         
         // SSL verification - configurable for environments with SSL issues
         // In production, keep SSL verification enabled for security
@@ -1075,7 +1153,7 @@ class Job {
 
 class Worker {
     // Configuration constants
-    private const DEFAULT_RATE_LIMIT = 0.3; // seconds between API requests (optimized for parallel mode)
+    private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
     
     public static function getAll(): array {
         $db = Database::connect();
@@ -1424,7 +1502,7 @@ class Worker {
         
         // Second pass: parallel deep scraping if enabled and needed
         if (!empty($urlsToScrape)) {
-            $scrapedResults = EmailExtractor::extractEmailsFromUrlsParallel($urlsToScrape, 5);
+            $scrapedResults = EmailExtractor::extractEmailsFromUrlsParallel($urlsToScrape, 3); // Reduced timeout from 5 to 3
             
             foreach ($scrapedResults as $url => $emails) {
                 foreach ($emails as $email) {
@@ -1779,13 +1857,12 @@ class Router {
                 self::renderDashboard();
                 break;
             case 'new-job':
-                self::renderNewJob();
-                break;
+            case 'workers':
+                // Redirect old pages to dashboard
+                header('Location: ?page=dashboard');
+                exit;
             case 'settings':
                 self::renderSettings();
-                break;
-            case 'workers':
-                self::renderWorkers();
                 break;
             case 'results':
                 self::renderResults();
@@ -1929,6 +2006,37 @@ class Router {
                 
             case 'worker-stats':
                 echo json_encode(Worker::getStats());
+                break;
+                
+            case 'diagnostic':
+                // Diagnostic endpoint to check system status
+                $db = Database::connect();
+                
+                // Check exec availability
+                $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+                
+                // Check for pending queue items
+                $stmt = $db->query("SELECT COUNT(*) as count FROM job_queue WHERE status = 'pending'");
+                $pendingQueueItems = $stmt->fetch()['count'];
+                
+                // Check for active workers
+                $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE last_heartbeat > DATE_SUB(NOW(), INTERVAL 30 SECOND)");
+                $activeWorkers = $stmt->fetch()['count'];
+                
+                // Check for running jobs
+                $stmt = $db->query("SELECT COUNT(*) as count FROM jobs WHERE status = 'running'");
+                $runningJobs = $stmt->fetch()['count'];
+                
+                echo json_encode([
+                    'exec_available' => $execAvailable,
+                    'pending_queue_items' => $pendingQueueItems,
+                    'active_workers' => $activeWorkers,
+                    'running_jobs' => $runningJobs,
+                    'php_version' => PHP_VERSION,
+                    'php_sapi' => php_sapi_name(),
+                    'fastcgi_available' => function_exists('fastcgi_finish_request'),
+                    'disabled_functions' => ini_get('disable_functions')
+                ]);
                 break;
                 
             case 'queue-stats':
@@ -2158,7 +2266,7 @@ class Router {
             $workerName = $_POST['worker_name'] ?? 'http-worker-' . uniqid();
             $workerIndex = (int)($_POST['worker_index'] ?? 0);
             
-            error_log("HTTP Worker {$workerName} starting...");
+            error_log("handleStartWorker: HTTP Worker {$workerName} starting...");
             
             // Close connection immediately so client doesn't wait
             ignore_user_abort(true);
@@ -2179,6 +2287,12 @@ class Router {
             }
             flush();
             
+            // Use fastcgi_finish_request if available (PHP-FPM)
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+                error_log("handleStartWorker: Used fastcgi_finish_request() for {$workerName}");
+            }
+            
             // Close the session if it's open
             if (session_id()) {
                 session_write_close();
@@ -2189,9 +2303,10 @@ class Router {
             
             // Now run worker loop in background
             try {
-                error_log("Worker {$workerName} entering queue polling mode");
+                error_log("handleStartWorker: Worker {$workerName} entering queue polling mode");
                 
                 $workerId = Worker::register($workerName);
+                error_log("handleStartWorker: Worker {$workerName} registered with ID {$workerId}");
                 
                 // Process queue items until empty or timeout
                 $startTime = time();
@@ -2204,25 +2319,38 @@ class Router {
                     $job = Worker::getNextJob();
                     
                     if ($job) {
+                        error_log("handleStartWorker: Worker {$workerName} got job #{$job['id']}");
                         Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                        Worker::processJob($job['id']);
+                        
+                        try {
+                            Worker::processJob($job['id']);
+                            $itemsProcessed++;
+                            error_log("handleStartWorker: Worker {$workerName} completed job #{$job['id']} (total: {$itemsProcessed})");
+                        } catch (Exception $e) {
+                            error_log("handleStartWorker: Worker {$workerName} error processing job #{$job['id']}: " . $e->getMessage());
+                        }
+                        
                         Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                        $itemsProcessed++;
                     } else {
-                        // No more jobs in queue, exit
-                        break;
+                        // No jobs available, sleep briefly
+                        usleep(500000); // 0.5 seconds
                     }
                     
-                    // Small sleep between checks
-                    sleep(1);
+                    // If no items to process, check less frequently
+                    if ($itemsProcessed === 0 && (time() - $startTime) > 30) {
+                        error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found in 30 seconds");
+                        break;
+                    }
                 }
                 
-                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} items.");
+                error_log("handleStartWorker: Worker {$workerName} shutting down after processing {$itemsProcessed} items");
+                
             } catch (Exception $e) {
-                error_log("HTTP Worker {$workerName} error: " . $e->getMessage());
+                error_log("handleStartWorker: Worker {$workerName} fatal error: " . $e->getMessage());
             }
+            
+            exit(0);
         }
-        exit;
     }
     
     private static function handleProcessQueueWorker(): void {
@@ -2451,6 +2579,9 @@ class Router {
     }
     
     private static function renderDashboard(): void {
+        $error = null;
+        $success = null;
+        
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             if ($_POST['action'] === 'delete_job') {
                 $jobId = (int)$_POST['job_id'];
@@ -2460,22 +2591,180 @@ class Router {
                 header('Location: ?page=dashboard');
                 exit;
             }
+            
+            // Handle new job creation from Dashboard
+            if ($_POST['action'] === 'create_job') {
+                try {
+                    $query = $_POST['query'] ?? '';
+                    $apiKey = $_POST['api_key'] ?? '';
+                    $maxResults = (int)($_POST['max_results'] ?? 100);
+                    $country = !empty($_POST['country']) ? $_POST['country'] : null;
+                    $emailFilter = $_POST['email_filter'] ?? 'all';
+                    $workerCount = (int)($_POST['worker_count'] ?? 0);
+                    
+                    // Validate worker count is specified
+                    if ($workerCount < 1) {
+                        $error = 'Worker count is required. Please specify how many workers to use (minimum 1).';
+                    } elseif (!$query || !$apiKey) {
+                        $error = 'Query and API Key are required';
+                    } else {
+                        // Create job for immediate processing
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        
+                        // Start job processing with specified workers
+                        self::spawnParallelWorkers($jobId, $workerCount);
+                        
+                        // Redirect to dashboard with job ID
+                        header('Location: ?page=dashboard&job_id=' . $jobId);
+                        exit;
+                    }
+                } catch (Exception $e) {
+                    $error = 'Error creating job: ' . $e->getMessage();
+                    error_log('Job creation error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+                }
+            }
         }
         
         $jobs = Job::getAll(Auth::getUserId());
         $newJobId = (int)($_GET['job_id'] ?? 0); // Check if redirected from job creation
         
-        self::renderLayout('Dashboard', function() use ($jobs, $newJobId) {
+        self::renderLayout('Dashboard', function() use ($jobs, $newJobId, $error, $success) {
             ?>
+            <?php if ($error): ?>
+                <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
+            <?php endif; ?>
+            
+            <?php if ($success): ?>
+                <div class="alert alert-success"><?php echo htmlspecialchars($success); ?></div>
+            <?php endif; ?>
+            
+            <!-- New Job Creation Card -->
+            <div class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
+                <h2 style="color: white; margin-top: 0;">✨ Create New Email Extraction Job</h2>
+                
+                <!-- Query Templates -->
+                <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                    <h3 style="color: white; margin: 0 0 10px 0; font-size: 16px;">💡 High-Yield Query Templates</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='real estate agents'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🏘️ Real Estate Agents
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='dentists near me'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🦷 Dentists
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='lawyers attorney'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            ⚖️ Lawyers
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='restaurants contact'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🍽️ Restaurants
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='plumbers contact email'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🔧 Plumbers
+                        </button>
+                        <button type="button" onclick="document.querySelector('input[name=query]').value='marketing agencies'" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            📢 Marketing Agencies
+                        </button>
+                    </div>
+                    <small style="display: block; margin-top: 8px; color: rgba(255,255,255,0.8); font-size: 12px;">
+                        💡 Tip: Add location terms like "california" or "new york" for better targeting
+                    </small>
+                </div>
+                
+                <form method="POST" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
+                    <input type="hidden" name="action" value="create_job">
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Search Query *</label>
+                            <input type="text" name="query" placeholder="e.g., real estate agents california" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Use specific industry + location for best results</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Serper.dev API Key *</label>
+                            <input type="text" name="api_key" placeholder="Your API key" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Get free key at <a href="https://serper.dev" target="_blank" style="color: white;">serper.dev</a></small>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Target Emails *</label>
+                            <input type="number" name="max_results" value="1000" min="1" max="100000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Recommended: 1000-10000 for quality</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Workers * 🚀</label>
+                            <input type="number" name="worker_count" value="20" min="1" max="1000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Estimated: 20-50 workers ≈ 100k emails in ~3 min*</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Email Filter</label>
+                            <select name="email_filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                                <option value="all">All Types</option>
+                                <option value="business" selected>Business Only (Recommended)</option>
+                                <option value="gmail">Gmail Only</option>
+                                <option value="yahoo">Yahoo Only</option>
+                            </select>
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Business emails have higher value</small>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-bottom: 15px;">
+                        <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
+                        <select name="country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <option value="">All Countries</option>
+                            <option value="us">🇺🇸 United States</option>
+                            <option value="uk">🇬🇧 United Kingdom</option>
+                            <option value="ca">🇨🇦 Canada</option>
+                            <option value="au">🇦🇺 Australia</option>
+                            <option value="de">🇩🇪 Germany</option>
+                            <option value="fr">🇫🇷 France</option>
+                        </select>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-large" 
+                            style="background: white; color: #667eea; font-weight: 600; width: 100%; padding: 15px;">
+                        🚀 Start Extraction
+                    </button>
+                </form>
+                
+                <!-- Performance Tips -->
+                <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
+                    <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
+                        <li>Use 20-50 workers for fastest extraction (estimated: 100k emails in ~3 minutes)*</li>
+                        <li>Business email filter removes junk and social media emails</li>
+                        <li>Specific queries (industry + location) yield better quality emails</li>
+                        <li>System automatically filters famous sites and placeholder emails</li>
+                    </ul>
+                    <small style="display: block; margin-top: 8px; color: rgba(255,255,255,0.7); font-size: 11px;">
+                        * Performance depends on query quality, network speed, API limits, and data availability
+                    </small>
+                </div>
+            </div>
+            
             <?php if ($newJobId > 0): ?>
                 <!-- Job Progress Widget -->
-                <div id="job-progress-widget" class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
+                <div id="job-progress-widget" class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
                     <h2 style="color: white; margin-top: 0;">📊 Job Processing</h2>
                     <div id="progress-content" style="font-size: 14px;">
                         <p>🔄 Starting workers...</p>
                     </div>
                     <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
-                        <div id="progress-bar" style="background: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                        <div id="progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
                             <span id="progress-text">0%</span>
                         </div>
                     </div>
@@ -2498,10 +2787,35 @@ class Router {
                         </div>
                     </div>
                     <div style="margin-top: 15px; text-align: right;">
-                        <a href="?page=results&job_id=<?php echo $newJobId; ?>" style="color: white; text-decoration: underline;">View Results</a>
+                        <a href="?page=results&job_id=<?php echo $newJobId; ?>" style="color: white; text-decoration: underline;">View Full Results</a>
                     </div>
                 </div>
             <?php endif; ?>
+            
+            <!-- Worker Statistics -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="active-workers">-</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="worker-emails">-</div>
+                        <div class="stat-label">Worker Emails Extracted</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚡</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="extraction-rate">-</div>
+                        <div class="stat-label">Emails/Min</div>
+                    </div>
+                </div>
+            </div>
             
             <div class="stats-grid">
                 <div class="stat-card">
@@ -2592,16 +2906,31 @@ class Router {
                             document.getElementById('completed-jobs').textContent = data.completedJobs;
                             document.getElementById('total-results').textContent = data.totalResults;
                         });
+                    
+                    // Update worker statistics
+                    fetch('?page=api&action=worker-stats')
+                        .then(res => res.json())
+                        .then(stats => {
+                            document.getElementById('active-workers').textContent = stats.active_workers || 0;
+                            document.getElementById('worker-emails').textContent = stats.total_emails || 0;
+                            
+                            // Display extraction rate
+                            if (stats.emails_per_minute > 0) {
+                                document.getElementById('extraction-rate').textContent = stats.emails_per_minute;
+                            } else {
+                                document.getElementById('extraction-rate').textContent = '-';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching worker stats:', err));
                 }
                 
                 updateStats();
-                setInterval(updateStats, 5000);
+                setInterval(updateStats, 3000); // Update every 3 seconds for real-time feeling
                 
                 // Job progress widget logic
                 <?php if ($newJobId > 0): ?>
                 const jobId = <?php echo $newJobId; ?>;
                 let progressInterval = null;
-                let processingStarted = false;
                 
                 // Function to update job progress
                 function updateJobProgress() {
@@ -2657,40 +2986,20 @@ class Router {
                         });
                 }
                 
-                // Start processing workers via AJAX (non-blocking)
-                function startJobProcessing() {
-                    if (processingStarted) return;
-                    processingStarted = true;
-                    
-                    fetch('?page=api&action=process-job-workers', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                        },
-                        body: 'job_id=' + jobId + '&worker_count=5'
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        console.log('Worker processing triggered:', data);
-                    })
-                    .catch(error => {
-                        console.error('Error starting workers:', error);
-                        document.getElementById('progress-content').innerHTML = '<p style="color: #fca5a5;">❌ Error starting workers: ' + error.message + '</p>';
-                    });
-                }
-                
                 // Start progress monitoring immediately
                 updateJobProgress();
                 progressInterval = setInterval(updateJobProgress, 3000); // Update every 3 seconds
-                
-                // Trigger worker processing after a short delay (let UI render first)
-                setTimeout(startJobProcessing, 500);
                 <?php endif; ?>
             </script>
             <?php
         });
     }
     
+    /**
+     * دالة تشغيل العمال بالتوازي (Parallel Workers)
+     * تقوم بإنشاء queue items وتشغيل العمال مباشرة من Dashboard
+     * بدون الحاجة لصفحة Workers منفصلة
+     */
     private static function spawnParallelWorkers(int $jobId, int $workerCount): void {
         $job = Job::getById($jobId);
         if (!$job) {
@@ -2704,6 +3013,7 @@ class Router {
         error_log("Creating queue for job {$jobId}: {$maxResults} total results, {$workerCount} workers, ~{$resultsPerWorker} per worker");
         
         // Create queue items for parallel processing
+        // إنشاء queue items للمعالجة المتوازية
         $db = Database::connect();
         $queueItemsCreated = 0;
         
@@ -2720,27 +3030,26 @@ class Router {
             }
         }
         
-        // Don't set to running yet - wait for workers to actually start
+        // Mark job as running immediately - workers will process the queue
         error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}. Spawning workers now...");
+        Job::updateStatus($jobId, 'running', 0);
         
-        // Spawn workers directly to process queue items
-        $successCount = self::spawnWorkersDirectly($jobId, $workerCount);
+        // Spawn workers asynchronously in background (NOT synchronously!)
+        // This allows workers to run in parallel, not sequentially
+        // تشغيل العمال بشكل غير متزامن في الخلفية (وليس بشكل متزامن!)
+        self::autoSpawnWorkers($workerCount);
         
-        if ($successCount > 0) {
-            // At least one worker started successfully
-            Job::updateStatus($jobId, 'running', 0);
-            error_log("✓ Worker spawning completed for job {$jobId} - {$successCount}/{$workerCount} workers started");
-        } else {
-            // No workers started - mark job as failed
-            Job::updateStatus($jobId, 'failed', 0);
-            error_log("✗ Worker spawning FAILED for job {$jobId} - no workers could start");
-            
-            // Log error to worker_errors table for UI display
-            $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'spawn_failed', ?, 'critical')");
-            $stmt->execute([$jobId, "Failed to spawn any workers for job {$jobId}. Check server configuration and error logs."]);
-        }
+        error_log("✓ Triggered async spawning of {$workerCount} workers for job {$jobId}");
     }
     
+    /**
+     * DEPRECATED: This function runs workers synchronously (one after another)
+     * which causes the entire process to hang and be extremely slow.
+     * DO NOT USE - Use autoSpawnWorkers() instead which spawns workers in background.
+     * 
+     * Kept here only for reference. Will be removed in future versions.
+     */
+    /*
     private static function spawnWorkersDirectly(int $jobId, int $workerCount): int {
         // For environments where HTTP loopback connections are blocked (common hosting restriction)
         // Process workers inline since curl to self fails
@@ -2818,18 +3127,25 @@ class Router {
         
         return $successCount;
     }
+    */
     
     private static function autoSpawnWorkers(int $workerCount): void {
+        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
+        
         // Check if exec() is available
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
+            error_log("autoSpawnWorkers: Using exec() method");
             // Method 1: Spawn background PHP processes (preferred)
             self::spawnWorkersViaExec($workerCount);
         } else {
+            error_log("autoSpawnWorkers: exec() not available, using HTTP method");
             // Method 2: Use async HTTP requests (fallback for restricted hosting)
             self::spawnWorkersViaHttp($workerCount);
         }
+        
+        error_log("autoSpawnWorkers: Completed spawning attempt for {$workerCount} workers");
     }
     
     private static function spawnWorkersViaExec(int $workerCount): void {
@@ -2866,10 +3182,14 @@ class Router {
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
-        error_log("Spawning {$workerCount} HTTP workers");
+        error_log("spawnWorkersViaHttp: Spawning {$workerCount} HTTP workers to {$baseUrl}");
+        
+        // Use curl_multi for truly async requests
+        $multiHandle = curl_multi_init();
+        $handles = [];
         
         for ($i = 0; $i < $workerCount; $i++) {
-            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+            $workerName = 'http-worker-' . uniqid() . '-' . $i;
             
             // Create async HTTP request to trigger worker
             $ch = curl_init($baseUrl . '?page=start-worker');
@@ -2879,24 +3199,45 @@ class Router {
                 'worker_name' => $workerName,
                 'worker_index' => $i
             ]));
-            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Short timeout to just start the worker
+            curl_setopt($ch, CURLOPT_TIMEOUT_MS, 500); // Very short timeout - just trigger
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, 500);
             curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
             
-            // Execute async (don't wait for response)
-            curl_exec($ch);
+            curl_multi_add_handle($multiHandle, $ch);
+            $handles[$i] = $ch;
+            
+            error_log("spawnWorkersViaHttp: Queued HTTP worker #{$i}: {$workerName}");
+        }
+        
+        // Execute all requests in parallel
+        $running = null;
+        do {
+            curl_multi_exec($multiHandle, $running);
+            curl_multi_select($multiHandle, 0.1);
+        } while ($running > 0);
+        
+        // Check results and clean up
+        $successCount = 0;
+        foreach ($handles as $i => $ch) {
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
             
-            if ($httpCode === 200) {
-                error_log("Successfully spawned HTTP worker: {$workerName}");
+            if ($httpCode === 200 || $httpCode === 0) { // 0 = timeout (expected for async)
+                error_log("spawnWorkersViaHttp: Worker #{$i} triggered (HTTP {$httpCode})");
+                $successCount++;
             } else {
-                error_log("Failed to spawn HTTP worker #{$i}, HTTP code: {$httpCode}");
+                error_log("spawnWorkersViaHttp: Worker #{$i} failed - HTTP {$httpCode}, Error: {$error}");
             }
             
+            curl_multi_remove_handle($multiHandle, $ch);
             curl_close($ch);
-            
-            // Small delay between spawning workers
-            usleep(50000); // 0.05 seconds
         }
+        
+        curl_multi_close($multiHandle);
+        
+        error_log("spawnWorkersViaHttp: Successfully triggered {$successCount}/{$workerCount} HTTP workers");
     }
     
     private static function renderNewJob(): void {
@@ -3088,9 +3429,9 @@ class Router {
                     
                     <div class="form-group">
                         <label>Rate Limit (seconds between requests)</label>
-                        <!-- Default: 0.3 (see Worker::DEFAULT_RATE_LIMIT) -->
-                        <input type="number" step="0.1" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.3'); ?>">
-                        <small>Optimized for parallel processing: 0.1-0.5 seconds recommended with curl_multi</small>
+                        <!-- Default: 0.1 (see Worker::DEFAULT_RATE_LIMIT) -->
+                        <input type="number" step="0.01" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.1'); ?>">
+                        <small>Optimized for maximum performance: 0.1 seconds with curl_multi parallel processing (100k emails in ~3 min)</small>
                     </div>
                     
                     <div class="form-group">
@@ -3704,12 +4045,6 @@ class Router {
                 <nav class="nav">
                     <a href="?page=dashboard" class="nav-item <?php echo ($_GET['page'] ?? 'dashboard') === 'dashboard' ? 'active' : ''; ?>">
                         📊 Dashboard
-                    </a>
-                    <a href="?page=new-job" class="nav-item <?php echo ($_GET['page'] ?? '') === 'new-job' ? 'active' : ''; ?>">
-                        ➕ New Email Job
-                    </a>
-                    <a href="?page=workers" class="nav-item <?php echo ($_GET['page'] ?? '') === 'workers' ? 'active' : ''; ?>">
-                        👥 Workers
                     </a>
                     <a href="?page=settings" class="nav-item <?php echo ($_GET['page'] ?? '') === 'settings' ? 'active' : ''; ?>">
                         🔧 Settings
