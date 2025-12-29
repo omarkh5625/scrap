@@ -1154,6 +1154,23 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
+    private const AUTO_MAX_WORKERS = 100; // Maximum workers to spawn automatically for maximum performance
+    private const OPTIMAL_RESULTS_PER_WORKER = 100; // Optimal number of results per worker for best performance
+    
+    /**
+     * Calculate optimal worker count based on job size
+     * Automatically determines the best number of workers for maximum performance
+     */
+    public static function calculateOptimalWorkerCount(int $maxResults): int {
+        // Calculate based on optimal results per worker
+        $calculatedWorkers = (int)ceil($maxResults / self::OPTIMAL_RESULTS_PER_WORKER);
+        
+        // Cap at maximum workers to avoid resource exhaustion
+        $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
+        
+        // Ensure at least 1 worker
+        return max(1, $optimalWorkers);
+    }
     
     public static function getAll(): array {
         $db = Database::connect();
@@ -2123,9 +2140,16 @@ class Router {
             case 'process-job-workers':
                 // Trigger worker processing for a job (called via AJAX after job creation)
                 $jobId = (int)($_POST['job_id'] ?? 0);
-                $workerCount = (int)($_POST['worker_count'] ?? 5);
                 
                 if ($jobId > 0) {
+                    // Get job details to calculate optimal worker count
+                    $job = Job::getById($jobId);
+                    if ($job) {
+                        $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                    } else {
+                        $workerCount = Worker::calculateOptimalWorkerCount(100); // Default fallback
+                    }
+                    
                     // Send immediate response, then process in background
                     ignore_user_abort(true);
                     set_time_limit(0);
@@ -2600,12 +2624,12 @@ class Router {
                     $maxResults = (int)($_POST['max_results'] ?? 100);
                     $country = !empty($_POST['country']) ? $_POST['country'] : null;
                     $emailFilter = $_POST['email_filter'] ?? 'all';
-                    $workerCount = (int)($_POST['worker_count'] ?? 0);
                     
-                    // Validate worker count is specified
-                    if ($workerCount < 1) {
-                        $error = 'Worker count is required. Please specify how many workers to use (minimum 1).';
-                    } elseif (!$query || !$apiKey) {
+                    // Automatically calculate optimal worker count based on job size
+                    $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
+                    
+                    // Validate required fields
+                    if (!$query || !$apiKey) {
                         $error = 'Query and API Key are required';
                     } else {
                         // Create job for immediate processing
@@ -2695,19 +2719,12 @@ class Router {
                         </div>
                     </div>
                     
-                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Target Emails *</label>
                             <input type="number" name="max_results" value="1000" min="1" max="100000" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Recommended: 1000-10000 for quality</small>
-                        </div>
-                        
-                        <div>
-                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Workers * 🚀</label>
-                            <input type="number" name="worker_count" value="20" min="1" max="1000" required 
-                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
-                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Estimated: 20-50 workers ≈ 100k emails in ~3 min*</small>
                         </div>
                         
                         <div>
@@ -2745,7 +2762,7 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
                     <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
-                        <li>Use 20-50 workers for fastest extraction (estimated: 100k emails in ~3 minutes)*</li>
+                        <li>🚀 Workers spawn automatically based on job size (up to 100 workers for maximum speed)</li>
                         <li>Business email filter removes junk and social media emails</li>
                         <li>Specific queries (industry + location) yield better quality emails</li>
                         <li>System automatically filters famous sites and placeholder emails</li>
@@ -3253,7 +3270,9 @@ class Router {
                 $maxResults = (int)($_POST['max_results'] ?? 100);
                 $country = !empty($_POST['country']) ? $_POST['country'] : null;
                 $emailFilter = $_POST['email_filter'] ?? 'all';
-                $workerCount = (int)($_POST['worker_count'] ?? 5);
+                
+                // Automatically calculate optimal worker count based on job size
+                $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
                 
                 if ($query && $apiKey) {
                     // Create job for immediate processing
@@ -3301,7 +3320,7 @@ class Router {
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Workers start automatically when you create a job! Results appear in real-time.
+                    ⚡ Workers spawn automatically at maximum capacity based on your job size! Results appear in real-time.
                 </p>
                 <form method="POST">
                     <div class="form-group">
@@ -3353,13 +3372,7 @@ class Router {
                         <small>Filter extracted emails by domain type</small>
                     </div>
                     
-                    <div class="form-group">
-                        <label>Parallel Workers</label>
-                        <input type="number" name="worker_count" value="5" min="1" max="1000">
-                        <small>Number of parallel workers to spawn automatically (1-1000). More workers = faster processing</small>
-                    </div>
-                    
-                    <button type="submit" class="btn btn-primary">Create Job & Start Processing</button>
+                    <button type="submit" class="btn btn-primary">🚀 Start Extraction</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
@@ -3368,7 +3381,7 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>Workers start automatically in the background</li>
+                    <li>System automatically calculates and spawns optimal number of workers (up to 100)</li>
                     <li>Job is split into chunks for parallel processing</li>
                     <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously</li>
                     <li>Emails are extracted and validated in batches</li>
@@ -3379,14 +3392,15 @@ class Router {
                     <strong>⚡ Performance Optimizations:</strong>
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
-                    <li><strong>Parallel HTTP Requests:</strong> Up to 50 simultaneous connections with curl_multi</li>
+                    <li><strong>Automatic Worker Scaling:</strong> System spawns optimal workers based on job size</li>
+                    <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections with curl_multi</li>
                     <li><strong>Batch Processing:</strong> URLs scraped in parallel, emails inserted in bulk</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support for faster requests</li>
                     <li><strong>Memory Caching:</strong> BloomFilter cache reduces database queries by ~90%</li>
-                    <li><strong>Optimized Rate Limiting:</strong> 0.3s default (vs 0.5s) with parallel processing</li>
+                    <li><strong>Optimized Rate Limiting:</strong> 0.1s default with parallel processing</li>
                 </ul>
                 <p style="margin-top: 15px;">
-                    <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Create Job & Start Processing". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically at maximum capacity when you click "🚀 Start Extraction". The UI returns instantly while workers process in the background. Works on all hosting environments including cPanel!
                 </p>
             </div>
             <?php
@@ -3593,15 +3607,23 @@ class Router {
             
             <div class="card">
                 <h2>Start New Worker</h2>
-                <p>To start a worker, run this command in your terminal:</p>
+                <p>Workers are spawned automatically when jobs are created. You can also manually start additional workers using this command:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-name</pre>
                 <p>Example:</p>
                 <pre class="code-block">php <?php echo __FILE__; ?> worker-1</pre>
                 <p style="margin-top: 15px; color: #718096;">
+                    <strong>⚡ Automatic Worker Spawning:</strong>
+                </p>
+                <ul style="color: #718096; padding-left: 20px;">
+                    <li>✅ System automatically spawns optimal workers based on job size (up to 100)</li>
+                    <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
+                    <li>✅ Workers scale dynamically for maximum performance</li>
+                </ul>
+                <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 50 simultaneous)</li>
+                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 100 simultaneous)</li>
                     <li>✅ <strong>Bulk operations</strong> for database inserts and email validation</li>
                     <li>✅ <strong>In-memory caching</strong> for BloomFilter (10K item cache)</li>
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
