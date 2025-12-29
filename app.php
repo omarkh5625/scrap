@@ -1286,6 +1286,9 @@ class Router {
             case 'start-worker':
                 self::handleStartWorker();
                 break;
+            case 'process-queue-worker':
+                self::handleProcessQueueWorker();
+                break;
             case 'api':
                 self::handleAPI();
                 break;
@@ -1668,6 +1671,98 @@ class Router {
         exit;
     }
     
+    private static function handleProcessQueueWorker(): void {
+        // This processes queue items for a specific job
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $jobId = (int)($_POST['job_id'] ?? 0);
+            $workerName = $_POST['worker_name'] ?? 'queue-worker-' . uniqid();
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            
+            if ($jobId <= 0) {
+                exit;
+            }
+            
+            error_log("Queue Worker {$workerName} starting for job {$jobId}...");
+            
+            // Close connection immediately so client doesn't wait
+            ignore_user_abort(true);
+            set_time_limit(0);
+            
+            // Send minimal response
+            $response = json_encode(['status' => 'processing', 'worker' => $workerName, 'job_id' => $jobId]);
+            header('Content-Type: application/json');
+            header('Content-Length: ' . strlen($response));
+            header('Connection: close');
+            echo $response;
+            
+            // Flush all output buffers
+            if (ob_get_level() > 0) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Close the session if it's open
+            if (session_id()) {
+                session_write_close();
+            }
+            
+            // Give time for connection to close
+            usleep(100000); // 0.1 seconds
+            
+            // Now process queue items for this job in background
+            try {
+                error_log("Worker {$workerName} processing queue for job {$jobId}");
+                
+                $workerId = Worker::register($workerName);
+                
+                // Process queue items for this specific job
+                $startTime = time();
+                $maxRuntime = 600; // 10 minutes max per worker
+                $itemsProcessed = 0;
+                
+                while ((time() - $startTime) < $maxRuntime) {
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    
+                    // Get next queue item for this job
+                    $job = Worker::getNextJob();
+                    
+                    // Only process if it's for our job
+                    if ($job && isset($job['id']) && $job['id'] == $jobId) {
+                        Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                        Worker::processJob($job['id']);
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        $itemsProcessed++;
+                        
+                        // Check if all queue items for this job are done
+                        $db = Database::connect();
+                        $stmt = $db->prepare("SELECT COUNT(*) as pending FROM job_queue WHERE job_id = ? AND status = 'pending'");
+                        $stmt->execute([$jobId]);
+                        $pendingCount = $stmt->fetch()['pending'];
+                        
+                        if ($pendingCount == 0) {
+                            error_log("Worker {$workerName}: No more queue items for job {$jobId}. Exiting.");
+                            break;
+                        }
+                    } else {
+                        // No queue items for our job, exit
+                        error_log("Worker {$workerName}: No queue items found for job {$jobId}. Exiting.");
+                        break;
+                    }
+                    
+                    // Small sleep between items
+                    sleep(1);
+                }
+                
+                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} queue items for job {$jobId}.");
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } catch (Exception $e) {
+                error_log("Queue Worker {$workerName} error: " . $e->getMessage());
+                Worker::logError($workerId ?? 0, $jobId, 'worker_error', $e->getMessage(), $e->getTraceAsString(), 'error');
+            }
+        }
+        exit;
+    }
+    
     private static function renderSetup(?string $error): void {
         ?>
         <!DOCTYPE html>
@@ -1920,13 +2015,58 @@ class Router {
             }
         }
         
-        // Update job status to pending (workers will pick it up from queue)
-        Job::updateStatus($jobId, 'pending', 0);
+        // Update job status to running so it shows activity
+        Job::updateStatus($jobId, 'running', 0);
         
-        error_log("Created {$workerCount} queue items for job {$jobId}. Auto-spawning workers...");
+        error_log("Created {$workerCount} queue items for job {$jobId}. Spawning workers immediately...");
         
-        // Auto-spawn workers to process the queue immediately
-        self::autoSpawnWorkers($workerCount);
+        // Spawn workers directly to process queue items
+        self::spawnWorkersDirectly($jobId, $workerCount);
+    }
+    
+    private static function spawnWorkersDirectly(int $jobId, int $workerCount): void {
+        // For cPanel and restricted environments, spawn workers via direct HTTP requests
+        // This method processes queue items immediately instead of relying on background processes
+        
+        error_log("Spawning {$workerCount} workers directly for job {$jobId}");
+        
+        // Get the current URL
+        $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
+        $baseUrl = $protocol . '://' . $host . $scriptName;
+        
+        // Spawn workers via async HTTP requests
+        for ($i = 0; $i < $workerCount; $i++) {
+            $workerName = 'worker-' . $jobId . '-' . $i . '-' . time();
+            
+            // Create async HTTP request to trigger worker processing
+            $ch = curl_init($baseUrl . '?page=process-queue-worker');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'job_id' => $jobId,
+                'worker_name' => $workerName,
+                'worker_index' => $i
+            ]));
+            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Very short timeout - just to trigger
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+            curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            
+            // Execute without waiting for full response
+            curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            
+            if ($httpCode > 0) {
+                error_log("Spawned worker {$i} for job {$jobId}: HTTP {$httpCode}");
+            } else {
+                error_log("Warning: Worker {$i} spawn may have failed for job {$jobId}");
+            }
+            
+            // Small delay between spawns to avoid overwhelming the server
+            usleep(50000); // 0.05 seconds
+        }
     }
     
     private static function autoSpawnWorkers(int $workerCount): void {
