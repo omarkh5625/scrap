@@ -40,6 +40,8 @@ define('CONFIG_END', true);
 
 error_reporting(E_ALL);
 ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+ini_set('error_log', __DIR__ . '/php_errors.log');
 date_default_timezone_set('UTC');
 
 session_start();
@@ -452,7 +454,10 @@ class Worker {
             }
             
             $page++;
-            usleep(500000); // Rate limiting: 0.5 second delay
+            
+            // Rate limiting: use configurable setting or default 0.5 seconds
+            $rateLimit = (float)(Settings::get('rate_limit', '0.5'));
+            usleep((int)($rateLimit * 1000000));
         }
         
         Job::updateStatus($jobId, 'completed', 100);
@@ -494,7 +499,7 @@ class Worker {
 // ============================================================================
 
 class Settings {
-    public static function get(string $key, $default = null) {
+    public static function get(string $key, mixed $default = null): mixed {
         $db = Database::connect();
         $stmt = $db->prepare("SELECT setting_value FROM settings WHERE setting_key = ?");
         $stmt->execute([$key]);
@@ -599,6 +604,9 @@ class Router {
         echo "Worker ID: {$workerId}\n";
         echo "Waiting for jobs...\n\n";
         
+        // Get polling interval from settings or use default 5 seconds
+        $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
+        
         while (true) {
             Worker::updateHeartbeat($workerId, 'idle');
             
@@ -610,7 +618,7 @@ class Router {
                 Worker::updateHeartbeat($workerId, 'idle');
             }
             
-            sleep(5); // Check for new jobs every 5 seconds
+            sleep($pollingInterval);
         }
     }
     
@@ -1197,10 +1205,10 @@ class Router {
                         ➕ New Job
                     </a>
                     <a href="?page=workers" class="nav-item <?php echo ($_GET['page'] ?? '') === 'workers' ? 'active' : ''; ?>">
-                        ⚙️ Workers
+                        👥 Workers
                     </a>
                     <a href="?page=settings" class="nav-item <?php echo ($_GET['page'] ?? '') === 'settings' ? 'active' : ''; ?>">
-                        ⚙️ Settings
+                        🔧 Settings
                     </a>
                     <a href="?page=logout" class="nav-item">
                         🚪 Logout
