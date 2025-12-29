@@ -610,18 +610,18 @@ class Worker {
     public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
         $db = Database::connect();
         
-        // Calculate runtime
-        $stmt = $db->prepare("SELECT created_at FROM workers WHERE id = ?");
-        $stmt->execute([$workerId]);
-        $worker = $stmt->fetch();
-        
-        if ($worker) {
-            $createdAt = strtotime($worker['created_at']);
-            $runtimeSeconds = time() - $createdAt;
-            
-            $stmt = $db->prepare("UPDATE workers SET status = ?, current_job_id = ?, last_heartbeat = NOW(), pages_processed = pages_processed + ?, emails_extracted = emails_extracted + ?, runtime_seconds = ? WHERE id = ?");
-            $stmt->execute([$status, $jobId, $pagesProcessed, $emailsExtracted, $runtimeSeconds, $workerId]);
-        }
+        // Simple runtime calculation based on created_at (cached in single query)
+        $stmt = $db->prepare("
+            UPDATE workers 
+            SET status = ?, 
+                current_job_id = ?, 
+                last_heartbeat = NOW(), 
+                pages_processed = pages_processed + ?, 
+                emails_extracted = emails_extracted + ?, 
+                runtime_seconds = TIMESTAMPDIFF(SECOND, created_at, NOW())
+            WHERE id = ?
+        ");
+        $stmt->execute([$status, $jobId, $pagesProcessed, $emailsExtracted, $workerId]);
     }
     
     public static function getStats(): array {
@@ -728,6 +728,11 @@ class Worker {
         
         echo "Processing job #{$jobId}: {$job['query']}\n";
         
+        // Register this worker for tracking
+        $workerName = 'cli-worker-' . getmypid();
+        $workerId = self::register($workerName);
+        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+        
         $apiKey = $job['api_key'];
         $query = $job['query'];
         $maxResults = (int)$job['max_results'];
@@ -763,6 +768,11 @@ class Worker {
                 }
             }
             
+            $emailsExtractedThisPage = $processed - $emailsBefore;
+            
+            // Update worker statistics
+            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+            
             if (!isset($data['organic']) || count($data['organic']) === 0) {
                 break;
             }
@@ -776,6 +786,9 @@ class Worker {
         
         Job::updateStatus($jobId, 'completed', 100);
         echo "Job #{$jobId} completed! Total emails: {$processed}\n";
+        
+        // Mark worker as idle
+        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
     }
     
     private static function searchSerper(string $apiKey, string $query, int $page = 1, ?string $country = null): ?array {
@@ -1694,7 +1707,6 @@ class Router {
                 <p style="margin-top: 15px;">
                     <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Start Processing Immediately". No manual CLI worker setup needed! The UI returns instantly while workers process in the background.
                 </p>
-                </p>
             </div>
             <?php
         });
@@ -1853,60 +1865,6 @@ class Router {
                     <strong>Note:</strong> Workers automatically track their performance metrics including pages processed, emails extracted, and runtime.
                 </p>
             </div>
-            
-            <style>
-                .worker-status-indicator {
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }
-                
-                .status-dot {
-                    width: 12px;
-                    height: 12px;
-                    border-radius: 50%;
-                    background: #48bb78;
-                    animation: pulse 2s infinite;
-                }
-                
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: 0.5; }
-                }
-                
-                .metrics-grid {
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 20px;
-                }
-                
-                .metric-item {
-                    padding: 15px;
-                    background: #f7fafc;
-                    border-radius: 6px;
-                }
-                
-                .metric-label {
-                    font-size: 13px;
-                    color: #718096;
-                    margin-bottom: 5px;
-                }
-                
-                .metric-value {
-                    font-size: 24px;
-                    font-weight: 700;
-                    color: #2d3748;
-                }
-                
-                .worker-detail {
-                    margin-top: 10px;
-                    padding: 10px;
-                    background: #f7fafc;
-                    border-radius: 4px;
-                    font-size: 13px;
-                    color: #4a5568;
-                }
-            </style>
             
             <script>
                 function formatRuntime(seconds) {
@@ -2593,6 +2551,60 @@ class Router {
             border-radius: 6px;
             font-family: 'Courier New', monospace;
             overflow-x: auto;
+        }
+        
+        /* Worker Status Indicator */
+        .worker-status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #48bb78;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        /* Metrics Grid */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        
+        .metric-item {
+            padding: 15px;
+            background: #f7fafc;
+            border-radius: 6px;
+        }
+        
+        .metric-label {
+            font-size: 13px;
+            color: #718096;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #2d3748;
+        }
+        
+        .worker-detail {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f7fafc;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #4a5568;
         }
         
         /* Responsive */
