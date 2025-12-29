@@ -1160,20 +1160,23 @@ class Job {
 // ============================================================================
 
 class Worker {
-    // Configuration constants
+    // Configuration constants - Enhanced for 300 worker support
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 100; // Maximum workers to spawn automatically for maximum performance
+    private const AUTO_MAX_WORKERS = 300; // Maximum workers to spawn automatically - increased from 100 to 300
     private const OPTIMAL_RESULTS_PER_WORKER = 100; // Optimal number of results per worker for best performance
+    private const WORKER_HEARTBEAT_TIMEOUT = 300; // 5 minutes - consider worker dead if no heartbeat
+    private const WORKER_BATCH_SIZE = 50; // Spawn workers in batches to prevent resource spikes
     
     /**
      * Calculate optimal worker count based on job size
      * Automatically determines the best number of workers for maximum performance
+     * Enhanced to support up to 300 workers efficiently
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
         // Calculate based on optimal results per worker
         $calculatedWorkers = (int)ceil($maxResults / self::OPTIMAL_RESULTS_PER_WORKER);
         
-        // Cap at maximum workers to avoid resource exhaustion
+        // Cap at maximum workers to avoid resource exhaustion (now 300 instead of 100)
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
@@ -1852,9 +1855,22 @@ class Router {
             return;
         }
         
-        // Handle login/logout
+        // ========================================================================
+        // SEPARATION OF UI AND BACKEND - Route based on request method
+        // ========================================================================
+        // GET requests = UI rendering (user interface)
+        // POST requests = Backend processing (data submission, API calls)
+        // This prevents UI blocking when backend processes are running
+        // ========================================================================
+        
+        $requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
         $page = $_GET['page'] ?? 'dashboard';
         
+        // ========================================================================
+        // BACKEND ROUTES (POST/API) - No UI rendering, pure backend logic
+        // ========================================================================
+        
+        // Handle login/logout
         if ($page === 'login') {
             self::handleLogin();
             return;
@@ -1873,10 +1889,40 @@ class Router {
             return;
         }
         
-        // Require authentication for all other pages
+        // Backend API endpoints - no UI rendering
+        if ($page === 'api') {
+            Auth::requireAuth();
+            self::handleAPI();
+            return;
+        }
+        
+        // Worker processing endpoints - backend only
+        if ($page === 'process-worker' || $page === 'start-worker') {
+            if ($requestMethod === 'POST') {
+                if ($page === 'process-worker') {
+                    self::handleWorkerProcessing();
+                } else {
+                    self::handleStartWorker();
+                }
+                return;
+            }
+        }
+        
+        // Export endpoints - backend only
+        if ($page === 'export') {
+            Auth::requireAuth();
+            self::handleExport();
+            return;
+        }
+        
+        // ========================================================================
+        // UI ROUTES (GET) - User interface rendering only
+        // ========================================================================
+        
+        // Require authentication for all UI pages
         Auth::requireAuth();
         
-        // Route to appropriate page
+        // Route to appropriate UI page
         switch ($page) {
             case 'dashboard':
                 self::renderDashboard();
@@ -1891,18 +1937,6 @@ class Router {
                 break;
             case 'results':
                 self::renderResults();
-                break;
-            case 'export':
-                self::handleExport();
-                break;
-            case 'process-worker':
-                self::handleWorkerProcessing();
-                break;
-            case 'start-worker':
-                self::handleStartWorker();
-                break;
-            case 'api':
-                self::handleAPI();
                 break;
             default:
                 self::renderDashboard();
@@ -2787,7 +2821,7 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
                     <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
-                        <li>🚀 Workers spawn automatically based on job size (up to 100 workers for maximum speed)</li>
+                        <li>🚀 Workers spawn automatically based on job size (up to 300 workers for maximum speed)</li>
                         <li>Business email filter removes junk and social media emails</li>
                         <li>Specific queries (industry + location) yield better quality emails</li>
                         <li>System automatically filters famous sites and placeholder emails</li>
@@ -3217,6 +3251,13 @@ class Router {
     private static function autoSpawnWorkers(int $workerCount): void {
         error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
         
+        // ========================================================================
+        // ENHANCED WORKER SPAWNING FOR 300 WORKERS
+        // ========================================================================
+        // Strategy: Spawn workers in batches to prevent resource spikes
+        // This ensures system stability when spawning large number of workers
+        // ========================================================================
+        
         // For restricted hosting environments (exec disabled, no cron), 
         // process work directly in background after closing connection
         // This ensures extraction starts immediately without blocking UI
@@ -3224,13 +3265,13 @@ class Router {
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method");
-            // Method 1: Spawn background PHP processes (only if exec available)
+            error_log("autoSpawnWorkers: Using exec() method with batch spawning");
+            // Method 1: Spawn background PHP processes in batches (only if exec available)
             self::spawnWorkersViaExec($workerCount);
         } else {
             // Method 2: Direct background processing (no exec, no HTTP, no cron needed)
             // Process work in same request but after closing connection to user
-            error_log("autoSpawnWorkers: exec() not available, using direct background processing");
+            error_log("autoSpawnWorkers: exec() not available, using direct background processing with batching");
             self::processWorkersInBackground($workerCount);
         }
     }
@@ -3238,28 +3279,51 @@ class Router {
     private static function spawnWorkersViaExec(int $workerCount): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
+        $batchSize = Worker::WORKER_BATCH_SIZE; // 50 workers per batch
         
-        for ($i = 0; $i < $workerCount; $i++) {
-            // Build command to run worker in queue mode
-            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
-            $cmd = sprintf(
-                '%s %s %s > /dev/null 2>&1 &',
-                escapeshellarg($phpBinary),
-                escapeshellarg($scriptPath),
-                escapeshellarg($workerName)
-            );
+        error_log("spawnWorkersViaExec: Spawning {$workerCount} workers in batches of {$batchSize}");
+        
+        // Spawn workers in batches to prevent resource exhaustion
+        $batches = (int)ceil($workerCount / $batchSize);
+        
+        for ($batch = 0; $batch < $batches; $batch++) {
+            $batchStart = $batch * $batchSize;
+            $batchEnd = min($batchStart + $batchSize, $workerCount);
+            $currentBatchSize = $batchEnd - $batchStart;
             
-            // Execute in background
-            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-                // Windows
-                pclose(popen("start /B " . $cmd, "r"));
-            } else {
-                // Unix/Linux
-                exec($cmd);
+            error_log("  Batch " . ($batch + 1) . "/{$batches}: Spawning workers {$batchStart}-" . ($batchEnd - 1) . " ({$currentBatchSize} workers)");
+            
+            for ($i = $batchStart; $i < $batchEnd; $i++) {
+                // Build command to run worker in queue mode
+                $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+                $cmd = sprintf(
+                    '%s %s %s > /dev/null 2>&1 &',
+                    escapeshellarg($phpBinary),
+                    escapeshellarg($scriptPath),
+                    escapeshellarg($workerName)
+                );
+                
+                // Execute in background
+                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                    // Windows
+                    pclose(popen("start /B " . $cmd, "r"));
+                } else {
+                    // Unix/Linux
+                    exec($cmd);
+                }
+                
+                // Small delay between worker spawns in same batch to prevent fork bomb
+                usleep(10000); // 0.01 seconds = 10ms
             }
             
-            error_log("Spawned worker: {$workerName}");
+            // Small delay between batches to allow workers to initialize
+            if ($batch < $batches - 1) {
+                usleep(100000); // 0.1 seconds between batches
+                error_log("  Batch " . ($batch + 1) . " spawned. Waiting before next batch...");
+            }
         }
+        
+        error_log("spawnWorkersViaExec: All {$workerCount} workers spawned in {$batches} batches");
     }
     
     private static function spawnWorkersViaHttp(int $workerCount): int {
@@ -3405,55 +3469,81 @@ class Router {
      * Process workers in background after closing connection
      * This method works without exec, HTTP workers, or cron
      * Connection must be closed BEFORE calling this method
+     * Enhanced to handle 300 workers with batching strategy
      */
     private static function processWorkersInBackground(int $workerCount): void {
         error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers");
         
+        // ========================================================================
+        // ENHANCED BACKGROUND PROCESSING FOR 300 WORKERS
+        // ========================================================================
+        // Strategy: Process workers in batches with staggered execution
+        // This prevents memory exhaustion and database connection overload
+        // ========================================================================
+        
         // Connection should already be closed by caller
         // Just ensure we can continue after user disconnect
         ignore_user_abort(true);
-        set_time_limit(300); // 5 minutes max to prevent runaway processes
+        set_time_limit(600); // 10 minutes max for large worker counts (increased from 5)
         
         // Now process work in background - user has already received response
         try {
             $db = Database::connect();
             
-            // Process queue items with multiple simulated workers
+            // Process queue items with multiple simulated workers in batches
+            $batchSize = Worker::WORKER_BATCH_SIZE; // 50 workers per batch
             $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
             $totalProcessed = 0;
             $startTime = time();
-            $maxRuntime = 300; // 5 minutes total
+            $maxRuntime = 600; // 10 minutes total for large worker counts
             
-            for ($workerIndex = 0; $workerIndex < $workerCount; $workerIndex++) {
+            // Calculate number of batches
+            $batches = (int)ceil($workerCount / $batchSize);
+            error_log("processWorkersInBackground: Processing {$workerCount} workers in {$batches} batches of up to {$batchSize}");
+            
+            for ($batch = 0; $batch < $batches; $batch++) {
                 // Check if we've exceeded max runtime
                 if ((time() - $startTime) >= $maxRuntime) {
                     error_log("processWorkersInBackground: Max runtime reached, stopping");
                     break;
                 }
                 
-                $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
+                $batchStart = $batch * $batchSize;
+                $batchEnd = min($batchStart + $batchSize, $workerCount);
+                $currentBatchSize = $batchEnd - $batchStart;
                 
-                try {
-                    $workerId = Worker::register($workerName);
-                    if (!$workerId) {
-                        error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
-                        continue;
+                error_log("processWorkersInBackground: Processing batch " . ($batch + 1) . "/{$batches} (workers {$batchStart}-" . ($batchEnd - 1) . ")");
+                
+                // Process workers in this batch
+                for ($workerIndex = $batchStart; $workerIndex < $batchEnd; $workerIndex++) {
+                    // Check runtime periodically
+                    if ((time() - $startTime) >= $maxRuntime) {
+                        error_log("processWorkersInBackground: Max runtime reached in batch, stopping");
+                        break 2; // Break out of both loops
                     }
-                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered with ID {$workerId}");
                     
-                    // Each simulated worker processes items from the queue
-                    $itemsProcessed = 0;
+                    $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
                     
-                    for ($i = 0; $i < $maxItemsPerWorker; $i++) {
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    try {
+                        $workerId = Worker::register($workerName);
+                        if (!$workerId) {
+                            error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
+                            continue;
+                        }
                         
-                        $job = Worker::getNextJob();
+                        // Each simulated worker processes items from the queue
+                        $itemsProcessed = 0;
                         
-                        if ($job) {
-                            // Check if job has reached target email count
-                            $jobId = (int)$job['id'];
-                            $jobDetails = Job::getById($jobId);
-                            if ($jobDetails) {
+                        for ($i = 0; $i < $maxItemsPerWorker; $i++) {
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                            
+                            $job = Worker::getNextJob();
+                            
+                            if ($job) {
+                                // Check if job has reached target email count
+                                $jobId = (int)$job['id'];
+                                $jobDetails = Job::getById($jobId);
+                                if ($jobDetails) {
                                 $emailsCollected = Job::getEmailCount($jobId);
                                 $maxResults = (int)$jobDetails['max_results'];
                                 
@@ -3465,20 +3555,17 @@ class Router {
                                 }
                             }
                             
-                            error_log("processWorkersInBackground: Worker {$workerIndex} processing job #{$job['id']}");
                             Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                             
                             try {
                                 Worker::processJob($job['id']);
                                 $itemsProcessed++;
                                 $totalProcessed++;
-                                error_log("processWorkersInBackground: Worker {$workerIndex} completed job #{$job['id']}");
                                 
                                 // Check again after processing if target reached
                                 if ($jobDetails) {
                                     $emailsCollected = Job::getEmailCount($jobId);
                                     if ($emailsCollected >= $maxResults) {
-                                        error_log("processWorkersInBackground: Job {$jobId} reached target after processing, stopping");
                                         Worker::checkAndUpdateJobCompletion($jobId);
                                         break; // Stop processing more items for this worker
                                     }
@@ -3489,20 +3576,25 @@ class Router {
                             }
                         } else {
                             // No more jobs in queue
-                            error_log("processWorkersInBackground: Worker {$workerIndex} - no more jobs available");
                             break;
                         }
                     }
                     
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                    error_log("processWorkersInBackground: Worker {$workerIndex} completed {$itemsProcessed} items");
                     
                 } catch (Exception $e) {
                     error_log("processWorkersInBackground: Worker {$workerIndex} fatal error: " . $e->getMessage());
                 }
             }
             
-            error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers");
+            // Small delay between batches to prevent resource spikes
+            if ($batch < $batches - 1) {
+                usleep(200000); // 0.2 seconds between batches
+                error_log("processWorkersInBackground: Batch " . ($batch + 1) . " complete. Waiting before next batch...");
+            }
+        }
+            
+            error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers in {$batches} batches");
             
         } catch (Exception $e) {
             error_log("processWorkersInBackground: Fatal error: " . $e->getMessage());
@@ -3651,7 +3743,7 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>System automatically calculates and spawns optimal number of workers (up to 100)</li>
+                    <li>System automatically calculates and spawns optimal number of workers (up to 300)</li>
                     <li>Job is split into chunks for parallel processing</li>
                     <li>Workers use <strong>curl_multi</strong> to fetch multiple URLs simultaneously</li>
                     <li>Emails are extracted and validated in batches</li>
@@ -3885,7 +3977,7 @@ class Router {
                     <strong>⚡ Automatic Worker Spawning:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ System automatically spawns optimal workers based on job size (up to 100)</li>
+                    <li>✅ System automatically spawns optimal workers based on job size (up to 300)</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum performance</li>
                 </ul>
@@ -3893,7 +3985,7 @@ class Router {
                     <strong>Performance Features:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 100 simultaneous)</li>
+                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 200 simultaneous)</li>
                     <li>✅ <strong>Bulk operations</strong> for database inserts and email validation</li>
                     <li>✅ <strong>In-memory caching</strong> for BloomFilter (10K item cache)</li>
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
