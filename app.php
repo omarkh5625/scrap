@@ -1316,7 +1316,7 @@ class Worker {
         $completed = (int)$counts['completed'];
         $failed = (int)$counts['failed'];
         
-        if ($total == 0) {
+        if ($total === 0) {
             error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
             return;
         }
@@ -1327,11 +1327,11 @@ class Worker {
         error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
         
         // Update job status based on queue completion
-        if ($completed == $total) {
+        if ($completed === $total) {
             // All queue items completed
             Job::updateStatus($jobId, 'completed', 100);
             error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
-        } elseif ($completed + $failed == $total) {
+        } elseif ($completed + $failed === $total) {
             // All queue items either completed or failed
             Job::updateStatus($jobId, 'completed', $progress);
             error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
@@ -1666,13 +1666,13 @@ class Worker {
                     
                     error_log("processJobImmediately: Processed {$processed}/{$maxResults} emails so far");
                     
-                    if (!isset($data['organic']) || count($data['organic']) === 0) {
-                        break;
-                    }
-                    
                     // Stop if we've reached the limit for this queue item
                     if ($processed >= $maxResults) {
                         error_log("processJobImmediately: Reached limit of {$maxResults} emails for this queue item");
+                        break;
+                    }
+                    
+                    if (count($data['organic']) === 0) {
                         break;
                     }
                     
