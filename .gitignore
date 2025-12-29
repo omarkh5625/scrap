@@ -1,0 +1,32 @@
+# Storage files (generated at runtime)
+public_html/storage/*.json
+public_html/storage/*.bin
+public_html/storage/*.tmp
+public_html/storage/*.log
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Logs
+*.log
+logs/
+
+# Vendor (if using Composer)
+vendor/
+
+# Node modules (if using npm)
+node_modules/
