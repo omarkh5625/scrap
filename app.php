@@ -1,19 +1,22 @@
 
 <?php
 /**
- * Complete PHP Scraping System - Single File Application
+ * Complete PHP Email Extraction System - Single File Application
  * PHP 8.0+ Required
  * 
  * Features:
  * - Setup Wizard
  * - Authentication System
  * - Dashboard
- * - Job Management
- * - Workers Control
+ * - Email Extraction Jobs
+ * - Async Background Workers (1-1000)
+ * - Email Type Filtering (Gmail, Yahoo, Business)
+ * - Country Targeting
  * - Results Export
  * - Google Serper.dev Integration
  * - BloomFilter Deduplication
  * - CLI Worker Support
+ * - Regex Email Extraction
  */
 
 declare(strict_types=1);
@@ -128,28 +131,35 @@ class Database {
                     query VARCHAR(500) NOT NULL,
                     api_key VARCHAR(255) NOT NULL,
                     max_results INT DEFAULT 100,
+                    country VARCHAR(100),
+                    email_filter VARCHAR(50),
                     status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
                     progress INT DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                     INDEX idx_status (status),
-                    INDEX idx_created (created_at)
+                    INDEX idx_created (created_at),
+                    INDEX idx_country (country)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
             $pdo->exec("
-                CREATE TABLE IF NOT EXISTS results (
+                CREATE TABLE IF NOT EXISTS emails (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     job_id INT NOT NULL,
-                    title TEXT,
-                    link VARCHAR(1000),
-                    snippet TEXT,
-                    url_hash VARCHAR(64) UNIQUE,
+                    email VARCHAR(500) NOT NULL,
+                    email_hash VARCHAR(64) UNIQUE,
+                    domain VARCHAR(255),
+                    country VARCHAR(100),
+                    source_url VARCHAR(1000),
+                    source_title TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
                     INDEX idx_job (job_id),
-                    INDEX idx_hash (url_hash)
+                    INDEX idx_hash (email_hash),
+                    INDEX idx_domain (domain),
+                    INDEX idx_country (country)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
@@ -309,8 +319,8 @@ class Auth {
 // ============================================================================
 
 class BloomFilter {
-    public static function add(string $url): void {
-        $hash = self::normalize($url);
+    public static function add(string $email): void {
+        $hash = self::normalize($email);
         $db = Database::connect();
         
         try {
@@ -321,8 +331,8 @@ class BloomFilter {
         }
     }
     
-    public static function exists(string $url): bool {
-        $hash = self::normalize($url);
+    public static function exists(string $email): bool {
+        $hash = self::normalize($email);
         $db = Database::connect();
         
         $stmt = $db->prepare("SELECT COUNT(*) as count FROM bloomfilter WHERE hash = ?");
@@ -332,13 +342,78 @@ class BloomFilter {
         return $result['count'] > 0;
     }
     
-    private static function normalize(string $url): string {
-        // Normalize URL and return SHA-256 hash
-        $url = strtolower(trim($url));
-        $url = preg_replace('/^https?:\/\/(www\.)?/', '', $url);
-        $url = rtrim($url, '/');
+    private static function normalize(string $email): string {
+        // Normalize email and return SHA-256 hash
+        $email = strtolower(trim($email));
         
-        return hash('sha256', $url);
+        return hash('sha256', $email);
+    }
+}
+
+// ============================================================================
+// EMAIL EXTRACTOR CLASS
+// ============================================================================
+
+class EmailExtractor {
+    // Comprehensive email regex pattern
+    private static string $emailPattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/';
+    
+    public static function extractEmails(string $text): array {
+        $emails = [];
+        preg_match_all(self::$emailPattern, $text, $matches);
+        
+        if (!empty($matches[0])) {
+            foreach ($matches[0] as $email) {
+                $email = strtolower(trim($email));
+                // Validate email
+                if (self::isValidEmail($email)) {
+                    $emails[] = $email;
+                }
+            }
+        }
+        
+        return array_unique($emails);
+    }
+    
+    public static function isValidEmail(string $email): bool {
+        // Basic validation
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        
+        // Check for common invalid patterns
+        if (preg_match('/\.(png|jpg|jpeg|gif|pdf|doc|docx|zip|rar)$/i', $email)) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    public static function getDomain(string $email): string {
+        $parts = explode('@', $email);
+        return isset($parts[1]) ? strtolower($parts[1]) : '';
+    }
+    
+    public static function matchesFilter(?string $filter, string $email): bool {
+        if (!$filter || $filter === 'all') {
+            return true;
+        }
+        
+        $domain = self::getDomain($email);
+        
+        switch ($filter) {
+            case 'gmail':
+                return $domain === 'gmail.com';
+            case 'yahoo':
+                return in_array($domain, ['yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'yahoo.de']);
+            case 'business':
+                // Not free email providers
+                $freeProviders = ['gmail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'hotmail.com', 
+                                 'outlook.com', 'aol.com', 'mail.com', 'protonmail.com'];
+                return !in_array($domain, $freeProviders);
+            default:
+                return true;
+        }
     }
 }
 
@@ -347,10 +422,10 @@ class BloomFilter {
 // ============================================================================
 
 class Job {
-    public static function create(int $userId, string $query, string $apiKey, int $maxResults): int {
+    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
         $db = Database::connect();
-        $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, status) VALUES (?, ?, ?, ?, 'completed')");
-        $stmt->execute([$userId, $query, $apiKey, $maxResults]);
+        $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
+        $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
         
         $jobId = (int)$db->lastInsertId();
         
@@ -382,27 +457,30 @@ class Job {
     
     public static function getResults(int $jobId): array {
         $db = Database::connect();
-        $stmt = $db->prepare("SELECT * FROM results WHERE job_id = ? ORDER BY created_at DESC");
+        $stmt = $db->prepare("SELECT * FROM emails WHERE job_id = ? ORDER BY created_at DESC");
         $stmt->execute([$jobId]);
         
         return $stmt->fetchAll();
     }
     
-    public static function addResult(int $jobId, string $title, string $link, string $snippet): void {
-        if (BloomFilter::exists($link)) {
-            return; // Skip duplicates
+    public static function addEmail(int $jobId, string $email, ?string $country = null, ?string $sourceUrl = null, ?string $sourceTitle = null): bool {
+        if (BloomFilter::exists($email)) {
+            return false; // Skip duplicates
         }
         
         $db = Database::connect();
-        $urlHash = hash('sha256', $link);
+        $emailHash = hash('sha256', strtolower($email));
+        $domain = EmailExtractor::getDomain($email);
         
         try {
-            $stmt = $db->prepare("INSERT INTO results (job_id, title, link, snippet, url_hash) VALUES (?, ?, ?, ?, ?)");
-            $stmt->execute([$jobId, $title, $link, $snippet, $urlHash]);
+            $stmt = $db->prepare("INSERT INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$jobId, $email, $emailHash, $domain, $country, $sourceUrl, $sourceTitle]);
             
-            BloomFilter::add($link);
+            BloomFilter::add($email);
+            return true;
         } catch (PDOException $e) {
             // Duplicate hash, skip
+            return false;
         }
     }
 }
@@ -476,12 +554,14 @@ class Worker {
         $apiKey = $job['api_key'];
         $query = $job['query'];
         $maxResults = (int)$job['max_results'];
+        $country = $job['country'];
+        $emailFilter = $job['email_filter'];
         
         $processed = 0;
         $page = 1;
         
         while ($processed < $maxResults) {
-            $data = self::searchSerper($apiKey, $query, $page);
+            $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
                 break;
@@ -496,14 +576,26 @@ class Worker {
                 $link = $result['link'] ?? '';
                 $snippet = $result['snippet'] ?? '';
                 
-                if ($link) {
-                    Job::addResult($jobId, $title, $link, $snippet);
-                    $processed++;
+                // Extract emails from title, link, and snippet
+                $textToScan = $title . ' ' . $link . ' ' . $snippet;
+                $emails = EmailExtractor::extractEmails($textToScan);
+                
+                foreach ($emails as $email) {
+                    if ($processed >= $maxResults) {
+                        break 2;
+                    }
                     
-                    $progress = (int)(($processed / $maxResults) * 100);
-                    Job::updateStatus($jobId, 'running', $progress);
-                    
-                    echo "  - Added: {$title}\n";
+                    // Apply email filter
+                    if (EmailExtractor::matchesFilter($emailFilter, $email)) {
+                        if (Job::addEmail($jobId, $email, $country, $link, $title)) {
+                            $processed++;
+                            
+                            $progress = (int)(($processed / $maxResults) * 100);
+                            Job::updateStatus($jobId, 'running', $progress);
+                            
+                            echo "  - Added: {$email}\n";
+                        }
+                    }
                 }
             }
             
@@ -522,14 +614,20 @@ class Worker {
         echo "Job #{$jobId} completed!\n";
     }
     
-    private static function searchSerper(string $apiKey, string $query, int $page = 1): ?array {
+    private static function searchSerper(string $apiKey, string $query, int $page = 1, ?string $country = null): ?array {
         $url = 'https://google.serper.dev/search';
         
-        $data = json_encode([
+        $payload = [
             'q' => $query,
             'page' => $page,
             'num' => 10
-        ]);
+        ];
+        
+        if ($country) {
+            $payload['gl'] = $country;
+        }
+        
+        $data = json_encode($payload);
         
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -559,12 +657,14 @@ class Worker {
         
         $apiKey = $job['api_key'];
         $query = $job['query'];
+        $country = $job['country'];
+        $emailFilter = $job['email_filter'];
         
         $processed = 0;
         $page = (int)($startOffset / 10) + 1;
         
         while ($processed < $maxResults) {
-            $data = self::searchSerper($apiKey, $query, $page);
+            $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
                 break;
@@ -579,9 +679,21 @@ class Worker {
                 $link = $result['link'] ?? '';
                 $snippet = $result['snippet'] ?? '';
                 
-                if ($link) {
-                    Job::addResult($jobId, $title, $link, $snippet);
-                    $processed++;
+                // Extract emails from title, link, and snippet
+                $textToScan = $title . ' ' . $link . ' ' . $snippet;
+                $emails = EmailExtractor::extractEmails($textToScan);
+                
+                foreach ($emails as $email) {
+                    if ($processed >= $maxResults) {
+                        break 2;
+                    }
+                    
+                    // Apply email filter
+                    if (EmailExtractor::matchesFilter($emailFilter, $email)) {
+                        if (Job::addEmail($jobId, $email, $country, $link, $title)) {
+                            $processed++;
+                        }
+                    }
                 }
             }
             
@@ -598,7 +710,7 @@ class Worker {
         
         // Update progress
         $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
-        Job::updateStatus($jobId, 'completed', min($progress, 100));
+        Job::updateStatus($jobId, 'running', min($progress, 100));
     }
 }
 
@@ -703,7 +815,7 @@ class Router {
     private static function handleCLI(): void {
         global $argv;
         
-        echo "=== PHP Scraping System Worker ===\n";
+        echo "=== PHP Email Extraction System Worker ===\n";
         
         $workerName = $argv[1] ?? 'worker-' . uniqid();
         echo "Worker: {$workerName}\n";
@@ -787,7 +899,7 @@ class Router {
                 $stmt->execute([$userId]);
                 $completedJobs = $stmt->fetch()['total'];
                 
-                $stmt = $db->prepare("SELECT COUNT(*) as total FROM results r INNER JOIN jobs j ON r.job_id = j.id WHERE j.user_id = ?");
+                $stmt = $db->prepare("SELECT COUNT(*) as total FROM emails r INNER JOIN jobs j ON r.job_id = j.id WHERE j.user_id = ?");
                 $stmt->execute([$userId]);
                 $totalResults = $stmt->fetch()['total'];
                 
@@ -821,19 +933,19 @@ class Router {
         
         if ($format === 'csv') {
             header('Content-Type: text/csv');
-            header('Content-Disposition: attachment; filename="results-' . $jobId . '.csv"');
+            header('Content-Disposition: attachment; filename="emails-' . $jobId . '.csv"');
             
             $output = fopen('php://output', 'w');
-            fputcsv($output, ['Title', 'Link', 'Snippet']);
+            fputcsv($output, ['Email', 'Domain', 'Country', 'Source URL', 'Source Title']);
             
             foreach ($results as $result) {
-                fputcsv($output, [$result['title'], $result['link'], $result['snippet']]);
+                fputcsv($output, [$result['email'], $result['domain'], $result['country'], $result['source_url'], $result['source_title']]);
             }
             
             fclose($output);
         } else {
             header('Content-Type: application/json');
-            header('Content-Disposition: attachment; filename="results-' . $jobId . '.json"');
+            header('Content-Disposition: attachment; filename="emails-' . $jobId . '.json"');
             echo json_encode($results, JSON_PRETTY_PRINT);
         }
         
@@ -847,14 +959,14 @@ class Router {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Setup Wizard - PHP Scraping System</title>
+            <title>Setup Wizard - PHP Email Extraction System</title>
             <style><?php self::getCSS(); ?></style>
         </head>
         <body class="setup-page">
             <div class="setup-container">
                 <div class="setup-card">
                     <h1>🚀 Setup Wizard</h1>
-                    <p class="subtitle">Welcome! Let's configure your scraping system.</p>
+                    <p class="subtitle">Welcome! Let's configure your email extraction system.</p>
                     
                     <?php if ($error): ?>
                         <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
@@ -921,14 +1033,14 @@ class Router {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Login - PHP Scraping System</title>
+            <title>Login - PHP Email Extraction System</title>
             <style><?php self::getCSS(); ?></style>
         </head>
         <body class="login-page">
             <div class="login-container">
                 <div class="login-card">
                     <h1>🔐 Login</h1>
-                    <p class="subtitle">Access your scraping dashboard</p>
+                    <p class="subtitle">Access your email extraction dashboard</p>
                     
                     <?php if ($error): ?>
                         <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
@@ -987,10 +1099,10 @@ class Router {
                     </div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-icon">🔍</div>
+                    <div class="stat-icon">📧</div>
                     <div class="stat-content">
                         <div class="stat-value" id="total-results">-</div>
-                        <div class="stat-label">Total Results</div>
+                        <div class="stat-label">Total Emails</div>
                     </div>
                 </div>
             </div>
@@ -1007,7 +1119,8 @@ class Router {
                                 <th>Query</th>
                                 <th>Status</th>
                                 <th>Progress</th>
-                                <th>Results</th>
+                                <th>Emails</th>
+                                <th>Filter</th>
                                 <th>Created</th>
                                 <th>Actions</th>
                             </tr>
@@ -1027,12 +1140,13 @@ class Router {
                                     <td>
                                         <?php
                                         $db = Database::connect();
-                                        $stmt = $db->prepare("SELECT COUNT(*) as count FROM results WHERE job_id = ?");
+                                        $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
                                         $stmt->execute([$job['id']]);
                                         $count = $stmt->fetch()['count'];
                                         echo $count;
                                         ?>
                                     </td>
+                                    <td><?php echo $job['email_filter'] ? ucfirst($job['email_filter']) : 'All'; ?></td>
                                     <td><?php echo date('Y-m-d H:i', strtotime($job['created_at'])); ?></td>
                                     <td>
                                         <a href="?page=results&job_id=<?php echo $job['id']; ?>" class="btn btn-sm">View</a>
@@ -1069,56 +1183,42 @@ class Router {
     
     private static function renderNewJob(): void {
         $success = false;
-        $resultsCount = 0;
+        $jobId = 0;
         
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $query = $_POST['query'] ?? '';
             $apiKey = $_POST['api_key'] ?? '';
             $maxResults = (int)($_POST['max_results'] ?? 100);
-            $workerCount = (int)($_POST['worker_count'] ?? 1);
+            $country = $_POST['country'] ?? null;
+            $emailFilter = $_POST['email_filter'] ?? 'all';
             
             if ($query && $apiKey) {
-                // Create job and process immediately
-                $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults);
-                
-                // Process immediately with multiple workers
-                $resultsPerWorker = (int)ceil($maxResults / $workerCount);
-                
-                for ($i = 0; $i < $workerCount; $i++) {
-                    $startOffset = $i * $resultsPerWorker;
-                    $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
-                    
-                    if ($workerMaxResults > 0) {
-                        // Process synchronously
-                        Worker::processJobImmediately($jobId, $startOffset, $workerMaxResults);
-                    }
-                }
-                
-                // Get final results count
-                $results = Job::getResults($jobId);
-                $resultsCount = count($results);
+                // Create job for async processing
+                $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                 $success = true;
             }
         }
         
-        self::renderLayout('New Job', function() use ($success, $resultsCount) {
+        self::renderLayout('New Job', function() use ($success, $jobId) {
             ?>
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job completed successfully! Found <?php echo $resultsCount; ?> results.
+                    ✓ Job #<?php echo $jobId; ?> created successfully! Workers will process it in the background.
+                    <a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
                     <a href="?page=dashboard">Go to Dashboard</a>
                 </div>
             <?php endif; ?>
             
             <div class="card">
-                <h2>Create New Job</h2>
+                <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Jobs are processed immediately - results appear instantly!
+                    ⚡ Jobs are processed by background workers asynchronously. Start workers with CLI command.
                 </p>
                 <form method="POST">
                     <div class="form-group">
                         <label>Search Query *</label>
-                        <input type="text" name="query" placeholder="e.g., best php tutorials" required>
+                        <input type="text" name="query" placeholder="e.g., real estate agents california" required>
+                        <small>Enter search terms to find pages containing emails</small>
                     </div>
                     
                     <div class="form-group">
@@ -1128,19 +1228,59 @@ class Router {
                     </div>
                     
                     <div class="form-group">
-                        <label>Maximum Results</label>
-                        <input type="number" name="max_results" value="100" min="1" max="1000">
+                        <label>Maximum Emails</label>
+                        <input type="number" name="max_results" value="100" min="1" max="100000">
+                        <small>Target number of emails to extract (1-100,000)</small>
                     </div>
                     
                     <div class="form-group">
-                        <label>Number of Workers</label>
-                        <input type="number" name="worker_count" value="1" min="1" max="10">
-                        <small>More workers = faster processing (parallel execution)</small>
+                        <label>Country Target (Optional)</label>
+                        <select name="country">
+                            <option value="">All Countries</option>
+                            <option value="us">United States</option>
+                            <option value="uk">United Kingdom</option>
+                            <option value="ca">Canada</option>
+                            <option value="au">Australia</option>
+                            <option value="de">Germany</option>
+                            <option value="fr">France</option>
+                            <option value="es">Spain</option>
+                            <option value="it">Italy</option>
+                            <option value="jp">Japan</option>
+                            <option value="cn">China</option>
+                            <option value="in">India</option>
+                            <option value="br">Brazil</option>
+                        </select>
+                        <small>Target search results from a specific country</small>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Process Job Immediately</button>
+                    <div class="form-group">
+                        <label>Email Type Filter</label>
+                        <select name="email_filter">
+                            <option value="all">All Email Types</option>
+                            <option value="gmail">Gmail Only</option>
+                            <option value="yahoo">Yahoo Only</option>
+                            <option value="business">Business Domains Only</option>
+                        </select>
+                        <small>Filter extracted emails by domain type</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">Create Job</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
+            </div>
+            
+            <div class="card">
+                <h2>ℹ️ How It Works</h2>
+                <ol style="padding-left: 20px;">
+                    <li>Create a job with your search query and preferences</li>
+                    <li>Background workers process the job asynchronously</li>
+                    <li>Emails are extracted from search results using regex patterns</li>
+                    <li>Duplicates are automatically filtered out</li>
+                    <li>Results appear in real-time on the dashboard</li>
+                </ol>
+                <p style="margin-top: 15px;">
+                    <strong>Start workers:</strong> Run <code>php app.php worker-name</code> in your terminal to start processing jobs.
+                </p>
             </div>
             <?php
         });
@@ -1287,7 +1427,13 @@ class Router {
                 <div class="job-info">
                     <span class="status-badge status-<?php echo $job['status']; ?>"><?php echo ucfirst($job['status']); ?></span>
                     <span>Progress: <?php echo $job['progress']; ?>%</span>
-                    <span>Results: <?php echo count($results); ?></span>
+                    <span>Emails: <?php echo count($results); ?></span>
+                    <?php if ($job['country']): ?>
+                        <span>Country: <?php echo strtoupper($job['country']); ?></span>
+                    <?php endif; ?>
+                    <?php if ($job['email_filter']): ?>
+                        <span>Filter: <?php echo ucfirst($job['email_filter']); ?></span>
+                    <?php endif; ?>
                 </div>
                 
                 <div class="action-bar">
@@ -1298,21 +1444,40 @@ class Router {
             </div>
             
             <div class="card">
-                <h2>Results</h2>
+                <h2>Extracted Emails</h2>
                 <?php if (empty($results)): ?>
-                    <p class="empty-state">No results yet</p>
+                    <p class="empty-state">No emails extracted yet. Workers are processing in the background...</p>
                 <?php else: ?>
                     <div class="results-list">
                         <?php foreach ($results as $result): ?>
                             <div class="result-item">
-                                <h3><a href="<?php echo htmlspecialchars($result['link']); ?>" target="_blank"><?php echo htmlspecialchars($result['title']); ?></a></h3>
-                                <p class="result-snippet"><?php echo htmlspecialchars($result['snippet']); ?></p>
-                                <p class="result-url"><?php echo htmlspecialchars($result['link']); ?></p>
+                                <h3>📧 <?php echo htmlspecialchars($result['email']); ?></h3>
+                                <p class="result-snippet">
+                                    <strong>Domain:</strong> <?php echo htmlspecialchars($result['domain']); ?>
+                                    <?php if ($result['country']): ?>
+                                        | <strong>Country:</strong> <?php echo strtoupper($result['country']); ?>
+                                    <?php endif; ?>
+                                </p>
+                                <?php if ($result['source_title']): ?>
+                                    <p class="result-snippet"><strong>Source:</strong> <?php echo htmlspecialchars($result['source_title']); ?></p>
+                                <?php endif; ?>
+                                <?php if ($result['source_url']): ?>
+                                    <p class="result-url"><a href="<?php echo htmlspecialchars($result['source_url']); ?>" target="_blank"><?php echo htmlspecialchars($result['source_url']); ?></a></p>
+                                <?php endif; ?>
                             </div>
                         <?php endforeach; ?>
                     </div>
                 <?php endif; ?>
             </div>
+            
+            <script>
+                // Auto-refresh results if job is still running
+                <?php if ($job['status'] === 'running' || $job['status'] === 'pending'): ?>
+                setInterval(function() {
+                    location.reload();
+                }, 5000);
+                <?php endif; ?>
+            </script>
             <?php
         });
     }
@@ -1324,20 +1489,20 @@ class Router {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title><?php echo htmlspecialchars($title); ?> - PHP Scraping System</title>
+            <title><?php echo htmlspecialchars($title); ?> - PHP Email Extraction System</title>
             <style><?php self::getCSS(); ?></style>
         </head>
         <body>
             <div class="sidebar">
                 <div class="logo">
-                    <h1>🔍 Scraper</h1>
+                    <h1>📧 Email Scraper</h1>
                 </div>
                 <nav class="nav">
                     <a href="?page=dashboard" class="nav-item <?php echo ($_GET['page'] ?? 'dashboard') === 'dashboard' ? 'active' : ''; ?>">
                         📊 Dashboard
                     </a>
                     <a href="?page=new-job" class="nav-item <?php echo ($_GET['page'] ?? '') === 'new-job' ? 'active' : ''; ?>">
-                        ➕ New Job
+                        ➕ New Email Job
                     </a>
                     <a href="?page=workers" class="nav-item <?php echo ($_GET['page'] ?? '') === 'workers' ? 'active' : ''; ?>">
                         👥 Workers
