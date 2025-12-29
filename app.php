@@ -858,7 +858,7 @@ class Worker {
         // Register this worker for tracking
         $workerName = 'worker-' . getmypid() . '-' . time();
         $workerId = self::register($workerName);
-        self::updateHeartbeat($workerId, 'running', $jobId);
+        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
         
         $apiKey = $job['api_key'];
         $query = $job['query'];
@@ -931,7 +931,7 @@ class Worker {
         }
         
         // Mark worker as idle when done
-        self::updateHeartbeat($workerId, 'idle');
+        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
     }
 }
 
