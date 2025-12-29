@@ -1276,6 +1276,54 @@ class Worker {
         self::logError($workerId, null, 'worker_crash', $reason, null, 'critical');
     }
     
+    /**
+     * Clean up old completed/stopped workers to prevent database bloat
+     * Important for 300 worker scenarios to keep database performant
+     */
+    public static function cleanupOldWorkers(int $ageHours = 24): int {
+        $db = Database::connect();
+        
+        // Delete workers that are idle or stopped and older than specified hours
+        $stmt = $db->prepare("
+            DELETE FROM workers 
+            WHERE status IN ('idle', 'stopped') 
+            AND created_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
+        ");
+        $stmt->execute([$ageHours]);
+        $deletedCount = $stmt->rowCount();
+        
+        if ($deletedCount > 0) {
+            error_log("cleanupOldWorkers: Deleted {$deletedCount} old worker records");
+        }
+        
+        return $deletedCount;
+    }
+    
+    /**
+     * Get count of workers by status - useful for monitoring at scale
+     */
+    public static function getWorkerCountByStatus(): array {
+        $db = Database::connect();
+        
+        $stmt = $db->query("
+            SELECT status, COUNT(*) as count 
+            FROM workers 
+            GROUP BY status
+        ");
+        
+        $counts = [
+            'running' => 0,
+            'idle' => 0,
+            'stopped' => 0
+        ];
+        
+        foreach ($stmt->fetchAll() as $row) {
+            $counts[$row['status']] = (int)$row['count'];
+        }
+        
+        return $counts;
+    }
+    
     public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
         $db = Database::connect();
         
@@ -2064,7 +2112,17 @@ class Router {
                 break;
                 
             case 'worker-stats':
-                echo json_encode(Worker::getStats());
+                // Periodically clean up old workers to prevent database bloat
+                // Run cleanup every ~10% of requests (probabilistic)
+                if (rand(1, 10) === 1) {
+                    Worker::cleanupOldWorkers(24); // Clean workers older than 24 hours
+                }
+                
+                // Get and return worker statistics
+                $stats = Worker::getStats();
+                $stats['worker_counts'] = Worker::getWorkerCountByStatus();
+                
+                echo json_encode($stats);
                 break;
                 
             case 'diagnostic':
