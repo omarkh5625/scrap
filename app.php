@@ -72,13 +72,41 @@ class Database {
         return self::$pdo;
     }
     
-    public static function testConnection(string $host, string $db, string $user, string $pass): bool {
+    public static function testConnection(string $host, string $db, string $user, string $pass): array {
         try {
-            $dsn = "mysql:host={$host};charset=utf8mb4";
-            $pdo = new PDO($dsn, $user, $pass);
+            // Try different host formats for better compatibility
+            $hosts = [$host];
+            if ($host === 'localhost') {
+                $hosts = ['localhost', '127.0.0.1', 'localhost:/tmp/mysql.sock', 'localhost:/var/run/mysqld/mysqld.sock'];
+            }
+            
+            $lastError = '';
+            $pdo = null;
+            
+            foreach ($hosts as $tryHost) {
+                try {
+                    $dsn = "mysql:host={$tryHost};charset=utf8mb4";
+                    $pdo = new PDO($dsn, $user, $pass, [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+                    ]);
+                    break; // Connection successful
+                } catch (PDOException $e) {
+                    $lastError = $e->getMessage();
+                    continue;
+                }
+            }
+            
+            if (!$pdo) {
+                return ['success' => false, 'error' => 'Connection failed: ' . $lastError];
+            }
             
             // Create database if not exists
-            $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            try {
+                $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            } catch (PDOException $e) {
+                return ['success' => false, 'error' => 'Cannot create database. User may lack CREATE DATABASE privilege: ' . $e->getMessage()];
+            }
+            
             $pdo->exec("USE `{$db}`");
             
             // Create tables
@@ -154,38 +182,65 @@ class Database {
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
-            // Check if admin user exists
-            $stmt = $pdo->query("SELECT COUNT(*) as count FROM users");
-            $result = $stmt->fetch();
-            
-            return $result['count'] > 0;
+            return ['success' => true, 'error' => null];
             
         } catch (PDOException $e) {
-            return false;
+            return ['success' => false, 'error' => $e->getMessage()];
         }
     }
     
-    public static function install(string $host, string $db, string $user, string $pass, string $adminUser, string $adminPass, string $adminEmail): bool {
-        if (self::testConnection($host, $db, $user, $pass)) {
-            // Create admin user
-            try {
-                $dsn = "mysql:host={$host};dbname={$db};charset=utf8mb4";
-                $pdo = new PDO($dsn, $user, $pass);
-                $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-                
-                $hashedPassword = password_hash($adminPass, PASSWORD_BCRYPT);
-                $stmt = $pdo->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)");
-                $stmt->execute([$adminUser, $hashedPassword, $adminEmail]);
-                
-                // Update config in file
-                self::updateConfig($host, $db, $user, $pass);
-                
-                return true;
-            } catch (PDOException $e) {
-                return false;
-            }
+    public static function install(string $host, string $db, string $user, string $pass, string $adminUser, string $adminPass, string $adminEmail): array {
+        $result = self::testConnection($host, $db, $user, $pass);
+        
+        if (!$result['success']) {
+            return $result;
         }
-        return false;
+        
+        // Create admin user
+        try {
+            // Try different host formats
+            $hosts = [$host];
+            if ($host === 'localhost') {
+                $hosts = ['localhost', '127.0.0.1', 'localhost:/tmp/mysql.sock', 'localhost:/var/run/mysqld/mysqld.sock'];
+            }
+            
+            $pdo = null;
+            foreach ($hosts as $tryHost) {
+                try {
+                    $dsn = "mysql:host={$tryHost};dbname={$db};charset=utf8mb4";
+                    $pdo = new PDO($dsn, $user, $pass, [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+                    ]);
+                    break;
+                } catch (PDOException $e) {
+                    continue;
+                }
+            }
+            
+            if (!$pdo) {
+                return ['success' => false, 'error' => 'Could not reconnect to database after table creation'];
+            }
+            
+            // Check if admin already exists
+            $stmt = $pdo->prepare("SELECT COUNT(*) as count FROM users WHERE username = ?");
+            $stmt->execute([$adminUser]);
+            $count = $stmt->fetch()['count'];
+            
+            if ($count > 0) {
+                return ['success' => false, 'error' => 'Admin user already exists. System may already be installed.'];
+            }
+            
+            $hashedPassword = password_hash($adminPass, PASSWORD_BCRYPT);
+            $stmt = $pdo->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)");
+            $stmt->execute([$adminUser, $hashedPassword, $adminEmail]);
+            
+            // Update config in file
+            self::updateConfig($host, $db, $user, $pass);
+            
+            return ['success' => true, 'error' => null];
+        } catch (PDOException $e) {
+            return ['success' => false, 'error' => 'Failed to create admin user: ' . $e->getMessage()];
+        }
     }
     
     private static function updateConfig(string $host, string $db, string $user, string $pass): void {
@@ -632,11 +687,13 @@ class Router {
             $adminPass = $_POST['admin_pass'] ?? '';
             $adminEmail = $_POST['admin_email'] ?? '';
             
-            if (Database::install($host, $database, $username, $password, $adminUser, $adminPass, $adminEmail)) {
+            $result = Database::install($host, $database, $username, $password, $adminUser, $adminPass, $adminEmail);
+            
+            if ($result['success']) {
                 header('Location: ?page=login');
                 exit;
             } else {
-                $error = 'Installation failed. Please check your database credentials.';
+                $error = $result['error'];
             }
         }
         
