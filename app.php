@@ -797,7 +797,13 @@ class Worker {
         
         // Update progress
         $progress = (int)((($startOffset + $processed) / $job['max_results']) * 100);
-        Job::updateStatus($jobId, 'running', min($progress, 100));
+        
+        // If this worker has completed its portion and progress is 100%, mark job as completed
+        if ($progress >= 100) {
+            Job::updateStatus($jobId, 'completed', 100);
+        } else {
+            Job::updateStatus($jobId, 'running', min($progress, 100));
+        }
     }
 }
 
@@ -902,6 +908,24 @@ class Router {
     private static function handleCLI(): void {
         global $argv;
         
+        // Check if this is a process-job command (spawned by UI)
+        if (isset($argv[1]) && $argv[1] === 'process-job') {
+            // Direct job processing: php app.php process-job <jobId> <startOffset> <maxResults>
+            $jobId = (int)($argv[2] ?? 0);
+            $startOffset = (int)($argv[3] ?? 0);
+            $maxResults = (int)($argv[4] ?? 100);
+            
+            if ($jobId > 0) {
+                try {
+                    Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                } catch (Exception $e) {
+                    error_log("Worker error for job {$jobId}: " . $e->getMessage());
+                }
+            }
+            exit(0);
+        }
+        
+        // Regular worker mode (polls for jobs)
         echo "=== PHP Email Extraction System Worker ===\n";
         
         $workerName = $argv[1] ?? 'worker-' . uniqid();
@@ -1268,6 +1292,49 @@ class Router {
         });
     }
     
+    private static function spawnParallelWorkers(int $jobId, int $workerCount): void {
+        $job = Job::getById($jobId);
+        if (!$job) {
+            return;
+        }
+        
+        $maxResults = (int)$job['max_results'];
+        $resultsPerWorker = (int)ceil($maxResults / $workerCount);
+        
+        // Update job to running status immediately
+        Job::updateStatus($jobId, 'running', 0);
+        
+        // Spawn background workers
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            $startOffset = $i * $resultsPerWorker;
+            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            
+            if ($workerMaxResults > 0) {
+                // Build command to run worker
+                $cmd = sprintf(
+                    '%s %s process-job %d %d %d > /dev/null 2>&1 &',
+                    escapeshellarg($phpBinary),
+                    escapeshellarg($scriptPath),
+                    $jobId,
+                    $startOffset,
+                    $workerMaxResults
+                );
+                
+                // Execute in background
+                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                    // Windows
+                    pclose(popen("start /B " . $cmd, "r"));
+                } else {
+                    // Unix/Linux
+                    exec($cmd);
+                }
+            }
+        }
+    }
+    
     private static function renderNewJob(): void {
         $success = false;
         $jobId = 0;
@@ -1280,10 +1347,15 @@ class Router {
                 $maxResults = (int)($_POST['max_results'] ?? 100);
                 $country = !empty($_POST['country']) ? $_POST['country'] : null;
                 $emailFilter = $_POST['email_filter'] ?? 'all';
+                $workerCount = (int)($_POST['worker_count'] ?? 5);
                 
                 if ($query && $apiKey) {
-                    // Create job for async processing
+                    // Create job for immediate processing
                     $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                    
+                    // Spawn parallel workers in background immediately
+                    self::spawnParallelWorkers($jobId, $workerCount);
+                    
                     $success = true;
                 } else {
                     $error = 'Query and API Key are required';
@@ -1304,7 +1376,7 @@ class Router {
             
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job #<?php echo $jobId; ?> created successfully! Workers will process it in the background.
+                    ✓ Job #<?php echo $jobId; ?> created and processing started immediately! <?php echo $_POST['worker_count'] ?? 5; ?> parallel workers are running in the background.
                     <a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
                     <a href="?page=dashboard">Go to Dashboard</a>
                 </div>
@@ -1313,7 +1385,7 @@ class Router {
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Jobs are processed by background workers asynchronously. Start workers with CLI command.
+                    ⚡ Jobs start processing immediately with parallel workers! No need to start CLI workers.
                 </p>
                 <form method="POST">
                     <div class="form-group">
@@ -1365,7 +1437,13 @@ class Router {
                         <small>Filter extracted emails by domain type</small>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Create Job</button>
+                    <div class="form-group">
+                        <label>Parallel Workers</label>
+                        <input type="number" name="worker_count" value="5" min="1" max="1000">
+                        <small>Number of parallel workers to spawn (1-1000). More workers = faster processing</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">Start Processing Immediately</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
@@ -1374,13 +1452,14 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>Background workers process the job asynchronously</li>
+                    <li>Parallel workers start immediately in the background</li>
                     <li>Emails are extracted from search results using regex patterns</li>
                     <li>Duplicates are automatically filtered out</li>
                     <li>Results appear in real-time on the dashboard</li>
                 </ol>
                 <p style="margin-top: 15px;">
-                    <strong>Start workers:</strong> Run <code>php app.php worker-name</code> in your terminal to start processing jobs.
+                    <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Start Processing Immediately". No manual CLI worker setup needed! The UI returns instantly while workers process in the background.
+                </p>
                 </p>
             </div>
             <?php
