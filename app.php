@@ -2979,28 +2979,26 @@ class Router {
             }
         }
         
-        // Don't set to running yet - wait for workers to actually start
+        // Mark job as running immediately - workers will process the queue
         error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}. Spawning workers now...");
+        Job::updateStatus($jobId, 'running', 0);
         
-        // Spawn workers directly to process queue items
-        // تشغيل العمال مباشرة لمعالجة queue items
-        $successCount = self::spawnWorkersDirectly($jobId, $workerCount);
+        // Spawn workers asynchronously in background (NOT synchronously!)
+        // This allows workers to run in parallel, not sequentially
+        // تشغيل العمال بشكل غير متزامن في الخلفية (وليس بشكل متزامن!)
+        self::autoSpawnWorkers($workerCount);
         
-        if ($successCount > 0) {
-            // At least one worker started successfully
-            Job::updateStatus($jobId, 'running', 0);
-            error_log("✓ Worker spawning completed for job {$jobId} - {$successCount}/{$workerCount} workers started");
-        } else {
-            // No workers started - mark job as failed
-            Job::updateStatus($jobId, 'failed', 0);
-            error_log("✗ Worker spawning FAILED for job {$jobId} - no workers could start");
-            
-            // Log error to worker_errors table for UI display
-            $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'spawn_failed', ?, 'critical')");
-            $stmt->execute([$jobId, "Failed to spawn any workers for job {$jobId}. Check server configuration and error logs."]);
-        }
+        error_log("✓ Triggered async spawning of {$workerCount} workers for job {$jobId}");
     }
     
+    /**
+     * DEPRECATED: This function runs workers synchronously (one after another)
+     * which causes the entire process to hang and be extremely slow.
+     * DO NOT USE - Use autoSpawnWorkers() instead which spawns workers in background.
+     * 
+     * Kept here only for reference. Will be removed in future versions.
+     */
+    /*
     private static function spawnWorkersDirectly(int $jobId, int $workerCount): int {
         // For environments where HTTP loopback connections are blocked (common hosting restriction)
         // Process workers inline since curl to self fails
@@ -3078,6 +3076,7 @@ class Router {
         
         return $successCount;
     }
+    */
     
     private static function autoSpawnWorkers(int $workerCount): void {
         // Check if exec() is available
