@@ -2755,27 +2755,27 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 16px;">💡 High-Yield Query Templates</h3>
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='real estate agents'" 
+                        <button type="button" onclick="document.getElementById('dashboard-query').value='real estate agents'" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🏘️ Real Estate Agents
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='dentists near me'" 
+                        <button type="button" onclick="document.getElementById('dashboard-query').value='dentists near me'" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🦷 Dentists
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='lawyers attorney'" 
+                        <button type="button" onclick="document.getElementById('dashboard-query').value='lawyers attorney'" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             ⚖️ Lawyers
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='restaurants contact'" 
+                        <button type="button" onclick="document.getElementById('dashboard-query').value='restaurants contact'" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🍽️ Restaurants
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='plumbers contact email'" 
+                        <button type="button" onclick="document.getElementById('dashboard-query').value='plumbers contact email'" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             🔧 Plumbers
                         </button>
-                        <button type="button" onclick="document.querySelector('input[name=query]').value='marketing agencies'" 
+                        <button type="button" onclick="document.getElementById('dashboard-query').value='marketing agencies'" 
                                 style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
                             📢 Marketing Agencies
                         </button>
@@ -2785,20 +2785,18 @@ class Router {
                     </small>
                 </div>
                 
-                <form method="POST" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
-                    <input type="hidden" name="action" value="create_job">
-                    
+                <form id="dashboard-job-form" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Search Query *</label>
-                            <input type="text" name="query" placeholder="e.g., real estate agents california" required 
+                            <input type="text" name="query" id="dashboard-query" placeholder="e.g., real estate agents california" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Use specific industry + location for best results</small>
                         </div>
                         
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Serper.dev API Key *</label>
-                            <input type="text" name="api_key" placeholder="Your API key" required 
+                            <input type="text" name="api_key" id="dashboard-api-key" placeholder="Your API key" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Get free key at <a href="https://serper.dev" target="_blank" style="color: white;">serper.dev</a></small>
                         </div>
@@ -2807,14 +2805,14 @@ class Router {
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Target Emails *</label>
-                            <input type="number" name="max_results" value="1000" min="1" max="100000" required 
+                            <input type="number" name="max_results" id="dashboard-max-results" value="1000" min="1" max="100000" required 
                                    style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Recommended: 1000-10000 for quality</small>
                         </div>
                         
                         <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Email Filter</label>
-                            <select name="email_filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <select name="email_filter" id="dashboard-email-filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                                 <option value="all">All Types</option>
                                 <option value="business" selected>Business Only (Recommended)</option>
                                 <option value="gmail">Gmail Only</option>
@@ -2826,7 +2824,7 @@ class Router {
                     
                     <div style="margin-bottom: 15px;">
                         <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
-                        <select name="country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                        <select name="country" id="dashboard-country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                             <option value="">All Countries</option>
                             <option value="us">🇺🇸 United States</option>
                             <option value="uk">🇬🇧 United Kingdom</option>
@@ -2837,7 +2835,7 @@ class Router {
                         </select>
                     </div>
                     
-                    <button type="submit" class="btn btn-large" 
+                    <button type="submit" id="dashboard-submit-btn" class="btn btn-large" 
                             style="background: white; color: #667eea; font-weight: 600; width: 100%; padding: 15px;">
                         🚀 Start Extraction
                     </button>
@@ -3092,6 +3090,55 @@ class Router {
                 updateJobProgress();
                 progressInterval = setInterval(updateJobProgress, 3000); // Update every 3 seconds
                 <?php endif; ?>
+                
+                // Dashboard form AJAX submission
+                document.getElementById('dashboard-job-form').addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    
+                    // Get form data
+                    const formData = new FormData(this);
+                    
+                    // Disable submit button
+                    const submitBtn = document.getElementById('dashboard-submit-btn');
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = '⏳ Creating Job...';
+                    
+                    // Send AJAX request
+                    fetch('?page=api&action=create-job', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            // Show success message
+                            submitBtn.textContent = '✓ Job Created!';
+                            submitBtn.style.background = '#10b981';
+                            
+                            // Redirect to results page
+                            setTimeout(function() {
+                                window.location.href = '?page=dashboard&job_id=' + data.job_id;
+                            }, 500);
+                        } else {
+                            // Show error
+                            alert('Error: ' + (data.error || 'Unknown error occurred'));
+                            
+                            // Re-enable submit button
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                        }
+                    })
+                    .catch(error => {
+                        // Show error
+                        alert('Failed to create job: ' + error.message);
+                        
+                        // Re-enable submit button
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = '🚀 Start Extraction';
+                        
+                        console.error('Error creating job:', error);
+                    });
+                });
             </script>
             <?php
         });
