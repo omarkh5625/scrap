@@ -54,6 +54,7 @@ session_start();
 
 class Database {
     private static ?PDO $pdo = null;
+    private static bool $migrated = false;
     
     public static function connect(): PDO {
         global $DB_CONFIG;
@@ -66,12 +67,68 @@ class Database {
                     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                     PDO::ATTR_EMULATE_PREPARES => false
                 ]);
+                
+                // Run migrations if not already done
+                if (!self::$migrated) {
+                    self::runMigrations();
+                    self::$migrated = true;
+                }
             } catch (PDOException $e) {
                 die('Database connection failed: ' . $e->getMessage());
             }
         }
         
         return self::$pdo;
+    }
+    
+    private static function runMigrations(): void {
+        try {
+            // Migration: Add country and email_filter columns to jobs table if they don't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'country'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN country VARCHAR(100) AFTER max_results");
+                self::$pdo->exec("ALTER TABLE jobs ADD INDEX idx_country (country)");
+            }
+            
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'email_filter'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN email_filter VARCHAR(50) AFTER country");
+            }
+            
+            // Migration: Create emails table if it doesn't exist (rename from results)
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'emails'");
+            if ($stmt->rowCount() === 0) {
+                // Check if old results table exists
+                $stmt = self::$pdo->query("SHOW TABLES LIKE 'results'");
+                if ($stmt->rowCount() > 0) {
+                    // Rename old table
+                    self::$pdo->exec("RENAME TABLE results TO results_backup");
+                }
+                
+                // Create new emails table
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS emails (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        job_id INT NOT NULL,
+                        email VARCHAR(500) NOT NULL,
+                        email_hash VARCHAR(64) UNIQUE,
+                        domain VARCHAR(255),
+                        country VARCHAR(100),
+                        source_url VARCHAR(1000),
+                        source_title TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                        INDEX idx_job (job_id),
+                        INDEX idx_hash (email_hash),
+                        INDEX idx_domain (domain),
+                        INDEX idx_country (country)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
+        } catch (PDOException $e) {
+            error_log('Migration error: ' . $e->getMessage());
+            // Don't die on migration errors, just log them
+        }
     }
     
     public static function testConnection(string $host, string $db, string $user, string $pass): array {
