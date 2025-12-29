@@ -2944,6 +2944,11 @@ class Router {
         });
     }
     
+    /**
+     * دالة تشغيل العمال بالتوازي (Parallel Workers)
+     * تقوم بإنشاء queue items وتشغيل العمال مباشرة من Dashboard
+     * بدون الحاجة لصفحة Workers منفصلة
+     */
     private static function spawnParallelWorkers(int $jobId, int $workerCount): void {
         $job = Job::getById($jobId);
         if (!$job) {
@@ -2957,6 +2962,7 @@ class Router {
         error_log("Creating queue for job {$jobId}: {$maxResults} total results, {$workerCount} workers, ~{$resultsPerWorker} per worker");
         
         // Create queue items for parallel processing
+        // إنشاء queue items للمعالجة المتوازية
         $db = Database::connect();
         $queueItemsCreated = 0;
         
@@ -2977,6 +2983,7 @@ class Router {
         error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}. Spawning workers now...");
         
         // Spawn workers directly to process queue items
+        // تشغيل العمال مباشرة لمعالجة queue items
         $successCount = self::spawnWorkersDirectly($jobId, $workerCount);
         
         if ($successCount > 0) {
