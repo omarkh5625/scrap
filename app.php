@@ -2160,23 +2160,33 @@ class Router {
             $workerIndex = (int)($_POST['worker_index'] ?? 0);
             
             if ($jobId <= 0) {
+                echo json_encode(['status' => 'error', 'message' => 'Invalid job ID']);
                 exit;
             }
             
-            error_log("Queue Worker {$workerName} starting for job {$jobId}...");
+            error_log("✓ Queue Worker {$workerName} starting for job {$jobId}...");
+            
+            // Register worker immediately
+            $workerId = Worker::register($workerName);
+            Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
             
             // Close connection immediately so client doesn't wait
             ignore_user_abort(true);
             set_time_limit(0);
             
-            // Send minimal response
-            $response = json_encode(['status' => 'processing', 'worker' => $workerName, 'job_id' => $jobId]);
+            // Send success response immediately
+            $response = json_encode([
+                'status' => 'started', 
+                'worker' => $workerName, 
+                'worker_id' => $workerId,
+                'job_id' => $jobId
+            ]);
             header('Content-Type: application/json');
             header('Content-Length: ' . strlen($response));
             header('Connection: close');
             echo $response;
             
-            // Flush all output buffers
+            // Flush all output buffers to send response
             if (ob_get_level() > 0) {
                 ob_end_flush();
             }
@@ -2187,14 +2197,12 @@ class Router {
                 session_write_close();
             }
             
-            // Give time for connection to close
-            usleep(100000); // 0.1 seconds
+            // Small delay to ensure connection closes
+            usleep(50000); // 0.05 seconds
             
             // Now process queue items for this job in background
             try {
-                error_log("Worker {$workerName} processing queue for job {$jobId}");
-                
-                $workerId = Worker::register($workerName);
+                error_log("  Worker {$workerName} (ID: {$workerId}) processing queue for job {$jobId}");
                 
                 // Process queue items for this specific job
                 $startTime = time();
@@ -2202,17 +2210,18 @@ class Router {
                 $itemsProcessed = 0;
                 
                 while ((time() - $startTime) < $maxRuntime) {
-                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                    
-                    // Get next queue item for this job
+                    // Get next queue item for this specific job
                     $job = Worker::getNextJob();
                     
                     // Only process if it's for our job
                     if ($job && isset($job['id']) && $job['id'] == $jobId) {
+                        error_log("  Worker {$workerName}: Processing queue item for job {$jobId}");
                         Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                        
                         Worker::processJob($job['id']);
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        
                         $itemsProcessed++;
+                        error_log("  Worker {$workerName}: Completed queue item {$itemsProcessed} for job {$jobId}");
                         
                         // Check if all queue items for this job are done
                         $db = Database::connect();
@@ -2221,24 +2230,25 @@ class Router {
                         $pendingCount = $stmt->fetch()['pending'];
                         
                         if ($pendingCount == 0) {
-                            error_log("Worker {$workerName}: No more queue items for job {$jobId}. Exiting.");
+                            error_log("✓ Worker {$workerName}: All queue items completed for job {$jobId}. Exiting.");
                             break;
                         }
                     } else {
-                        // No queue items for our job, exit
-                        error_log("Worker {$workerName}: No queue items found for job {$jobId}. Exiting.");
+                        // No more queue items for our job
+                        error_log("  Worker {$workerName}: No more queue items for job {$jobId}. Exiting.");
                         break;
                     }
                     
-                    // Small sleep between items
-                    sleep(1);
+                    // Small sleep between items to avoid race conditions
+                    usleep(500000); // 0.5 seconds
                 }
                 
-                error_log("Worker {$workerName} completed. Processed {$itemsProcessed} queue items for job {$jobId}.");
+                error_log("✓ Worker {$workerName} completed successfully. Processed {$itemsProcessed} queue items for job {$jobId}.");
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             } catch (Exception $e) {
-                error_log("Queue Worker {$workerName} error: " . $e->getMessage());
-                Worker::logError($workerId ?? 0, $jobId, 'worker_error', $e->getMessage(), $e->getTraceAsString(), 'error');
+                error_log("✗ Queue Worker {$workerName} error: " . $e->getMessage());
+                Worker::logError($workerId, $jobId, 'worker_error', $e->getMessage(), $e->getTraceAsString(), 'error');
+                Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
             }
         }
         exit;
@@ -2476,14 +2486,18 @@ class Router {
     private static function spawnParallelWorkers(int $jobId, int $workerCount): void {
         $job = Job::getById($jobId);
         if (!$job) {
+            error_log("✗ ERROR: Cannot spawn workers - Job {$jobId} not found");
             return;
         }
         
         $maxResults = (int)$job['max_results'];
         $resultsPerWorker = (int)ceil($maxResults / $workerCount);
         
+        error_log("Creating queue for job {$jobId}: {$maxResults} total results, {$workerCount} workers, ~{$resultsPerWorker} per worker");
+        
         // Create queue items for parallel processing
         $db = Database::connect();
+        $queueItemsCreated = 0;
         
         for ($i = 0; $i < $workerCount; $i++) {
             $startOffset = $i * $resultsPerWorker;
@@ -2493,16 +2507,20 @@ class Router {
                 // Insert queue item
                 $stmt = $db->prepare("INSERT INTO job_queue (job_id, start_offset, max_results, status) VALUES (?, ?, ?, 'pending')");
                 $stmt->execute([$jobId, $startOffset, $workerMaxResults]);
+                $queueItemsCreated++;
+                error_log("  Queue item {$i}: offset {$startOffset}, max {$workerMaxResults}");
             }
         }
         
         // Update job status to running so it shows activity
         Job::updateStatus($jobId, 'running', 0);
         
-        error_log("Created {$workerCount} queue items for job {$jobId}. Spawning workers immediately...");
+        error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}. Spawning workers now...");
         
         // Spawn workers directly to process queue items
         self::spawnWorkersDirectly($jobId, $workerCount);
+        
+        error_log("✓ Worker spawning completed for job {$jobId}");
     }
     
     private static function spawnWorkersDirectly(int $jobId, int $workerCount): void {
@@ -2530,24 +2548,38 @@ class Router {
                 'worker_name' => $workerName,
                 'worker_index' => $i
             ]));
-            curl_setopt($ch, CURLOPT_TIMEOUT, 2); // Very short timeout - just to trigger
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+            // Increased timeout to allow worker to establish and respond
+            curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
             curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            // Don't verify SSL for local connections (worker spawning)
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
             
-            // Execute without waiting for full response
-            curl_exec($ch);
+            // Execute and wait for initial response
+            $response = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlError = curl_error($ch);
             curl_close($ch);
             
-            if ($httpCode > 0) {
-                error_log("Spawned worker {$i} for job {$jobId}: HTTP {$httpCode}");
+            if ($httpCode === 200) {
+                error_log("✓ Successfully spawned worker {$i} for job {$jobId}");
+                $decoded = json_decode($response, true);
+                if ($decoded && isset($decoded['status'])) {
+                    error_log("  Worker response: " . $decoded['status']);
+                }
             } else {
-                error_log("Warning: Worker {$i} spawn may have failed for job {$jobId}");
+                error_log("✗ Warning: Worker {$i} spawn failed for job {$jobId} - HTTP {$httpCode}");
+                if ($curlError) {
+                    error_log("  cURL error: {$curlError}");
+                }
             }
             
             // Small delay between spawns to avoid overwhelming the server
-            usleep(50000); // 0.05 seconds
+            usleep(100000); // 0.1 seconds
         }
+        
+        error_log("Finished spawning {$workerCount} workers for job {$jobId}");
     }
     
     private static function autoSpawnWorkers(int $workerCount): void {
