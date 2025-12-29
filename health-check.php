@@ -135,12 +135,11 @@
             <strong>Polling (Default)</strong>
             <br>3-second interval, works everywhere, efficient
         </div>
-        <div class="test-item <?php echo class_exists('EventSource') ? 'pass' : 'warning'; ?>">
-            <span class="badge <?php echo class_exists('EventSource') ? 'pass' : 'warning'; ?>">
-                <?php echo class_exists('EventSource') ? '✓ Available' : '⚠ Optional'; ?>
-            </span>
-            <strong>Server-Sent Events</strong>
-            <br>Real-time updates, requires server support
+        <div class="test-item pass">
+            <span class="badge pass">✓ Available</span>
+            <strong>Server-Sent Events (SSE)</strong>
+            <br>Real-time updates endpoint available, client-side EventSource API required in browser
+            <br><small style="color: #4a5568;">Browser support: Chrome, Firefox, Safari, Edge (all modern browsers)</small>
         </div>
     </div>
 

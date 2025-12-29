@@ -2218,6 +2218,7 @@ class Router {
                         $emailFilter = $_POST['email_filter'] ?? 'all';
                         
                         if (empty($query) || empty($apiKey)) {
+                            header('Content-Type: application/json');
                             echo json_encode(['success' => false, 'error' => 'Query and API Key are required']);
                             break;
                         }
@@ -4001,7 +4002,8 @@ class Router {
             
             <script>
                 // Configuration for progress update method
-                const USE_SSE = false; // Set to true to use Server-Sent Events instead of polling
+                // Can be configured in Settings page or set manually here
+                const USE_SSE = <?php echo Settings::get('use_sse') === '1' ? 'true' : 'false'; ?>; // Server-Sent Events vs Polling
                 
                 document.getElementById('job-form').addEventListener('submit', function(e) {
                     e.preventDefault();
@@ -4267,6 +4269,15 @@ class Router {
                         <label>Deep Scraping Threshold</label>
                         <input type="number" name="setting_deep_scraping_threshold" value="<?php echo htmlspecialchars($settings['deep_scraping_threshold'] ?? '5'); ?>" min="1" max="20">
                         <small>Only fetch page content if fewer than this many emails found in search result (1-20)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Progress Update Method</label>
+                        <select name="setting_use_sse">
+                            <option value="0" <?php echo ($settings['use_sse'] ?? '0') === '0' ? 'selected' : ''; ?>>Polling (Recommended)</option>
+                            <option value="1" <?php echo ($settings['use_sse'] ?? '0') === '1' ? 'selected' : ''; ?>>Server-Sent Events (SSE)</option>
+                        </select>
+                        <small>Polling: Updates every 3 seconds, works everywhere. SSE: Real-time updates, requires modern browser and server support.</small>
                     </div>
                     
                     <button type="submit" class="btn btn-primary">Save Settings</button>
