@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Extraction System - API Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f7fa;
+            color: #2d3748;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        
+        header h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+        
+        header p {
+            opacity: 0.9;
+            font-size: 16px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            transition: transform 0.2s;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+        }
+        
+        .stat-icon {
+            font-size: 36px;
+        }
+        
+        .stat-content {
+            flex: 1;
+        }
+        
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #2d3748;
+        }
+        
+        .stat-label {
+            font-size: 14px;
+            color: #718096;
+            margin-top: 5px;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .card h2 {
+            font-size: 24px;
+            margin-bottom: 20px;
+            color: #2d3748;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #2d3748;
+        }
+        
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .form-group small {
+            display: block;
+            margin-top: 5px;
+            color: #718096;
+            font-size: 13px;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .btn:hover {
+            background: #5a67d8;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .btn-success {
+            background: #48bb78;
+        }
+        
+        .btn-success:hover {
+            background: #38a169;
+        }
+        
+        .btn-danger {
+            background: #f56565;
+        }
+        
+        .btn-danger:hover {
+            background: #e53e3e;
+        }
+        
+        .alert {
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        
+        .alert-success {
+            background: #f0fff4;
+            color: #22543d;
+            border: 1px solid #9ae6b4;
+        }
+        
+        .alert-error {
+            background: #fff5f5;
+            color: #c53030;
+            border: 1px solid #feb2b2;
+        }
+        
+        .alert-info {
+            background: #ebf8ff;
+            color: #2c5282;
+            border: 1px solid #90cdf4;
+        }
+        
+        .status-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-dot.active {
+            background: #48bb78;
+        }
+        
+        .status-dot.idle {
+            background: #ecc94b;
+        }
+        
+        .status-dot.error {
+            background: #f56565;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+        
+        .spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #e2e8f0;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        th {
+            font-weight: 600;
+            color: #4a5568;
+            background: #f7fafc;
+        }
+        
+        tr:hover {
+            background: #f7fafc;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge-success {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+        
+        .badge-warning {
+            background: #feebc8;
+            color: #7c2d12;
+        }
+        
+        .badge-danger {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+        
+        .badge-info {
+            background: #bee3f8;
+            color: #2c5282;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📧 Email Extraction System</h1>
+            <p>Separated UI/Backend Architecture - Optimized for 300 Workers</p>
+        </header>
+        
+        <div id="alerts"></div>
+        
+        <!-- System Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">🚀</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="active-workers">-</div>
+                    <div class="stat-label">Active Workers</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">📋</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="total-jobs">-</div>
+                    <div class="stat-label">Total Jobs</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">📧</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="total-emails">-</div>
+                    <div class="stat-label">Emails Extracted</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">📊</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="queue-pending">-</div>
+                    <div class="stat-label">Pending Queue</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Create Job Form -->
+        <div class="card">
+            <h2>Create New Extraction Job</h2>
+            <form id="create-job-form">
+                <div class="form-group">
+                    <label>Search Query *</label>
+                    <input type="text" id="query" required placeholder="e.g., real estate agents california">
+                    <small>Enter search terms to find pages containing emails</small>
+                </div>
+                
+                <div class="form-group">
+                    <label>Serper.dev API Key *</label>
+                    <input type="text" id="api_key" required placeholder="Your API key from serper.dev">
+                    <small>Get your API key from <a href="https://serper.dev" target="_blank">serper.dev</a></small>
+                </div>
+                
+                <div class="form-group">
+                    <label>Maximum Emails</label>
+                    <input type="number" id="max_results" value="100" min="1" max="100000">
+                    <small>Target number of emails to extract (1-100,000)</small>
+                </div>
+                
+                <div class="form-group">
+                    <label>Country Target (Optional)</label>
+                    <select id="country">
+                        <option value="">All Countries</option>
+                        <option value="us">United States</option>
+                        <option value="uk">United Kingdom</option>
+                        <option value="ca">Canada</option>
+                        <option value="au">Australia</option>
+                        <option value="de">Germany</option>
+                        <option value="fr">France</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>Email Type Filter</label>
+                    <select id="email_filter">
+                        <option value="all">All Email Types</option>
+                        <option value="gmail">Gmail Only</option>
+                        <option value="yahoo">Yahoo Only</option>
+                        <option value="business">Business Domains Only</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>Worker Count</label>
+                    <input type="number" id="worker_count" value="0" min="0" max="300">
+                    <small>Number of parallel workers (0 = auto-calculate, max 300)</small>
+                </div>
+                
+                <button type="submit" class="btn">🚀 Start Extraction</button>
+            </form>
+        </div>
+        
+        <!-- Recent Jobs -->
+        <div class="card">
+            <h2>Recent Jobs</h2>
+            <div id="jobs-list">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading jobs...</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Active Workers -->
+        <div class="card">
+            <h2>Active Workers</h2>
+            <div id="workers-list">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading workers...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_URL = 'api.php';
+        
+        // Utility functions
+        function showAlert(message, type = 'info') {
+            const alertsDiv = document.getElementById('alerts');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            alertsDiv.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+        
+        async function apiCall(action, data = {}, method = 'GET') {
+            const url = new URL(API_URL, window.location.href);
+            url.searchParams.append('action', action);
+            
+            const options = {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            };
+            
+            if (method === 'POST' && Object.keys(data).length > 0) {
+                options.body = JSON.stringify(data);
+            }
+            
+            try {
+                const response = await fetch(url, options);
+                const result = await response.json();
+                
+                if (!result.success) {
+                    throw new Error(result.error || 'API request failed');
+                }
+                
+                return result.data;
+            } catch (error) {
+                console.error('API Error:', error);
+                showAlert('API Error: ' + error.message, 'error');
+                throw error;
+            }
+        }
+        
+        // Load system status
+        async function loadSystemStatus() {
+            try {
+                const status = await apiCall('get_system_status');
+                document.getElementById('active-workers').textContent = status.active_workers;
+                document.getElementById('total-jobs').textContent = status.total_jobs;
+                document.getElementById('total-emails').textContent = status.total_emails.toLocaleString();
+            } catch (error) {
+                console.error('Failed to load system status:', error);
+            }
+        }
+        
+        // Load queue stats
+        async function loadQueueStats() {
+            try {
+                const stats = await apiCall('get_queue_stats');
+                document.getElementById('queue-pending').textContent = stats.pending;
+            } catch (error) {
+                console.error('Failed to load queue stats:', error);
+            }
+        }
+        
+        // Load jobs
+        async function loadJobs() {
+            try {
+                const data = await apiCall('get_jobs');
+                const jobs = data.jobs;
+                
+                const jobsList = document.getElementById('jobs-list');
+                
+                if (jobs.length === 0) {
+                    jobsList.innerHTML = '<p style="text-align: center; color: #718096; padding: 20px;">No jobs yet. Create one above!</p>';
+                    return;
+                }
+                
+                let html = '<table><thead><tr><th>ID</th><th>Query</th><th>Status</th><th>Progress</th><th>Emails</th><th>Created</th></tr></thead><tbody>';
+                
+                jobs.forEach(job => {
+                    const statusClass = job.status === 'completed' ? 'success' : 
+                                       job.status === 'running' ? 'info' :
+                                       job.status === 'failed' ? 'danger' : 'warning';
+                    
+                    html += `
+                        <tr>
+                            <td><strong>#${job.id}</strong></td>
+                            <td>${escapeHtml(job.query)}</td>
+                            <td><span class="badge badge-${statusClass}">${job.status}</span></td>
+                            <td>${job.progress}%</td>
+                            <td>${job.email_count || 0}</td>
+                            <td>${new Date(job.created_at).toLocaleString()}</td>
+                        </tr>
+                    `;
+                });
+                
+                html += '</tbody></table>';
+                jobsList.innerHTML = html;
+            } catch (error) {
+                document.getElementById('jobs-list').innerHTML = '<p style="color: #f56565;">Failed to load jobs</p>';
+            }
+        }
+        
+        // Load workers
+        async function loadWorkers() {
+            try {
+                const data = await apiCall('get_workers');
+                const workers = data.workers;
+                
+                const workersList = document.getElementById('workers-list');
+                
+                if (workers.length === 0) {
+                    workersList.innerHTML = '<p style="text-align: center; color: #718096; padding: 20px;">No workers registered yet.</p>';
+                    return;
+                }
+                
+                let html = '<table><thead><tr><th>Worker</th><th>Status</th><th>Job</th><th>Pages</th><th>Emails</th><th>Last Heartbeat</th></tr></thead><tbody>';
+                
+                workers.forEach(worker => {
+                    const statusClass = worker.status === 'running' ? 'active' : 
+                                       worker.status === 'idle' ? 'idle' : 'error';
+                    
+                    html += `
+                        <tr>
+                            <td><span class="status-dot ${statusClass}"></span><strong>${escapeHtml(worker.worker_name)}</strong></td>
+                            <td><span class="badge badge-${worker.status === 'running' ? 'info' : 'warning'}">${worker.status}</span></td>
+                            <td>${worker.current_job_id ? '#' + worker.current_job_id : '-'}</td>
+                            <td>${worker.pages_processed || 0}</td>
+                            <td>${worker.emails_extracted || 0}</td>
+                            <td>${worker.last_heartbeat ? new Date(worker.last_heartbeat).toLocaleString() : 'Never'}</td>
+                        </tr>
+                    `;
+                });
+                
+                html += '</tbody></table>';
+                workersList.innerHTML = html;
+            } catch (error) {
+                document.getElementById('workers-list').innerHTML = '<p style="color: #f56565;">Failed to load workers</p>';
+            }
+        }
+        
+        // Create job form handler
+        document.getElementById('create-job-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = {
+                query: document.getElementById('query').value,
+                api_key: document.getElementById('api_key').value,
+                max_results: parseInt(document.getElementById('max_results').value),
+                country: document.getElementById('country').value || null,
+                email_filter: document.getElementById('email_filter').value,
+                worker_count: parseInt(document.getElementById('worker_count').value) || 0
+            };
+            
+            try {
+                // Create job
+                const jobResult = await apiCall('create_job', formData, 'POST');
+                showAlert(`Job #${jobResult.job_id} created! ${jobResult.worker_count} workers will be spawned.`, 'success');
+                
+                // Spawn workers
+                await apiCall('spawn_workers', { worker_count: jobResult.worker_count }, 'POST');
+                showAlert(`${jobResult.worker_count} workers spawned successfully!`, 'success');
+                
+                // Reset form
+                document.getElementById('create-job-form').reset();
+                
+                // Reload data
+                setTimeout(() => {
+                    loadJobs();
+                    loadWorkers();
+                    loadSystemStatus();
+                }, 2000);
+                
+            } catch (error) {
+                showAlert('Failed to create job: ' + error.message, 'error');
+            }
+        });
+        
+        // Helper function
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Initial load
+        loadSystemStatus();
+        loadQueueStats();
+        loadJobs();
+        loadWorkers();
+        
+        // Auto-refresh every 5 seconds
+        setInterval(() => {
+            loadSystemStatus();
+            loadQueueStats();
+            loadJobs();
+            loadWorkers();
+        }, 5000);
+    </script>
+</body>
+</html>

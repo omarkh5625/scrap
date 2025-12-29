@@ -4907,4 +4907,7 @@ class Router {
 // APPLICATION ENTRY POINT
 // ============================================================================
 
-Router::handleRequest();
+// Only handle web requests if not in API mode
+if (!defined('API_MODE') || !API_MODE) {
+    Router::handleRequest();
+}
