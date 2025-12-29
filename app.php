@@ -2172,7 +2172,6 @@ class Router {
             
             // Register worker immediately
             $workerId = Worker::register($workerName);
-            Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
             
             // Close connection immediately so client doesn't wait
             ignore_user_abort(true);
@@ -2206,45 +2205,54 @@ class Router {
             
             // Now process queue items for this job in background
             try {
-                error_log("  Worker {$workerName} (ID: {$workerId}) processing queue for job {$jobId}");
+                error_log("  Worker {$workerName} (ID: {$workerId}) starting to process queue for job {$jobId}");
                 
                 // Process queue items for this specific job
                 $startTime = time();
                 $maxRuntime = 600; // 10 minutes max per worker
                 $itemsProcessed = 0;
                 
+                // Keep processing until we run out of queue items for this job
                 while ((time() - $startTime) < $maxRuntime) {
                     // Get next queue item for this specific job
                     $job = Worker::getNextJob();
                     
-                    // Only process if it's for our job
-                    if ($job && isset($job['id']) && $job['id'] == $jobId) {
-                        error_log("  Worker {$workerName}: Processing queue item for job {$jobId}");
-                        Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                        
-                        Worker::processJob($job['id']);
-                        
-                        $itemsProcessed++;
-                        error_log("  Worker {$workerName}: Completed queue item {$itemsProcessed} for job {$jobId}");
-                        
-                        // Check if all queue items for this job are done
-                        $db = Database::connect();
-                        $stmt = $db->prepare("SELECT COUNT(*) as pending FROM job_queue WHERE job_id = ? AND status = 'pending'");
-                        $stmt->execute([$jobId]);
-                        $pendingCount = $stmt->fetch()['pending'];
-                        
-                        if ($pendingCount == 0) {
-                            error_log("✓ Worker {$workerName}: All queue items completed for job {$jobId}. Exiting.");
-                            break;
-                        }
-                    } else {
-                        // No more queue items for our job
-                        error_log("  Worker {$workerName}: No more queue items for job {$jobId}. Exiting.");
+                    // Check if we got a job and it's for our target job_id
+                    if (!$job) {
+                        error_log("  Worker {$workerName}: No queue items available. Exiting.");
+                        break;
+                    }
+                    
+                    $retrievedJobId = (int)$job['id'];
+                    
+                    // Only process if it's for our target job
+                    if ($retrievedJobId != $jobId) {
+                        error_log("  Worker {$workerName}: Queue item is for different job ({$retrievedJobId} != {$jobId}). Exiting.");
+                        break;
+                    }
+                    
+                    error_log("  Worker {$workerName}: Processing queue item for job {$jobId}");
+                    Worker::updateHeartbeat($workerId, 'running', $retrievedJobId, 0, 0);
+                    
+                    // Process the job (this extracts emails)
+                    Worker::processJob($retrievedJobId);
+                    
+                    $itemsProcessed++;
+                    error_log("  Worker {$workerName}: Completed queue item {$itemsProcessed} for job {$jobId}");
+                    
+                    // Check if all queue items for this job are done
+                    $db = Database::connect();
+                    $stmt = $db->prepare("SELECT COUNT(*) as pending FROM job_queue WHERE job_id = ? AND status = 'pending'");
+                    $stmt->execute([$jobId]);
+                    $pendingCount = $stmt->fetch()['pending'];
+                    
+                    if ($pendingCount == 0) {
+                        error_log("✓ Worker {$workerName}: All queue items completed for job {$jobId}. Exiting.");
                         break;
                     }
                     
                     // Small sleep between items to avoid race conditions
-                    usleep(500000); // 0.5 seconds
+                    usleep(100000); // 0.1 seconds (reduced from 0.5)
                 }
                 
                 error_log("✓ Worker {$workerName} completed successfully. Processed {$itemsProcessed} queue items for job {$jobId}.");
