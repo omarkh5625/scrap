@@ -4001,9 +4001,11 @@ class Router {
             </style>
             
             <script>
-                // Configuration for progress update method
-                // Can be configured in Settings page or set manually here
-                const USE_SSE = <?php echo Settings::get('use_sse') === '1' ? 'true' : 'false'; ?>; // Server-Sent Events vs Polling
+                // Progress update method configuration
+                // Managed via Settings page: Settings → Progress Update Method
+                // false = Polling (recommended, works everywhere)
+                // true = Server-Sent Events (real-time, modern browsers)
+                const USE_SSE = <?php echo Settings::get('use_sse') === '1' ? 'true' : 'false'; ?>;
                 
                 document.getElementById('job-form').addEventListener('submit', function(e) {
                     e.preventDefault();

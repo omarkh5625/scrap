@@ -104,16 +104,20 @@ flush();
 
 ## Configuration
 
-### Enable Server-Sent Events
-In the JavaScript section of the create job form:
-```javascript
-const USE_SSE = true; // Use SSE instead of polling
-```
+### Progress Update Method
+Choose between polling and Server-Sent Events:
+1. Navigate to **Settings** in the web interface
+2. Find **Progress Update Method**
+3. Select:
+   - **Polling (Recommended)**: Updates every 3 seconds, works on all servers
+   - **Server-Sent Events (SSE)**: Real-time updates, requires modern browser
+
+**Note**: The setting is stored in the database and applies to all users. No code changes needed.
 
 ### Adjust Worker Count
 Workers are automatically calculated but can be customized:
 ```php
-// In Worker class
+// In Worker class (app.php)
 private const AUTO_MAX_WORKERS = 300;
 private const OPTIMAL_RESULTS_PER_WORKER = 100;
 ```
