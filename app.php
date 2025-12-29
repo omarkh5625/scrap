@@ -1210,7 +1210,7 @@ class Router {
             $query = $_POST['query'] ?? '';
             $apiKey = $_POST['api_key'] ?? '';
             $maxResults = (int)($_POST['max_results'] ?? 100);
-            $country = $_POST['country'] ?? null;
+            $country = !empty($_POST['country']) ? $_POST['country'] : null;
             $emailFilter = $_POST['email_filter'] ?? 'all';
             
             if ($query && $apiKey) {
