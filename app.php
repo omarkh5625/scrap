@@ -1990,12 +1990,10 @@ class Router {
                 break;
             case 'new-job':
             case 'workers':
-                // Redirect old pages to dashboard
+            case 'settings':
+                // Redirect all old pages to dashboard (Settings removed as per user request)
                 header('Location: ?page=dashboard');
                 exit;
-            case 'settings':
-                self::renderSettings();
-                break;
             case 'results':
                 self::renderResults();
                 break;
@@ -2795,26 +2793,34 @@ class Router {
                         // Create job for immediate processing
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
-                        // Prepare queue items but DON'T spawn workers yet
+                        // Prepare queue items for workers
                         self::createQueueItems($jobId, $workerCount);
                         
+                        // Log job creation
+                        error_log("✓ Job {$jobId} created with {$workerCount} workers queued for {$maxResults} emails");
+                        
                         // Send redirect response immediately (don't block UI)
-                        header('Location: ?page=dashboard&job_id=' . $jobId);
+                        header('Location: ?page=results&job_id=' . $jobId);
                         
                         // Close connection to user BEFORE spawning workers
                         if (function_exists('fastcgi_finish_request')) {
                             fastcgi_finish_request();
+                            error_log("✓ Response sent to user via fastcgi_finish_request, now spawning {$workerCount} workers");
                         } else {
                             if (ob_get_level() > 0) {
                                 ob_end_flush();
                             }
                             flush();
+                            error_log("✓ Response flushed to user, now spawning {$workerCount} workers");
                         }
                         
                         // Now spawn workers in background after response sent
                         ignore_user_abort(true);
-                        set_time_limit(300);
+                        set_time_limit(600); // 10 minutes for spawning
+                        
+                        error_log("=== STARTING WORKER SPAWN FOR JOB {$jobId} ===");
                         self::autoSpawnWorkers($workerCount);
+                        error_log("=== COMPLETED WORKER SPAWN FOR JOB {$jobId} ===");
                         
                         exit;
                     }
@@ -4611,9 +4617,6 @@ class Router {
                 <nav class="nav">
                     <a href="?page=dashboard" class="nav-item <?php echo ($_GET['page'] ?? 'dashboard') === 'dashboard' ? 'active' : ''; ?>">
                         📊 Dashboard
-                    </a>
-                    <a href="?page=settings" class="nav-item <?php echo ($_GET['page'] ?? '') === 'settings' ? 'active' : ''; ?>">
-                        🔧 Settings
                     </a>
                     <a href="?page=logout" class="nav-item">
                         🚪 Logout
