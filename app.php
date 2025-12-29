@@ -133,6 +133,27 @@ class Database {
                 self::$pdo->exec("ALTER TABLE workers ADD COLUMN emails_extracted INT DEFAULT 0 AFTER pages_processed");
                 self::$pdo->exec("ALTER TABLE workers ADD COLUMN runtime_seconds INT DEFAULT 0 AFTER emails_extracted");
             }
+            
+            // Migration: Create job_queue table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'job_queue'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS job_queue (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        job_id INT NOT NULL,
+                        start_offset INT NOT NULL,
+                        max_results INT NOT NULL,
+                        status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+                        worker_id INT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP NULL,
+                        completed_at TIMESTAMP NULL,
+                        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                        INDEX idx_status (status),
+                        INDEX idx_job (job_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
             // Don't die on migration errors, just log them
@@ -256,6 +277,23 @@ class Database {
                     setting_key VARCHAR(100) UNIQUE NOT NULL,
                     setting_value TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS job_queue (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    job_id INT NOT NULL,
+                    start_offset INT NOT NULL,
+                    max_results INT NOT NULL,
+                    status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+                    worker_id INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP NULL,
+                    completed_at TIMESTAMP NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                    INDEX idx_status (status),
+                    INDEX idx_job (job_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
@@ -663,6 +701,33 @@ class Worker {
         $db->beginTransaction();
         
         try {
+            // First check job_queue for pending chunks
+            $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+            $stmt->execute();
+            $queueItem = $stmt->fetch();
+            
+            if ($queueItem) {
+                // Mark this queue item as processing
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueItem['id']]);
+                
+                // Get the job details
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+                $stmt->execute([$queueItem['job_id']]);
+                $job = $stmt->fetch();
+                
+                if ($job) {
+                    // Add queue info to job
+                    $job['queue_id'] = $queueItem['id'];
+                    $job['queue_start_offset'] = $queueItem['start_offset'];
+                    $job['queue_max_results'] = $queueItem['max_results'];
+                }
+                
+                $db->commit();
+                return $job ?: null;
+            }
+            
+            // Fallback to old method: check for pending jobs without queue
             $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
             $stmt->execute();
             $job = $stmt->fetch();
@@ -676,8 +741,21 @@ class Worker {
             return $job ?: null;
         } catch (PDOException $e) {
             $db->rollBack();
+            error_log("getNextJob error: " . $e->getMessage());
             return null;
         }
+    }
+    
+    public static function markQueueItemComplete(int $queueId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$queueId]);
+    }
+    
+    public static function markQueueItemFailed(int $queueId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$queueId]);
     }
     
     public static function processResultWithDeepScraping(
@@ -739,11 +817,16 @@ class Worker {
         $country = $job['country'];
         $emailFilter = $job['email_filter'];
         
+        // Check if this is a queue-based job chunk
+        $startOffset = isset($job['queue_start_offset']) ? (int)$job['queue_start_offset'] : 0;
+        $maxToProcess = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : $maxResults;
+        $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
+        
         $processed = 0;
         $pagesProcessed = 0;
-        $page = 1;
+        $page = (int)($startOffset / 10) + 1;
         
-        while ($processed < $maxResults) {
+        while ($processed < $maxToProcess) {
             $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
@@ -754,17 +837,16 @@ class Worker {
             $emailsBefore = $processed;
             
             foreach ($data['organic'] as $result) {
-                if ($processed >= $maxResults) {
+                if ($processed >= $maxToProcess) {
                     break;
                 }
                 
-                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxResults);
+                self::processResultWithDeepScraping($result, $jobId, $country, $emailFilter, $processed, $maxToProcess);
                 
-                $progress = (int)(($processed / $maxResults) * 100);
-                Job::updateStatus($jobId, 'running', $progress);
+                $progress = (int)(($processed / $maxToProcess) * 100);
                 
                 if ($processed > 0 && $processed % 10 === 0) {
-                    echo "  - Progress: {$processed}/{$maxResults} emails\n";
+                    echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
                 }
             }
             
@@ -784,11 +866,42 @@ class Worker {
             usleep((int)($rateLimit * 1000000));
         }
         
-        Job::updateStatus($jobId, 'completed', 100);
-        echo "Job #{$jobId} completed! Total emails: {$processed}\n";
+        // Mark queue item as complete
+        if ($queueId) {
+            self::markQueueItemComplete($queueId);
+        }
+        
+        // Update overall job progress
+        self::updateJobProgress($jobId);
+        
+        echo "Job chunk completed! Processed {$processed} emails\n";
         
         // Mark worker as idle
         self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+    }
+    
+    public static function updateJobProgress(int $jobId): void {
+        $db = Database::connect();
+        
+        // Get total queue items and completed items
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM job_queue WHERE job_id = ?");
+        $stmt->execute([$jobId]);
+        $total = $stmt->fetch()['total'];
+        
+        $stmt = $db->prepare("SELECT COUNT(*) as completed FROM job_queue WHERE job_id = ? AND status = 'completed'");
+        $stmt->execute([$jobId]);
+        $completed = $stmt->fetch()['completed'];
+        
+        if ($total > 0) {
+            $progress = (int)(($completed / $total) * 100);
+            
+            // If all queue items are completed, mark job as completed
+            if ($completed === $total) {
+                Job::updateStatus($jobId, 'completed', 100);
+            } else {
+                Job::updateStatus($jobId, 'running', $progress);
+            }
+        }
     }
     
     private static function searchSerper(string $apiKey, string $query, int $page = 1, ?string $country = null): ?array {
@@ -1160,6 +1273,24 @@ class Router {
                 echo json_encode(Worker::getStats());
                 break;
                 
+            case 'queue-stats':
+                $db = Database::connect();
+                $stmt = $db->query("SELECT COUNT(*) as pending FROM job_queue WHERE status = 'pending'");
+                $pending = $stmt->fetch()['pending'];
+                
+                $stmt = $db->query("SELECT COUNT(*) as processing FROM job_queue WHERE status = 'processing'");
+                $processing = $stmt->fetch()['processing'];
+                
+                $stmt = $db->query("SELECT COUNT(*) as completed FROM job_queue WHERE status = 'completed'");
+                $completed = $stmt->fetch()['completed'];
+                
+                echo json_encode([
+                    'pending' => $pending,
+                    'processing' => $processing,
+                    'completed' => $completed
+                ]);
+                break;
+                
             case 'jobs':
                 echo json_encode(Job::getAll(Auth::getUserId()));
                 break;
@@ -1488,19 +1619,24 @@ class Router {
         $maxResults = (int)$job['max_results'];
         $resultsPerWorker = (int)ceil($maxResults / $workerCount);
         
-        // Update job to running status immediately
-        Job::updateStatus($jobId, 'running', 0);
+        // Create queue items for parallel processing
+        $db = Database::connect();
         
-        // Check if exec() is available
-        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
-        
-        if ($execAvailable) {
-            // Method 1: Spawn background PHP processes (preferred)
-            self::spawnWorkersViaExec($jobId, $workerCount, $resultsPerWorker, $maxResults);
-        } else {
-            // Method 2: Use async HTTP requests (fallback for restricted hosting)
-            self::spawnWorkersViaHttp($jobId, $workerCount, $resultsPerWorker, $maxResults);
+        for ($i = 0; $i < $workerCount; $i++) {
+            $startOffset = $i * $resultsPerWorker;
+            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            
+            if ($workerMaxResults > 0) {
+                // Insert queue item
+                $stmt = $db->prepare("INSERT INTO job_queue (job_id, start_offset, max_results, status) VALUES (?, ?, ?, 'pending')");
+                $stmt->execute([$jobId, $startOffset, $workerMaxResults]);
+            }
         }
+        
+        // Update job status to pending (workers will pick it up from queue)
+        Job::updateStatus($jobId, 'pending', 0);
+        
+        error_log("Created {$workerCount} queue items for job {$jobId}. Workers will process from queue.");
     }
     
     private static function spawnWorkersViaExec(int $jobId, int $workerCount, int $resultsPerWorker, int $maxResults): void {
@@ -1623,16 +1759,18 @@ class Router {
             
             <?php if ($success): ?>
                 <div class="alert alert-success">
-                    ✓ Job #<?php echo $jobId; ?> created and processing started immediately! <?php echo $_POST['worker_count'] ?? 5; ?> parallel workers are running in the background.
-                    <a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
-                    <a href="?page=dashboard">Go to Dashboard</a>
+                    ✓ Job #<?php echo $jobId; ?> created and queued for processing! <?php echo $_POST['worker_count'] ?? 5; ?> work chunks have been created.
+                    <br><strong>Start workers to process:</strong> <code>php app.php worker-1</code>
+                    <br><a href="?page=results&job_id=<?php echo $jobId; ?>">View Job</a> | 
+                    <a href="?page=dashboard">Go to Dashboard</a> | 
+                    <a href="?page=workers">View Workers</a>
                 </div>
             <?php endif; ?>
             
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Jobs start processing immediately with parallel workers! No need to start CLI workers.
+                    📋 Jobs are queued and processed by CLI workers. Start workers with: <code>php app.php worker-name</code>
                 </p>
                 <form method="POST">
                     <div class="form-group">
@@ -1687,10 +1825,10 @@ class Router {
                     <div class="form-group">
                         <label>Parallel Workers</label>
                         <input type="number" name="worker_count" value="5" min="1" max="1000">
-                        <small>Number of parallel workers to spawn (1-1000). More workers = faster processing</small>
+                        <small>Number of work chunks to create (1-1000). Each worker will process one chunk from the queue.</small>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary">Start Processing Immediately</button>
+                    <button type="submit" class="btn btn-primary">Create Job & Queue for Processing</button>
                     <a href="?page=dashboard" class="btn">Cancel</a>
                 </form>
             </div>
@@ -1699,13 +1837,14 @@ class Router {
                 <h2>ℹ️ How It Works</h2>
                 <ol style="padding-left: 20px;">
                     <li>Create a job with your search query and preferences</li>
-                    <li>Parallel workers start immediately in the background</li>
-                    <li>Emails are extracted from search results using regex patterns</li>
+                    <li>Job is split into chunks and added to processing queue</li>
+                    <li>Start CLI workers to process the queue: <code>php app.php worker-1</code></li>
+                    <li>Workers pick up chunks from the queue and extract emails</li>
                     <li>Duplicates are automatically filtered out</li>
                     <li>Results appear in real-time on the dashboard</li>
                 </ol>
                 <p style="margin-top: 15px;">
-                    <strong>Auto-Processing:</strong> Workers are spawned automatically when you click "Start Processing Immediately". No manual CLI worker setup needed! The UI returns instantly while workers process in the background.
+                    <strong>Queue-Based Processing:</strong> Jobs are queued and processed by persistent CLI workers. This is more reliable than HTTP-based workers and works on all hosting environments including cPanel.
                 </p>
             </div>
             <?php
@@ -1815,6 +1954,23 @@ class Router {
                     </div>
                 </div>
                 <div class="stat-card">
+                    <div class="stat-icon">📋</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="pending-queue">-</div>
+                        <div class="stat-label">Pending in Queue</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚙️</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="processing-queue">-</div>
+                        <div class="stat-label">Processing Now</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
                     <div class="stat-icon">📄</div>
                     <div class="stat-content">
                         <div class="stat-value" id="total-pages">-</div>
@@ -1826,6 +1982,20 @@ class Router {
                     <div class="stat-content">
                         <div class="stat-value" id="total-worker-emails">-</div>
                         <div class="stat-label">Emails Extracted</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="completed-queue">-</div>
+                        <div class="stat-label">Completed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏱️</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="avg-runtime">-</div>
+                        <div class="stat-label">Avg Runtime</div>
                     </div>
                 </div>
             </div>
@@ -1845,8 +2015,8 @@ class Router {
                 <h2>Performance Metrics</h2>
                 <div class="metrics-grid">
                     <div class="metric-item">
-                        <div class="metric-label">Average Runtime</div>
-                        <div class="metric-value" id="avg-runtime">-</div>
+                        <div class="metric-label">Queue Processing Rate</div>
+                        <div class="metric-value" id="queue-rate">-</div>
                     </div>
                     <div class="metric-item">
                         <div class="metric-label">Last Update</div>
@@ -1899,6 +2069,25 @@ class Router {
                             }
                         })
                         .catch(err => console.error('Error fetching worker stats:', err));
+                    
+                    // Update queue stats
+                    fetch('?page=api&action=queue-stats')
+                        .then(res => res.json())
+                        .then(queue => {
+                            document.getElementById('pending-queue').textContent = queue.pending;
+                            document.getElementById('processing-queue').textContent = queue.processing;
+                            document.getElementById('completed-queue').textContent = queue.completed;
+                            
+                            // Calculate processing rate
+                            const total = queue.pending + queue.processing + queue.completed;
+                            if (total > 0) {
+                                const rate = Math.round((queue.completed / total) * 100) + '%';
+                                document.getElementById('queue-rate').textContent = rate;
+                            } else {
+                                document.getElementById('queue-rate').textContent = '0%';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching queue stats:', err));
                 }
                 
                 function updateWorkers() {
