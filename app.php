@@ -655,6 +655,8 @@ class Worker {
             'avg_runtime' => $avgRuntime
         ];
     }
+    
+    public static function getNextJob(): ?array {
         $db = Database::connect();
         
         // Use transaction to prevent race conditions
