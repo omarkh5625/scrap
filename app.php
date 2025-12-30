@@ -829,10 +829,16 @@ function spawn_extraction_worker(PDO $pdo, int $jobId): bool {
  * This is the core extraction logic, similar to send_campaign_real in the old system
  */
 function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
+    error_log("PERFORM_EXTRACTION: ========== STARTING for job_id={$jobId} ==========");
+    error_log("PERFORM_EXTRACTION: Job data: " . json_encode($job));
+    error_log("PERFORM_EXTRACTION: Profile data: " . json_encode($profile));
+    
     try {
         // Update status to extracting
+        error_log("PERFORM_EXTRACTION: Updating job status to 'extracting'");
         $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
         $stmt->execute([$jobId]);
+        error_log("PERFORM_EXTRACTION: Job status updated successfully");
         
         // Get extraction parameters
         $apiKey = $profile['api_key'] ?? '';
@@ -841,23 +847,30 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
         $businessOnly = !empty($profile['business_only']);
         $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)($profile['target_count'] ?? 100);
         
+        error_log("PERFORM_EXTRACTION: Parameters - apiKey=" . (empty($apiKey) ? 'EMPTY' : 'SET') . ", searchQuery='{$searchQuery}', country='{$country}', businessOnly=" . ($businessOnly ? 'YES' : 'NO') . ", targetCount={$targetCount}");
+        
         if (empty($apiKey) || empty($searchQuery)) {
+            error_log("PERFORM_EXTRACTION: ERROR - API key or search query is missing");
             throw new Exception("API key or search query is missing");
         }
         
         // Call serper.dev API to extract emails
+        error_log("PERFORM_EXTRACTION: Calling extract_emails_serper()...");
         $result = extract_emails_serper($apiKey, $searchQuery, $country, $businessOnly, $targetCount);
+        error_log("PERFORM_EXTRACTION: extract_emails_serper() returned: success=" . ($result['success'] ? 'YES' : 'NO'));
         
         if (!$result['success']) {
             // Mark job as failed
+            error_log("PERFORM_EXTRACTION: Extraction failed, marking job as error");
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', progress_extracted = 0 WHERE id = ?");
             $stmt->execute([$jobId]);
-            error_log("Job {$jobId} extraction failed: " . implode('; ', $result['log']));
+            error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log']));
             return;
         }
         
         $extractedEmails = $result['emails'] ?? [];
         $extractedCount = 0;
+        error_log("PERFORM_EXTRACTION: Got " . count($extractedEmails) . " emails from serper.dev");
         
         // Store extracted emails in database
         foreach ($extractedEmails as $emailData) {
@@ -874,28 +887,37 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
                 if ($extractedCount % 10 === 0) {
                     $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
                     $stmt->execute([$extractedCount, $jobId]);
+                    error_log("PERFORM_EXTRACTION: Progress update - {$extractedCount} emails extracted so far");
                 }
             } catch (Exception $e) {
                 // Skip duplicate emails (unique constraint violation)
+                error_log("PERFORM_EXTRACTION: Skipping duplicate email: " . ($emailData['email'] ?? 'unknown'));
                 continue;
             }
         }
         
         // Mark job as completed
+        error_log("PERFORM_EXTRACTION: Marking job as completed");
         $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW() WHERE id = ?");
         $stmt->execute([$extractedCount, $jobId]);
         
-        error_log("Job {$jobId} completed successfully. Extracted {$extractedCount} emails.");
+        error_log("PERFORM_EXTRACTION: Job {$jobId} completed successfully. Extracted {$extractedCount} emails.");
+        error_log("PERFORM_EXTRACTION: ========== FINISHED ==========");
         
     } catch (Throwable $e) {
         // Mark job as failed
+        error_log("PERFORM_EXTRACTION: EXCEPTION CAUGHT - " . $e->getMessage());
+        error_log("PERFORM_EXTRACTION: Exception file: " . $e->getFile() . " line: " . $e->getLine());
+        error_log("PERFORM_EXTRACTION: Stack trace: " . $e->getTraceAsString());
+        
         try {
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error' WHERE id = ?");
             $stmt->execute([$jobId]);
+            error_log("PERFORM_EXTRACTION: Job marked as draft due to error");
         } catch (Exception $e2) {
-            // Ignore
+            error_log("PERFORM_EXTRACTION: Failed to mark job as draft: " . $e2->getMessage());
         }
-        error_log("Job {$jobId} extraction error: " . $e->getMessage());
+        error_log("PERFORM_EXTRACTION: Job {$jobId} extraction error: " . $e->getMessage());
         throw $e;
     }
 }
@@ -4628,6 +4650,9 @@ if ($action === 'save_job' || $action === 'save_campaign') {
     $name      = trim($_POST['name'] ?? '');
     $profile_id = (int)($_POST['profile_id'] ?? 0);
     $target_count = (int)($_POST['target_count'] ?? 0);
+    $start_immediately = isset($_POST['start_immediately']) && $_POST['start_immediately'];
+    
+    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, target_count={$target_count}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
 
     try {
         if ($target_count > 0) {
@@ -4637,6 +4662,7 @@ if ($action === 'save_job' || $action === 'save_campaign') {
                 WHERE id = ?
             ");
             $stmt->execute([$name, $profile_id, $target_count, $id]);
+            error_log("SAVE_JOB ACTION: Job {$id} updated with target_count");
         } else {
             $stmt = $pdo->prepare("
                 UPDATE jobs
@@ -4644,10 +4670,18 @@ if ($action === 'save_job' || $action === 'save_campaign') {
                 WHERE id = ?
             ");
             $stmt->execute([$name, $profile_id, $id]);
+            error_log("SAVE_JOB ACTION: Job {$id} updated without target_count");
         }
         
+        // Verify save was successful
+        $verify = $pdo->prepare("SELECT id, name, profile_id, target_count, status FROM jobs WHERE id = ?");
+        $verify->execute([$id]);
+        $saved_job = $verify->fetch(PDO::FETCH_ASSOC);
+        error_log("SAVE_JOB ACTION: Verified job after save: " . json_encode($saved_job));
+        
         // Check if should start immediately
-        if (isset($_POST['start_immediately']) && $_POST['start_immediately']) {
+        if ($start_immediately) {
+            error_log("SAVE_JOB ACTION: start_immediately flag detected, redirecting to start_job action");
             // Redirect with POST to start_job action
             header("Location: ?page=list");
             echo '<!DOCTYPE html><html><body><form id="startForm" method="POST" action="?page=list">';
@@ -4655,6 +4689,8 @@ if ($action === 'save_job' || $action === 'save_campaign') {
             echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
             echo '</form><script>document.getElementById("startForm").submit();</script></body></html>';
             exit;
+        } else {
+            error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
         }
     } catch (Exception $e) {
         error_log("Failed to save job id {$id}: " . $e->getMessage());
@@ -4683,13 +4719,41 @@ if ($action === 'save_job' || $action === 'save_campaign') {
 // Start extraction job action
 if ($action === 'start_job') {
     $job_id = (int)($_POST['job_id'] ?? $_GET['job_id'] ?? 0);
+    error_log("START_JOB ACTION: ========== STARTING ==========");
     error_log("START_JOB ACTION: Received job_id=" . $job_id);
+    error_log("START_JOB ACTION: POST data: " . json_encode($_POST));
+    error_log("START_JOB ACTION: GET data: " . json_encode($_GET));
+    
+    if ($job_id <= 0) {
+        error_log("START_JOB ACTION: ERROR - Invalid job_id (<=0)");
+        header("Location: ?page=list&error=invalid_job_id");
+        exit;
+    }
     
     if ($job_id > 0) {
+        error_log("START_JOB ACTION: Calling get_job() for job_id={$job_id}");
         $job = get_job($pdo, $job_id);
-        error_log("START_JOB ACTION: Job fetched: " . ($job ? "YES (profile_id=" . ($job['profile_id'] ?? 'NULL') . ")" : "NO"));
+        error_log("START_JOB ACTION: Job fetched: " . ($job ? "YES" : "NO"));
+        
+        if ($job) {
+            error_log("START_JOB ACTION: Job details: " . json_encode($job));
+            error_log("START_JOB ACTION: profile_id = " . ($job['profile_id'] ?? 'NULL') . " (empty=" . (empty($job['profile_id']) ? 'YES' : 'NO') . ")");
+        }
+        
+        if (!$job) {
+            error_log("START_JOB ACTION: ERROR - Job not found in database");
+            header("Location: ?page=list&error=job_not_found");
+            exit;
+        }
+        
+        if (empty($job['profile_id'])) {
+            error_log("START_JOB ACTION: ERROR - Job has no profile_id assigned");
+            header("Location: ?page=list&error=no_profile");
+            exit;
+        }
         
         if ($job && !empty($job['profile_id'])) {
+            error_log("START_JOB ACTION: Job and profile_id valid, continuing...");
             try {
                 // Get profile information
                 $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
@@ -7187,15 +7251,24 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               if (startJobBtn) {
                 startJobBtn.addEventListener('click', function(e) {
                   e.preventDefault();
+                  console.log('START EXTRACTION BUTTON: Button clicked');
+                  console.log('START EXTRACTION BUTTON: Profile selected:', profileSelect.value);
+                  
                   if (!profileSelect.value) {
                     alert('Please select a profile first');
+                    console.log('START EXTRACTION BUTTON: ERROR - No profile selected');
                     return;
                   }
                   if (confirm('Start extraction job now?')) {
+                    console.log('START EXTRACTION BUTTON: User confirmed, proceeding...');
                     // First save the job configuration (profile_id, name, target_count)
                     // Then start the job
                     var jobForm = document.getElementById('jobForm');
                     if (jobForm) {
+                      console.log('START EXTRACTION BUTTON: Job form found');
+                      console.log('START EXTRACTION BUTTON: Form action:', jobForm.action);
+                      console.log('START EXTRACTION BUTTON: Form method:', jobForm.method);
+                      
                       // Create hidden input to trigger start after save
                       var startInput = document.createElement('input');
                       startInput.type = 'hidden';
@@ -7203,11 +7276,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                       startInput.value = '1';
                       jobForm.appendChild(startInput);
                       
+                      console.log('START EXTRACTION BUTTON: Added start_immediately=1 input');
+                      console.log('START EXTRACTION BUTTON: Submitting form...');
+                      
                       // Submit the form (will save job and redirect to start)
                       jobForm.submit();
+                    } else {
+                      console.log('START EXTRACTION BUTTON: ERROR - Job form not found');
                     }
+                  } else {
+                    console.log('START EXTRACTION BUTTON: User cancelled');
                   }
                 });
+              } else {
+                console.log('START EXTRACTION BUTTON: ERROR - Button not found');
               }
             })();
           </script>
