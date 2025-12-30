@@ -192,6 +192,13 @@ class Database {
                 self::$pdo->exec("ALTER TABLE workers ADD COLUMN error_count INT DEFAULT 0 AFTER runtime_seconds");
                 self::$pdo->exec("ALTER TABLE workers ADD COLUMN last_error TEXT AFTER error_count");
             }
+            
+            // Migration: Add worker_count column to jobs table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'worker_count'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN worker_count INT DEFAULT 1 AFTER max_results");
+                self::$pdo->exec("ALTER TABLE jobs ADD INDEX idx_worker_count (worker_count)");
+            }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
             // Don't die on migration errors, just log them
@@ -253,6 +260,7 @@ class Database {
                     query VARCHAR(500) NOT NULL,
                     api_key VARCHAR(255) NOT NULL,
                     max_results INT DEFAULT 100,
+                    worker_count INT DEFAULT 1,
                     country VARCHAR(100),
                     email_filter VARCHAR(50),
                     status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
@@ -262,7 +270,8 @@ class Database {
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                     INDEX idx_status (status),
                     INDEX idx_created (created_at),
-                    INDEX idx_country (country)
+                    INDEX idx_country (country),
+                    INDEX idx_worker_count (worker_count)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
@@ -1012,11 +1021,11 @@ class Job {
     // Configuration constants
     private const BULK_INSERT_BATCH_SIZE = 1000;
     
-    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
+    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null, int $workerCount = 1): int {
         try {
             $db = Database::connect();
-            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
-            $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
+            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, worker_count, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')");
+            $stmt->execute([$userId, $query, $apiKey, $maxResults, $workerCount, $country, $emailFilter]);
             
             $jobId = (int)$db->lastInsertId();
             
@@ -2232,7 +2241,7 @@ class Router {
                         }
                         
                         // Create job - this should be fast (< 100ms)
-                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter, $workerCount);
                         
                         // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
                         // This divides the work among workers so they search in parallel without duplication
@@ -2293,7 +2302,14 @@ class Router {
                         // Get job to determine worker count
                         $job = Job::getById($jobId);
                         if ($job) {
-                            $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            // Use the worker count specified when the job was created
+                            // This respects the user's input from the UI
+                            $workerCount = isset($job['worker_count']) && $job['worker_count'] > 0
+                                ? (int)$job['worker_count']
+                                : Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            
+                            // Ensure worker count is within valid range
+                            $workerCount = max(1, min(1000, $workerCount));
                             
                             // Prepare response
                             $response = json_encode([
@@ -2851,8 +2867,8 @@ class Router {
                     if (!$query || !$apiKey) {
                         $error = 'Query and API Key are required';
                     } else {
-                        // Create job for immediate processing
-                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        // Create job for immediate processing with worker count
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter, $workerCount);
                         
                         // Prepare queue items with specified worker count
                         // This divides the work among workers so they search in parallel without duplication
