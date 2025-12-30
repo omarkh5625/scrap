@@ -1746,7 +1746,7 @@ class Worker {
         }
     }
     
-    public static function processJob(int $jobId): void {
+    public static function processJob(int $jobId, ?int $existingWorkerId = null, ?string $existingWorkerName = null): void {
         $job = Job::getById($jobId);
         if (!$job) {
             return;
@@ -1754,9 +1754,14 @@ class Worker {
         
         echo "Processing job #{$jobId}: {$job['query']}\n";
         
-        // Register this worker for tracking
-        $workerName = 'cli-worker-' . getmypid();
-        $workerId = self::register($workerName);
+        // Register this worker for tracking (or use existing worker)
+        if ($existingWorkerId && $existingWorkerName) {
+            $workerName = $existingWorkerName;
+            $workerId = $existingWorkerId;
+        } else {
+            $workerName = 'cli-worker-' . getmypid();
+            $workerId = self::register($workerName);
+        }
         self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
         
         $apiKey = $job['api_key'];
@@ -4295,7 +4300,8 @@ class Router {
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                 
                 try {
-                    Worker::processJob($job['id']);
+                    // Pass worker ID and name so processJob uses existing worker instead of creating new one
+                    Worker::processJob($job['id'], $workerId, $workerName);
                     $worker['processed']++;
                     $totalProcessed++;
                     error_log("processWorkersInBackground: Worker {$workerName} completed queue item (total processed: {$totalProcessed})");
