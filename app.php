@@ -4661,8 +4661,13 @@ if ($action === 'start_job') {
                     $stmt = $pdo->prepare("UPDATE jobs SET status = 'queued', progress_status = 'queued', progress_total = ?, started_at = NOW() WHERE id = ?");
                     $stmt->execute([$targetCount, $job_id]);
                     
+                    // Log for debugging
+                    error_log("Job {$job_id} status updated to queued, spawning worker...");
+                    
                     // Spawn background extraction worker
                     $spawned = spawn_extraction_worker($pdo, $job_id);
+                    
+                    error_log("Job {$job_id} worker spawn result: " . ($spawned ? 'SUCCESS' : 'FAILED'));
                     
                     if ($spawned) {
                         // Redirect to jobs list with success message
@@ -4670,7 +4675,11 @@ if ($action === 'start_job') {
                         exit;
                     } else {
                         // Fallback: could not spawn background worker, try synchronous
-                        // For now, just show error
+                        // Reset status back to draft
+                        $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'draft' WHERE id = ?");
+                        $stmt->execute([$job_id]);
+                        
+                        error_log("Job {$job_id} worker spawn failed, status reset to draft");
                         header("Location: ?page=editor&id={$job_id}&error=" . urlencode("Could not start background extraction worker"));
                         exit;
                     }
@@ -7099,7 +7108,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   if (confirm('Start extraction job now?')) {
                     var form = document.createElement('form');
                     form.method = 'POST';
-                    form.action = window.location.href;
+                    form.action = '?page=list';  // Submit to list page with action
                     
                     var actionInput = document.createElement('input');
                     actionInput.type = 'hidden';
