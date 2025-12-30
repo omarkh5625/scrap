@@ -1163,21 +1163,120 @@ class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
     private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
-    private const OPTIMAL_RESULTS_PER_WORKER = 50; // Optimal number of results per worker for best performance (reduced to spawn more workers)
+    private const OPTIMAL_RESULTS_PER_WORKER = 20; // 50 workers per 1000 emails = 20 emails per worker
+    private const WORKERS_PER_1000_EMAILS = 50; // Required: 50 workers for every 1000 emails
     
     /**
      * Calculate optimal worker count based on job size
+     * Formula: 50 workers per 1000 emails
+     * Target: Process 1,000,000 emails in ≤10 minutes
      * Automatically determines the best number of workers for maximum performance
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
-        // Calculate based on optimal results per worker
-        $calculatedWorkers = (int)ceil($maxResults / self::OPTIMAL_RESULTS_PER_WORKER);
+        // Calculate based on the formula: 50 workers per 1000 emails
+        // Example: 1000 emails = 50 workers, 10,000 emails = 500 workers, 1,000,000 emails = 50,000 workers
+        $calculatedWorkers = (int)ceil(($maxResults / 1000) * self::WORKERS_PER_1000_EMAILS);
         
         // Cap at maximum workers to avoid resource exhaustion
+        // Note: For 1M emails, this would require 50,000 workers which exceeds AUTO_MAX_WORKERS
+        // In that case, workers will be capped and each will process more emails
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
         return max(1, $optimalWorkers);
+    }
+    
+    /**
+     * Calculate estimated time to completion based on current progress
+     * Returns array with ETA seconds, formatted ETA, and processing rate
+     */
+    public static function calculateETA(int $jobId): array {
+        $db = Database::connect();
+        
+        // Get job details
+        $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+        $stmt->execute([$jobId]);
+        $job = $stmt->fetch();
+        
+        if (!$job) {
+            return [
+                'eta_seconds' => 0,
+                'eta_formatted' => 'Unknown',
+                'emails_per_minute' => 0,
+                'completion_percentage' => 0
+            ];
+        }
+        
+        $emailsCollected = Job::getEmailCount($jobId);
+        $emailsRequired = (int)$job['max_results'];
+        $completionPercentage = $emailsRequired > 0 ? round(($emailsCollected / $emailsRequired) * 100, 2) : 0;
+        
+        // Calculate time elapsed since job started
+        $createdAt = strtotime($job['created_at']);
+        $currentTime = time();
+        $elapsedSeconds = $currentTime - $createdAt;
+        
+        // Avoid division by zero
+        if ($elapsedSeconds <= 0 || $emailsCollected <= 0) {
+            return [
+                'eta_seconds' => 0,
+                'eta_formatted' => 'Calculating...',
+                'emails_per_minute' => 0,
+                'completion_percentage' => $completionPercentage,
+                'elapsed_seconds' => $elapsedSeconds
+            ];
+        }
+        
+        // Calculate processing rate (emails per minute)
+        $emailsPerSecond = $emailsCollected / $elapsedSeconds;
+        $emailsPerMinute = round($emailsPerSecond * 60, 2);
+        
+        // Calculate remaining emails
+        $remainingEmails = max(0, $emailsRequired - $emailsCollected);
+        
+        // Calculate ETA in seconds
+        $etaSeconds = $emailsPerSecond > 0 ? (int)ceil($remainingEmails / $emailsPerSecond) : 0;
+        
+        // Format ETA for display
+        $etaFormatted = self::formatDuration($etaSeconds);
+        
+        return [
+            'eta_seconds' => $etaSeconds,
+            'eta_formatted' => $etaFormatted,
+            'emails_per_minute' => $emailsPerMinute,
+            'completion_percentage' => $completionPercentage,
+            'elapsed_seconds' => $elapsedSeconds,
+            'elapsed_formatted' => self::formatDuration($elapsedSeconds),
+            'emails_collected' => $emailsCollected,
+            'emails_required' => $emailsRequired,
+            'remaining_emails' => $remainingEmails
+        ];
+    }
+    
+    /**
+     * Format duration in seconds to human-readable format
+     */
+    private static function formatDuration(int $seconds): string {
+        if ($seconds <= 0) {
+            return '0s';
+        }
+        
+        $hours = floor($seconds / 3600);
+        $minutes = floor(($seconds % 3600) / 60);
+        $secs = $seconds % 60;
+        
+        $parts = [];
+        if ($hours > 0) {
+            $parts[] = "{$hours}h";
+        }
+        if ($minutes > 0) {
+            $parts[] = "{$minutes}m";
+        }
+        if ($secs > 0 || empty($parts)) {
+            $parts[] = "{$secs}s";
+        }
+        
+        return implode(' ', $parts);
     }
     
     public static function getAll(): array {
@@ -2130,6 +2229,9 @@ class Router {
                     // Detect stale workers
                     $staleWorkers = Worker::detectStaleWorkers(300);
                     
+                    // Calculate ETA
+                    $etaInfo = Worker::calculateETA($jobId);
+                    
                     echo json_encode([
                         'job' => $job,
                         'active_workers' => count($activeWorkers),
@@ -2138,8 +2240,20 @@ class Router {
                         'emails_required' => $maxResults,
                         'completion_percentage' => $completionPercentage,
                         'recent_errors' => $recentErrors,
-                        'stale_workers' => $staleWorkers
+                        'stale_workers' => $staleWorkers,
+                        'eta' => $etaInfo
                     ]);
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
+            case 'job-eta':
+                // Get ETA information for a specific job
+                $jobId = (int)($_GET['job_id'] ?? 0);
+                if ($jobId > 0) {
+                    $etaInfo = Worker::calculateETA($jobId);
+                    echo json_encode($etaInfo);
                 } else {
                     echo json_encode(['error' => 'Invalid job ID']);
                 }
@@ -4040,7 +4154,9 @@ class Router {
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Workers spawn automatically at maximum capacity (up to 1000 workers) based on your job size! Results appear in real-time.
+                    ⚡ <strong>Parallel Processing Power:</strong> Workers calculated automatically using formula: <strong>50 workers per 1000 emails</strong><br>
+                    📊 Examples: 1,000 emails = 50 workers | 10,000 emails = 500 workers | 1,000,000 emails = 1,000 workers (capped)<br>
+                    🎯 Target: Process 1,000,000 emails in ≤10 minutes with maximum parallelization!
                 </p>
                 <form id="job-form">
                     <div class="form-group">
@@ -4111,26 +4227,28 @@ class Router {
                 <ol style="padding-left: 20px;">
                     <li><strong>Instant Job Creation:</strong> Job and queue items created in < 200ms</li>
                     <li><strong>Async Worker Spawning:</strong> Workers spawn after response is sent to client</li>
-                    <li><strong>Dynamic Scaling:</strong> System calculates optimal worker count (up to 1000 workers)</li>
+                    <li><strong>Dynamic Scaling:</strong> Formula: 50 workers per 1000 emails (max 1000 workers)</li>
                     <li><strong>Parallel Processing:</strong> Job split into chunks for concurrent processing</li>
                     <li><strong>Real-time Updates:</strong> Progress updates via efficient polling (SSE available)</li>
                     <li><strong>Bulk Operations:</strong> URLs scraped in parallel, emails inserted in bulk</li>
                     <li><strong>Smart Caching:</strong> BloomFilter reduces duplicate checks by ~90%</li>
+                    <li><strong>ETA Calculation:</strong> Real-time estimated time to completion based on current processing rate</li>
                 </ol>
                 <p style="margin-top: 15px;">
                     <strong>⚡ Performance Optimizations:</strong>
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
                     <li><strong>Non-Blocking I/O:</strong> FastCGI finish request for instant client disconnect</li>
-                    <li><strong>Automatic Worker Scaling:</strong> Optimal workers based on job size (up to 1000)</li>
+                    <li><strong>Automatic Worker Scaling:</strong> 50 workers per 1000 emails (up to 1000 workers cap)</li>
                     <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections per worker with curl_multi</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support</li>
                     <li><strong>Memory Caching:</strong> 10K-item BloomFilter cache in memory</li>
                     <li><strong>Bulk Database Operations:</strong> Batch inserts for maximum throughput</li>
                     <li><strong>Rate Limiting:</strong> Configurable (default 0.1s) with parallel processing</li>
+                    <li><strong>Dynamic ETA:</strong> Live calculation of estimated completion time and processing rate</li>
                 </ul>
                 <p style="margin-top: 15px; padding: 15px; background: #f0fff4; border-left: 4px solid #10b981; border-radius: 4px;">
-                    <strong>✨ SendGrid-Style Experience:</strong> Click "🚀 Start Extraction" and get instant feedback. The UI responds immediately, workers process in background, and you see live progress updates every 3 seconds. You can even navigate away and come back later - your job continues running!
+                    <strong>✨ SendGrid-Style Experience:</strong> Click "🚀 Start Extraction" and get instant feedback. The UI responds immediately, workers process in background, and you see live progress updates every 3 seconds with ETA. You can even navigate away and come back later - your job continues running!
                 </p>
             </div>
             
@@ -4197,7 +4315,7 @@ class Router {
                             alertArea.innerHTML = `
                                 <div class="alert alert-success" style="margin-bottom: 20px;">
                                     <strong>✓ Job #${data.job_id} created successfully in ${responseTime}ms!</strong><br>
-                                    <small>Workers spawned: ${data.worker_count} | Status updates every 3 seconds</small>
+                                    <small>Workers spawned: ${data.worker_count} (Formula: 50 workers per 1000 emails) | Status updates every 3 seconds</small>
                                 </div>
                                 <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
                                     <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
@@ -4222,6 +4340,24 @@ class Router {
                                         <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
                                             <div style="font-size: 20px; font-weight: bold;" id="live-job-status">starting</div>
                                             <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 10px;">
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-eta">Calculating...</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⏱️ ETA</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-elapsed">0s</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⏰ Elapsed</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-rate">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⚡ Emails/Min</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-remaining">-</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">📩 Remaining</div>
                                         </div>
                                     </div>
                                     <div style="margin-top: 15px; text-align: right;">
@@ -4345,13 +4481,35 @@ class Router {
                     const workers = status.active_workers || 0;
                     const jobStatus = status.job ? status.job.status : 'running';
                     
-                    // Update UI elements
+                    // Update basic UI elements
                     document.getElementById('live-progress-bar').style.width = percentage + '%';
                     document.getElementById('live-progress-text').textContent = percentage + '%';
-                    document.getElementById('live-emails-collected').textContent = collected;
-                    document.getElementById('live-emails-target').textContent = target;
+                    document.getElementById('live-emails-collected').textContent = collected.toLocaleString();
+                    document.getElementById('live-emails-target').textContent = target.toLocaleString();
                     document.getElementById('live-active-workers').textContent = workers;
                     document.getElementById('live-job-status').textContent = jobStatus;
+                    
+                    // Update ETA information if available
+                    if (status.eta) {
+                        const eta = status.eta;
+                        const etaElement = document.getElementById('live-eta');
+                        const elapsedElement = document.getElementById('live-elapsed');
+                        const rateElement = document.getElementById('live-rate');
+                        const remainingElement = document.getElementById('live-remaining');
+                        
+                        if (etaElement) {
+                            etaElement.textContent = eta.eta_formatted || 'Calculating...';
+                        }
+                        if (elapsedElement) {
+                            elapsedElement.textContent = eta.elapsed_formatted || '0s';
+                        }
+                        if (rateElement) {
+                            rateElement.textContent = eta.emails_per_minute ? eta.emails_per_minute.toFixed(1) : '0';
+                        }
+                        if (remainingElement) {
+                            remainingElement.textContent = eta.remaining_emails ? eta.remaining_emails.toLocaleString() : '0';
+                        }
+                    }
                 }
             </script>
             <?php
@@ -4575,9 +4733,11 @@ class Router {
                     <strong>⚡ Automatic Worker Spawning:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ System automatically spawns optimal workers based on job size (up to 1000)</li>
+                    <li>✅ <strong>Formula:</strong> 50 workers per 1000 emails (20 emails per worker)</li>
+                    <li>✅ <strong>Examples:</strong> 1,000 emails → 50 workers | 10,000 emails → 500 workers | 1,000,000 emails → 1,000 workers (capped)</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
-                    <li>✅ Workers scale dynamically for maximum performance</li>
+                    <li>✅ Workers scale dynamically for maximum parallel performance</li>
+                    <li>✅ <strong>Target:</strong> Process 1,000,000 emails in ≤10 minutes</li>
                 </ul>
                 <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
@@ -4587,6 +4747,7 @@ class Router {
                     <li>✅ <strong>Bulk operations</strong> for database inserts and email validation</li>
                     <li>✅ <strong>In-memory caching</strong> for BloomFilter (10K item cache)</li>
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
+                    <li>✅ <strong>Real-time ETA</strong> calculation based on processing rate</li>
                     <li>✅ Automatic performance tracking and error logging</li>
                 </ul>
             </div>
