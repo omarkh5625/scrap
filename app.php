@@ -2217,19 +2217,25 @@ class Router {
                         $country = !empty($_POST['country']) ? $_POST['country'] : null;
                         $emailFilter = $_POST['email_filter'] ?? 'all';
                         
+                        // Get worker count from user input, or calculate if not provided
+                        $workerCount = isset($_POST['worker_count']) && $_POST['worker_count'] > 0 
+                            ? (int)$_POST['worker_count'] 
+                            : Worker::calculateOptimalWorkerCount($maxResults);
+                        
+                        // Ensure worker count is within valid range
+                        $workerCount = max(1, min(1000, $workerCount));
+                        
                         if (empty($query) || empty($apiKey)) {
                             header('Content-Type: application/json');
                             echo json_encode(['success' => false, 'error' => 'Query and API Key are required']);
                             break;
                         }
                         
-                        // Calculate optimal worker count (up to 1000)
-                        $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
-                        
                         // Create job - this should be fast (< 100ms)
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
-                        // Create queue items - also fast (< 100ms for bulk insert)
+                        // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
+                        // This divides the work among workers so they search in parallel without duplication
                         self::createQueueItems($jobId, $workerCount);
                         
                         // Return success IMMEDIATELY to prevent UI hanging
@@ -2833,8 +2839,13 @@ class Router {
                     $country = !empty($_POST['country']) ? $_POST['country'] : null;
                     $emailFilter = $_POST['email_filter'] ?? 'all';
                     
-                    // Automatically calculate optimal worker count based on job size
-                    $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
+                    // Get worker count from user input, or calculate if not provided
+                    $workerCount = isset($_POST['worker_count']) && $_POST['worker_count'] > 0 
+                        ? (int)$_POST['worker_count'] 
+                        : Worker::calculateOptimalWorkerCount($maxResults);
+                    
+                    // Ensure worker count is within valid range
+                    $workerCount = max(1, min(1000, $workerCount));
                     
                     // Validate required fields
                     if (!$query || !$apiKey) {
@@ -2843,7 +2854,8 @@ class Router {
                         // Create job for immediate processing
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
-                        // Prepare queue items but DON'T spawn workers yet
+                        // Prepare queue items with specified worker count
+                        // This divides the work among workers so they search in parallel without duplication
                         self::createQueueItems($jobId, $workerCount);
                         
                         // Send redirect response immediately (don't block UI)
@@ -2950,6 +2962,15 @@ class Router {
                         </div>
                         
                         <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Worker Count *</label>
+                            <input type="number" name="worker_count" id="dashboard-worker-count" value="100" min="1" max="1000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Number of parallel workers (1-1000)</small>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
                             <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Email Filter</label>
                             <select name="email_filter" id="dashboard-email-filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
                                 <option value="all">All Types</option>
@@ -2959,19 +2980,25 @@ class Router {
                             </select>
                             <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Business emails have higher value</small>
                         </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
+                            <select name="country" id="dashboard-country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                                <option value="">All Countries</option>
+                                <option value="us">🇺🇸 United States</option>
+                                <option value="uk">🇬🇧 United Kingdom</option>
+                                <option value="ca">🇨🇦 Canada</option>
+                                <option value="au">🇦🇺 Australia</option>
+                                <option value="de">🇩🇪 Germany</option>
+                                <option value="fr">🇫🇷 France</option>
+                            </select>
+                        </div>
                     </div>
                     
-                    <div style="margin-bottom: 15px;">
-                        <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
-                        <select name="country" id="dashboard-country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
-                            <option value="">All Countries</option>
-                            <option value="us">🇺🇸 United States</option>
-                            <option value="uk">🇬🇧 United Kingdom</option>
-                            <option value="ca">🇨🇦 Canada</option>
-                            <option value="au">🇦🇺 Australia</option>
-                            <option value="de">🇩🇪 Germany</option>
-                            <option value="fr">🇫🇷 France</option>
-                        </select>
+                    <div style="margin-bottom: 15px; padding: 12px; background: rgba(255,255,255,0.1); border-radius: 6px;">
+                        <small style="color: rgba(255,255,255,0.9); font-size: 11px;">
+                            💡 <strong>Tip:</strong> More workers = faster extraction. Each worker searches in parallel without duplication.
+                        </small>
                     </div>
                     
                     <button type="submit" id="dashboard-submit-btn" class="btn btn-large" 
@@ -4032,6 +4059,12 @@ class Router {
                         <label>Maximum Emails</label>
                         <input type="number" name="max_results" id="max_results" value="100" min="1" max="100000">
                         <small>Target number of emails to extract (1-100,000)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Worker Count</label>
+                        <input type="number" name="worker_count" id="worker_count" value="50" min="1" max="1000" required>
+                        <small>Number of parallel workers (1-1000). More workers = faster extraction without search duplication.</small>
                     </div>
                     
                     <div class="form-group">
