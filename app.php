@@ -2157,10 +2157,17 @@ class Router {
                 $jobId = (int)($_POST['job_id'] ?? 0);
                 
                 if ($jobId > 0) {
-                    // Get job details to calculate optimal worker count
+                    // Get job details to get stored worker count
                     $job = Job::getById($jobId);
                     if ($job) {
-                        $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                        // Use the worker count specified when the job was created
+                        // This respects the user's input from the UI
+                        $workerCount = isset($job['worker_count']) && $job['worker_count'] > 0
+                            ? (int)$job['worker_count']
+                            : Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                        
+                        // Ensure worker count is within valid range
+                        $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                     } else {
                         // Default fallback to at least 1 worker
                         $workerCount = 1;
@@ -3730,6 +3737,8 @@ class Router {
     
     private static function autoSpawnWorkers(int $workerCount): void {
         error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
+        error_log("autoSpawnWorkers: Current PHP version: " . PHP_VERSION);
+        error_log("autoSpawnWorkers: PHP_BINARY: " . PHP_BINARY);
         
         // For restricted hosting environments (exec disabled, no cron), 
         // process work directly in background after closing connection
@@ -3737,8 +3746,10 @@ class Router {
         
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
+        error_log("autoSpawnWorkers: exec() available: " . ($execAvailable ? 'YES' : 'NO'));
+        
         if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method");
+            error_log("autoSpawnWorkers: Using exec() method to spawn workers");
             // Method 1: Spawn background PHP processes (only if exec available)
             self::spawnWorkersViaExec($workerCount);
         } else {
@@ -3747,11 +3758,17 @@ class Router {
             error_log("autoSpawnWorkers: exec() not available, using direct background processing");
             self::processWorkersInBackground($workerCount);
         }
+        
+        error_log("autoSpawnWorkers: Completed worker spawning for {$workerCount} workers");
     }
     
     private static function spawnWorkersViaExec(int $workerCount): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
+        
+        error_log("spawnWorkersViaExec: Starting to spawn {$workerCount} workers using exec()");
+        error_log("spawnWorkersViaExec: PHP Binary: {$phpBinary}");
+        error_log("spawnWorkersViaExec: Script Path: {$scriptPath}");
         
         for ($i = 0; $i < $workerCount; $i++) {
             // Build command to run worker in queue mode
@@ -3772,8 +3789,10 @@ class Router {
                 exec($cmd);
             }
             
-            error_log("Spawned worker: {$workerName}");
+            error_log("spawnWorkersViaExec: Spawned worker #{$i}: {$workerName} with command: {$cmd}");
         }
+        
+        error_log("spawnWorkersViaExec: Completed spawning {$workerCount} workers");
     }
     
     private static function spawnWorkersViaHttp(int $workerCount): int {
