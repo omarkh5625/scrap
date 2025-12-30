@@ -1171,6 +1171,12 @@ class Worker {
      * Formula: 50 workers per 1000 emails
      * Target: Process 1,000,000 emails in ≤10 minutes
      * Automatically determines the best number of workers for maximum performance
+     * 
+     * Examples:
+     * - 1,000 emails = 50 workers
+     * - 10,000 emails = 500 workers
+     * - 100,000 emails = 1,000 workers (capped at AUTO_MAX_WORKERS)
+     * - 1,000,000 emails = 1,000 workers (calculated 50,000, but capped at AUTO_MAX_WORKERS)
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
         // Calculate based on the formula: 50 workers per 1000 emails
@@ -1216,8 +1222,8 @@ class Worker {
         $currentTime = time();
         $elapsedSeconds = $currentTime - $createdAt;
         
-        // Avoid division by zero
-        if ($elapsedSeconds <= 0 || $emailsCollected <= 0) {
+        // Avoid division by zero and handle jobs that just started
+        if ($elapsedSeconds < 1 || $emailsCollected <= 0) {
             return [
                 'eta_seconds' => 0,
                 'eta_formatted' => 'Calculating...',
@@ -1326,6 +1332,10 @@ class Worker {
      */
     private static function convertToBytes(string $value): int {
         $value = trim($value);
+        if (empty($value)) {
+            return 0;
+        }
+        
         $last = strtolower($value[strlen($value)-1]);
         $value = (int)$value;
         

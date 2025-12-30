@@ -1,5 +1,6 @@
-# Test files
-test_*.php
+# Test files (exclude temporary test outputs, but keep test scripts)
+test_output_*.php
+test_results_*.txt
 
 # PHP errors
 php_errors.log
