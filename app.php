@@ -3957,17 +3957,29 @@ class Router {
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         $procOpenAvailable = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
         
+        $workersSpawned = false;
+        
         if ($execAvailable) {
             error_log("autoSpawnWorkers: Using exec() method for parallel workers");
             // Method 1: Spawn background PHP processes using exec (best performance)
             self::spawnWorkersViaExec($workerCount, $jobId);
+            $workersSpawned = true;
         } else if ($procOpenAvailable) {
             error_log("autoSpawnWorkers: exec() not available, using proc_open() for parallel workers");
             // Method 2: Spawn background PHP processes using proc_open (cPanel compatible)
-            self::spawnWorkersViaProcOpen($workerCount, $jobId);
-        } else {
+            try {
+                self::spawnWorkersViaProcOpen($workerCount, $jobId);
+                $workersSpawned = true;
+            } catch (Exception $e) {
+                error_log("autoSpawnWorkers: proc_open() failed: " . $e->getMessage());
+                $workersSpawned = false;
+            }
+        }
+        
+        // If proc_open or exec didn't work, try HTTP
+        if (!$workersSpawned) {
             // Method 3: Try HTTP-based spawning for true parallel workers
-            error_log("autoSpawnWorkers: exec() and proc_open() not available, trying HTTP method for parallel workers");
+            error_log("autoSpawnWorkers: Trying HTTP method for parallel workers");
             $successCount = self::spawnWorkersViaHttp($workerCount, $jobId);
             
             // Method 4: Fallback to direct background processing if HTTP also fails
@@ -4019,58 +4031,58 @@ class Router {
         
         error_log("spawnWorkersViaProcOpen: Spawning {$workerCount} workers using proc_open()" . ($jobId ? " for job {$jobId}" : ""));
         
+        $spawnedCount = 0;
+        
         for ($i = 0; $i < $workerCount; $i++) {
-            // Build command to run worker in queue mode
-            // Include job_id if specified so worker only processes that job
-            $workerName = 'proc-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
-            
-            // Build command arguments
-            $args = [$phpBinary, $scriptPath, $workerName];
-            if ($jobId !== null) {
-                $args[] = (string)$jobId;
-            }
-            
-            // Build command string for proc_open
-            $cmd = implode(' ', array_map('escapeshellarg', $args));
-            
-            // Descriptors for proc_open (redirect stdin, stdout, stderr to /dev/null)
-            $descriptors = [
-                0 => ['pipe', 'r'],  // stdin
-                1 => ['file', '/dev/null', 'w'],  // stdout
-                2 => ['file', '/dev/null', 'w']   // stderr
-            ];
-            
-            // For Windows, use different null device
-            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-                $descriptors = [
-                    0 => ['pipe', 'r'],
-                    1 => ['file', 'NUL', 'w'],
-                    2 => ['file', 'NUL', 'w']
-                ];
-                $cmd = "start /B " . $cmd;
-            } else {
-                // Add background operator for Unix/Linux
-                $cmd .= ' > /dev/null 2>&1 &';
-            }
-            
-            // Spawn process
-            $process = proc_open($cmd, $descriptors, $pipes);
-            
-            if (is_resource($process)) {
-                // Close stdin pipe if it was created
-                if (isset($pipes[0])) {
-                    fclose($pipes[0]);
+            try {
+                // Build command to run worker in queue mode
+                // Include job_id if specified so worker only processes that job
+                $workerName = 'proc-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                
+                // Build command arguments
+                $args = [$phpBinary, $scriptPath, $workerName];
+                if ($jobId !== null) {
+                    $args[] = (string)$jobId;
                 }
                 
-                // Don't wait for the process - let it run in background
-                // proc_close would wait, so we just leave it running
-                error_log("spawnWorkersViaProcOpen: Spawned worker {$i}/{$workerCount}: {$workerName}");
-            } else {
-                error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
+                // Descriptors for proc_open (redirect stdin, stdout, stderr to /dev/null)
+                $descriptors = [
+                    0 => ['pipe', 'r'],  // stdin
+                    1 => ['file', '/dev/null', 'w'],  // stdout
+                    2 => ['file', '/dev/null', 'w']   // stderr
+                ];
+                
+                // For Windows, use different null device
+                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                    $descriptors = [
+                        0 => ['pipe', 'r'],
+                        1 => ['file', 'NUL', 'w'],
+                        2 => ['file', 'NUL', 'w']
+                    ];
+                }
+                
+                // Spawn process - pass args directly for better compatibility
+                $process = proc_open($args, $descriptors, $pipes, null, null, ['bypass_shell' => true]);
+                
+                if (is_resource($process)) {
+                    // Close stdin pipe if it was created
+                    if (isset($pipes[0]) && is_resource($pipes[0])) {
+                        fclose($pipes[0]);
+                    }
+                    
+                    // Don't call proc_close - let it run in background
+                    // The process will continue running even after parent terminates
+                    $spawnedCount++;
+                    error_log("spawnWorkersViaProcOpen: Spawned worker {$spawnedCount}/{$workerCount}: {$workerName}");
+                } else {
+                    error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
+                }
+            } catch (Exception $e) {
+                error_log("spawnWorkersViaProcOpen: Exception spawning worker {$i}: " . $e->getMessage());
             }
         }
         
-        error_log("spawnWorkersViaProcOpen: Completed spawning {$workerCount} workers");
+        error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
     }
     
     private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
