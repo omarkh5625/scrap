@@ -870,8 +870,12 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
             $errorMsg = $result['error'] ?? 'Unknown error';
             error_log("PERFORM_EXTRACTION: Extraction failed: {$errorMsg}");
             error_log("PERFORM_EXTRACTION: Full error details: " . json_encode($result));
+            // Store complete error message + full API log for UI display
+            $apiLog = isset($result['log']) ? implode("\n", $result['log']) : '';
+            $fullError = $errorMsg . "\n\n--- API Log ---\n" . $apiLog;
+            
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
-            $stmt->execute([$errorMsg, $jobId]);
+            $stmt->execute([$fullError, $jobId]);
             error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log'] ?? []));
             throw new Exception("API extraction failed: {$errorMsg}");
         }
@@ -1137,10 +1141,12 @@ function extract_emails_serper(string $apiKey, string $query, string $country = 
     curl_close($ch);
     
     $log[] = 'HTTP Code: ' . $httpCode;
+    $log[] = 'Response length: ' . strlen($response) . ' bytes';
+    $log[] = 'First 500 chars of response: ' . substr($response, 0, 500);
     
     if ($httpCode !== 200) {
-        $log[] = 'API error response: ' . substr($response, 0, 200);
-        return ['success' => false, 'error' => 'API returned HTTP ' . $httpCode, 'log' => $log];
+        $log[] = 'FULL ERROR RESPONSE: ' . $response;
+        return ['success' => false, 'error' => "HTTP $httpCode: " . substr($response, 0, 200), 'log' => $log];
     }
     
     $data = json_decode($response, true);
@@ -7630,26 +7636,43 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
 
               <!-- Error Alert Display - Shows Actual Error Message -->
               <?php if (!empty($job['error_message'])): ?>
-              <div class="card" style="margin-bottom:18px; border-left:4px solid #dc3545; background:#f8d7da;">
+              <div class="card" style="margin-bottom:20px; border-left:4px solid #dc3545; background:#f8d7da;">
                 <div style="padding:20px;">
-                  <h3 style="margin:0 0 12px 0; color:#721c24; font-size:18px;">⚠️ Extraction Failed</h3>
-                  <p style="margin:0 0 12px 0; color:#721c24;">The extraction job did not complete successfully.</p>
+                  <h3 style="margin:0 0 15px 0; color:#721c24; font-size:20px;">⚠️ Extraction Failed - Complete Diagnostic Information</h3>
                   
-                  <!-- Actual Error Message Box -->
-                  <div style="background:#fff; padding:12px; border:1px solid #f5c6cb; border-radius:4px; margin:12px 0;">
-                    <strong style="color:#721c24;">Error Details:</strong>
-                    <pre style="color:#dc3545; margin:8px 0; font-family:monospace; font-size:14px; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars($job['error_message']); ?></pre>
+                  <!-- Full Error Message + API Log Box -->
+                  <div style="background:#fff; padding:15px; border:1px solid #f5c6cb; border-radius:4px; margin:15px 0; max-height:400px; overflow-y:auto;">
+                    <strong style="display:block; margin-bottom:10px; color:#721c24;">Full Error Details + API Log:</strong>
+                    <pre style="color:#721c24; margin:0; padding:10px; background:#f9f9f9; border:1px solid #e0e0e0; border-radius:3px; font-family:monospace; font-size:13px; line-height:1.5; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars($job['error_message']); ?></pre>
                   </div>
                   
-                  <div style="margin:12px 0;">
-                    <strong style="color:#721c24;">Common causes:</strong>
-                    <ul style="margin:8px 0; padding-left:20px; color:#721c24;">
-                      <li>Invalid or expired serper.dev API key</li>
-                      <li>API rate limit exceeded (check your subscription plan)</li>
-                      <li>Network connection timeout or firewall blocking</li>
-                      <li>Malformed search query or invalid parameters</li>
-                      <li>Server PHP configuration issues (curl not enabled)</li>
+                  <!-- Collapsible Error Code Meanings -->
+                  <details style="margin:15px 0; cursor:pointer;">
+                    <summary style="font-weight:bold; color:#721c24; cursor:pointer; padding:10px; background:#fef5f6; border-radius:3px; border:1px solid #f5c6cb;">📖 Error Code Meanings (Click to expand)</summary>
+                    <ul style="margin:10px 0 0 0; padding:10px 10px 10px 35px; background:#fff; border-radius:3px; color:#721c24;">
+                      <li style="margin:6px 0;"><strong>HTTP 401</strong> = Invalid or expired API key</li>
+                      <li style="margin:6px 0;"><strong>HTTP 429</strong> = Rate limit exceeded (too many requests)</li>
+                      <li style="margin:6px 0;"><strong>HTTP 500</strong> = serper.dev server error</li>
+                      <li style="margin:6px 0;"><strong>cURL error</strong> = Network connectivity problem</li>
+                      <li style="margin:6px 0;"><strong>Invalid JSON</strong> = Malformed API response</li>
+                      <li style="margin:6px 0;"><strong>Connection timeout</strong> = Server can't reach serper.dev (firewall/network issue)</li>
                     </ul>
+                  </details>
+                  
+                  <div style="margin:15px 0;">
+                    <strong style="display:block; margin-bottom:8px; color:#721c24;">🔧 Troubleshooting Steps:</strong>
+                    <ol style="margin:0; padding-left:25px; color:#721c24;">
+                      <li style="margin:5px 0;">Copy the full error details shown above</li>
+                      <li style="margin:5px 0;">Verify your API key at <a href="https://serper.dev/dashboard" target="_blank" style="color:#721c24; text-decoration:underline;">serper.dev/dashboard</a></li>
+                      <li style="margin:5px 0;">Test your search query at <a href="https://serper.dev/playground" target="_blank" style="color:#721c24; text-decoration:underline;">serper.dev/playground</a></li>
+                      <li style="margin:5px 0;">Check your API usage and remaining quota</li>
+                      <li style="margin:5px 0;">Verify your server has internet connectivity to serper.dev</li>
+                      <li style="margin:5px 0;">Check error.log file on server for additional technical details</li>
+                    </ol>
+                  </div>
+                </div>
+              </div>
+              <?php endif; ?>
                   </div>
                   <div style="margin:12px 0;">
                     <strong style="color:#721c24;">Next steps:</strong>
