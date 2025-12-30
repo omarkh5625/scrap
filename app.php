@@ -232,62 +232,20 @@ if (PHP_SAPI === 'cli' && isset($argv) && count($argv) > 1) {
             try {
                 $job = get_job($pdo, $jobId);
                 if ($job && !empty($job['profile_id'])) {
-                    // Update status to extracting
-                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
-                    $stmt->execute([$jobId]);
-                    
                     // Get profile information
                     $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
                     $profile_stmt->execute([$job['profile_id']]);
                     $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
                     
                     if ($profile) {
-                        // Use target from job or profile
-                        $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)$profile['target_count'];
-                        
-                        // Call serper.dev API to extract emails
-                        $result = extract_emails_serper(
-                            $profile['api_key'],
-                            $profile['search_query'],
-                            $profile['country'] ?? '',
-                            (bool)($profile['filter_business_only'] ?? true),
-                            $targetCount
-                        );
-                        
-                        if ($result['success']) {
-                            // Store extracted emails
-                            $extractedCount = 0;
-                            foreach ($result['emails'] as $email) {
-                                try {
-                                    $stmt = $pdo->prepare("INSERT INTO extracted_emails (job_id, email, source) VALUES (?, ?, ?)");
-                                    $stmt->execute([$jobId, $email, $profile['search_query']]);
-                                    $extractedCount++;
-                                    
-                                    // Update progress periodically
-                                    if ($extractedCount % 10 === 0) {
-                                        $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
-                                        $stmt->execute([$extractedCount, $jobId]);
-                                    }
-                                } catch (Exception $e) {
-                                    error_log("Failed to store email: " . $e->getMessage());
-                                }
-                            }
-                            
-                            // Mark as completed
-                            $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW() WHERE id = ?");
-                            $stmt->execute([$extractedCount, $jobId]);
-                        } else {
-                            // API call failed
-                            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'failed' WHERE id = ?");
-                            $stmt->execute([$jobId]);
-                            error_log("Extraction failed for job {$jobId}: " . ($result['error'] ?? 'Unknown error'));
-                        }
+                        // Perform extraction using the shared function
+                        perform_extraction($pdo, $jobId, $job, $profile);
                     }
                 }
             } catch (Exception $e) {
                 error_log("Background extraction worker failed for job {$jobId}: " . $e->getMessage());
                 try {
-                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'failed' WHERE id = ?");
+                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error' WHERE id = ?");
                     $stmt->execute([$jobId]);
                 } catch (Exception $e2) {}
             }
@@ -864,6 +822,82 @@ function spawn_extraction_worker(PDO $pdo, int $jobId): bool {
         }
     }
     return false;
+}
+
+/**
+ * Perform email extraction for a job (called from fastcgi_finish_request or background worker)
+ * This is the core extraction logic, similar to send_campaign_real in the old system
+ */
+function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
+    try {
+        // Update status to extracting
+        $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
+        $stmt->execute([$jobId]);
+        
+        // Get extraction parameters
+        $apiKey = $profile['api_key'] ?? '';
+        $searchQuery = $profile['search_query'] ?? '';
+        $country = $profile['country'] ?? '';
+        $businessOnly = !empty($profile['business_only']);
+        $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)($profile['target_count'] ?? 100);
+        
+        if (empty($apiKey) || empty($searchQuery)) {
+            throw new Exception("API key or search query is missing");
+        }
+        
+        // Call serper.dev API to extract emails
+        $result = extract_emails_serper($apiKey, $searchQuery, $country, $businessOnly, $targetCount);
+        
+        if (!$result['success']) {
+            // Mark job as failed
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', progress_extracted = 0 WHERE id = ?");
+            $stmt->execute([$jobId]);
+            error_log("Job {$jobId} extraction failed: " . implode('; ', $result['log']));
+            return;
+        }
+        
+        $extractedEmails = $result['emails'] ?? [];
+        $extractedCount = 0;
+        
+        // Store extracted emails in database
+        foreach ($extractedEmails as $emailData) {
+            try {
+                $stmt = $pdo->prepare("INSERT INTO extracted_emails (job_id, email, source, extracted_at) VALUES (?, ?, ?, NOW())");
+                $stmt->execute([
+                    $jobId,
+                    $emailData['email'],
+                    $emailData['source'] ?? ''
+                ]);
+                $extractedCount++;
+                
+                // Update progress every 10 emails
+                if ($extractedCount % 10 === 0) {
+                    $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
+                    $stmt->execute([$extractedCount, $jobId]);
+                }
+            } catch (Exception $e) {
+                // Skip duplicate emails (unique constraint violation)
+                continue;
+            }
+        }
+        
+        // Mark job as completed
+        $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$extractedCount, $jobId]);
+        
+        error_log("Job {$jobId} completed successfully. Extracted {$extractedCount} emails.");
+        
+    } catch (Throwable $e) {
+        // Mark job as failed
+        try {
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error' WHERE id = ?");
+            $stmt->execute([$jobId]);
+        } catch (Exception $e2) {
+            // Ignore
+        }
+        error_log("Job {$jobId} extraction error: " . $e->getMessage());
+        throw $e;
+    }
 }
 
 /**
@@ -4648,7 +4682,7 @@ if ($action === 'start_job') {
         $job = get_job($pdo, $job_id);
         if ($job && !empty($job['profile_id'])) {
             try {
-                // Get profile information to set progress_total
+                // Get profile information
                 $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
                 $profile_stmt->execute([$job['profile_id']]);
                 $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
@@ -4657,32 +4691,59 @@ if ($action === 'start_job') {
                     // Use target from job or profile
                     $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)$profile['target_count'];
                     
-                    // Update job status to queued and set progress tracking
-                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'queued', progress_status = 'queued', progress_total = ?, started_at = NOW() WHERE id = ?");
+                    // Update job status to extracting immediately (like old "sending" status)
+                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting', progress_total = ?, started_at = NOW() WHERE id = ?");
                     $stmt->execute([$targetCount, $job_id]);
                     
-                    // Log for debugging
-                    error_log("Job {$job_id} status updated to queued, spawning worker...");
+                    $redirect = "?page=list&started_job=" . (int)$job_id;
                     
-                    // Spawn background extraction worker
-                    $spawned = spawn_extraction_worker($pdo, $job_id);
+                    // Close session to allow immediate redirect
+                    session_write_close();
                     
-                    error_log("Job {$job_id} worker spawn result: " . ($spawned ? 'SUCCESS' : 'FAILED'));
-                    
-                    if ($spawned) {
-                        // Redirect to jobs list with success message
-                        header("Location: ?page=list&started_job={$job_id}");
-                        exit;
-                    } else {
-                        // Fallback: could not spawn background worker, try synchronous
-                        // Reset status back to draft
-                        $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'draft' WHERE id = ?");
-                        $stmt->execute([$job_id]);
+                    // Use fastcgi_finish_request if available (like old email sending system)
+                    if (function_exists('fastcgi_finish_request')) {
+                        header("Location: $redirect");
+                        echo "<!doctype html><html><body>Extracting emails in background... Redirecting.</body></html>";
+                        @ob_end_flush();
+                        @flush();
+                        fastcgi_finish_request();
                         
-                        error_log("Job {$job_id} worker spawn failed, status reset to draft");
-                        header("Location: ?page=editor&id={$job_id}&error=" . urlencode("Could not start background extraction worker"));
+                        ignore_user_abort(true);
+                        set_time_limit(0);
+                        
+                        // Execute extraction in same process (non-blocking for user)
+                        try {
+                            perform_extraction($pdo, $job_id, $job, $profile);
+                        } catch (Throwable $e) {
+                            error_log("Job extraction error: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
+                            error_log("Stack trace: " . $e->getTraceAsString());
+                        }
                         exit;
                     }
+                    
+                    // Fallback: Try background worker (if fastcgi not available)
+                    $spawned = spawn_extraction_worker($pdo, $job_id);
+                    
+                    if ($spawned) {
+                        header("Location: $redirect");
+                        exit;
+                    }
+                    
+                    // Last resort: synchronous extraction (blocking but works everywhere)
+                    header("Location: $redirect");
+                    echo "<!doctype html><html><body>Extracting emails... Please wait.</body></html>";
+                    @ob_end_flush();
+                    @flush();
+                    
+                    ignore_user_abort(true);
+                    set_time_limit(0);
+                    
+                    try {
+                        perform_extraction($pdo, $job_id, $job, $profile);
+                    } catch (Throwable $e) {
+                        error_log("Job extraction error (blocking): " . $e->getMessage());
+                    }
+                    exit;
                 }
             } catch (Exception $e) {
                 error_log("Failed to start job {$job_id}: " . $e->getMessage());
