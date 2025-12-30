@@ -4238,6 +4238,11 @@ class Router {
             while (!$allWorkersIdle && (time() - $startTime) < $maxRuntime) {
                 $anyWorkerProcessed = false;
                 
+                // Update ALL workers' heartbeats at start of each cycle to prevent stale detection
+                foreach ($workers as $w) {
+                    Worker::updateHeartbeat($w['id'], 'running', $jobId, 0, 0);
+                }
+                
                 // Cycle through all workers in round-robin fashion
                 for ($i = 0; $i < count($workers); $i++) {
                     $worker = &$workers[$i];
@@ -4246,11 +4251,12 @@ class Router {
                     
                     // Skip if this worker has reached its max items
                     if ($worker['processed'] >= $maxItemsPerWorker) {
+                        // Mark as idle if done processing
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         continue;
                     }
                     
                     // Try to get next job from queue
-                    Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
                     $job = Worker::getNextJob($jobId);
                     
                     if ($job) {
