@@ -6734,36 +6734,33 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                         </a>
                       </td>
                       <td><?php echo ucfirst($status); ?>
-                        <?php if ($status === 'sending' || $status === 'queued'): ?>
+                        <?php if ($status === 'sending' || $status === 'queued' || $status === 'extracting'): ?>
                           <div id="progress-bar-<?php echo (int)$c['id']; ?>" style="margin-top:4px;">
                             <div style="background:#eee; height:4px; border-radius:2px; overflow:hidden;">
-                              <div id="progress-fill-<?php echo (int)$c['id']; ?>" style="background:#4CAF50; height:100%; width:0%; transition:width 0.3s;"></div>
+                              <div id="progress-fill-<?php echo (int)$c['id']; ?>" style="background:#4CAF50; height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
                             </div>
                             <div id="progress-text-<?php echo (int)$c['id']; ?>" style="font-size:11px; color:var(--sg-muted); margin-top:2px;">
-                              0% • 0/0 • 0 workers
+                              <?php echo $progress; ?>% • <?php echo $extracted; ?>/<?php echo $target; ?>
                             </div>
                           </div>
                         <?php endif; ?>
                       </td>
-                      <td><?php echo h($c['subject']); ?></td>
-                      <td><?php echo $c['sent_at'] ? h($c['sent_at']) : '—'; ?></td>
-                      <td><?php echo (int)$stats['target']; ?></td>
-                      <td><span id="bounce-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['bounce']; ?></span></td>
-                      <td><span id="delivered-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['delivered']; ?></span></td>
-                      <td><span id="open-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['open']; ?></span></td>
-                      <td><span id="click-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['click']; ?></span></td>
+                      <td><?php echo h($profileName); ?></td>
+                      <td><span id="extracted-<?php echo (int)$c['id']; ?>"><?php echo $extracted; ?></span></td>
+                      <td><?php echo $target; ?></td>
+                      <td><?php echo $progress; ?>%</td>
                       <td><?php echo h($c['created_at'] ?? ''); ?></td>
                       <td>
                         <a class="btn-mini" href="<?php echo $link; ?>">Open</a>
                         <form method="post" style="display:inline;">
-                          <input type="hidden" name="action" value="duplicate_campaign">
-                          <input type="hidden" name="campaign_id" value="<?php echo (int)$c['id']; ?>">
+                          <input type="hidden" name="action" value="duplicate_job">
+                          <input type="hidden" name="job_id" value="<?php echo (int)$c['id']; ?>">
                           <button type="submit" class="btn-mini">Duplicate</button>
                         </form>
                         <form method="post" style="display:inline;">
-                          <input type="hidden" name="action" value="delete_campaign">
-                          <input type="hidden" name="campaign_id" value="<?php echo (int)$c['id']; ?>">
-                          <button type="submit" class="btn-mini" onclick="return confirm('Delete this campaign and its events?');">Delete</button>
+                          <input type="hidden" name="action" value="delete_job">
+                          <input type="hidden" name="job_id" value="<?php echo (int)$c['id']; ?>">
+                          <button type="submit" class="btn-mini" onclick="return confirm('Delete this job and its extracted emails?');">Delete</button>
                         </form>
                       </td>
                     </tr>
@@ -7280,32 +7277,6 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                     $extracted = (int)($job['progress_extracted'] ?? 0);
                     $target = (int)($job['progress_total'] ?? $job['target_count'] ?? 0);
                     $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
-
-                // Per-profile aggregation for this campaign (PHP-side)
-                $profilesAll = get_profiles($pdo);
-                $profilesMap = [];
-                foreach ($profilesAll as $p) $profilesMap[(int)$p['id']] = $p;
-
-                $perProfile = [];
-                try {
-                    $stmtp = $pdo->prepare("SELECT event_type, details FROM events WHERE campaign_id = ?");
-                    $stmtp->execute([$id]);
-                    foreach ($stmtp as $row) {
-                        $etype = $row['event_type'];
-                        $details = json_decode($row['details'], true);
-                        if (!is_array($details)) continue;
-                        $pid = isset($details['profile_id']) ? (int)$details['profile_id'] : 0;
-                        if ($pid <= 0) continue;
-                        if (!isset($perProfile[$pid])) $perProfile[$pid] = ['sent'=>0,'delivered'=>0,'bounces'=>0,'unsubscribes'=>0,'clicks'=>0,'opens'=>0];
-                        // Count sent attempts: delivered + bounce + deferred
-                        if (in_array($etype, ['delivered','bounce','deferred'])) $perProfile[$pid]['sent']++;
-                        if ($etype === 'delivered') $perProfile[$pid]['delivered']++;
-                        if ($etype === 'bounce') $perProfile[$pid]['bounces']++;
-                        if ($etype === 'unsubscribe' || $etype === 'skipped_unsubscribe') $perProfile[$pid]['unsubscribes']++;
-                        if ($etype === 'click') $perProfile[$pid]['clicks']++;
-                        if ($etype === 'open') $perProfile[$pid]['opens']++;
-                    }
-                } catch (Exception $e) {}
             ?>
               <div class="page-title">Job Stats — <?php echo h($job['name']); ?></div>
               <div class="page-subtitle">Extraction results and progress for this job.</div>
