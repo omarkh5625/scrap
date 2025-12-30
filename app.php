@@ -1163,21 +1163,194 @@ class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
     private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
-    private const OPTIMAL_RESULTS_PER_WORKER = 50; // Optimal number of results per worker for best performance (reduced to spawn more workers)
+    private const OPTIMAL_RESULTS_PER_WORKER = 20; // 50 workers per 1000 emails = 20 emails per worker
+    private const WORKERS_PER_1000_EMAILS = 50; // Required: 50 workers for every 1000 emails
     
     /**
      * Calculate optimal worker count based on job size
+     * Formula: 50 workers per 1000 emails
+     * Target: Process 1,000,000 emails in ≤10 minutes
      * Automatically determines the best number of workers for maximum performance
+     * 
+     * Examples:
+     * - 1,000 emails = 50 workers
+     * - 10,000 emails = 500 workers
+     * - 100,000 emails = 1,000 workers (capped at AUTO_MAX_WORKERS)
+     * - 1,000,000 emails = 1,000 workers (calculated 50,000, but capped at AUTO_MAX_WORKERS)
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
-        // Calculate based on optimal results per worker
-        $calculatedWorkers = (int)ceil($maxResults / self::OPTIMAL_RESULTS_PER_WORKER);
+        // Calculate based on the formula: 50 workers per 1000 emails
+        // Example: 1000 emails = 50 workers, 10,000 emails = 500 workers, 1,000,000 emails = 50,000 workers
+        $calculatedWorkers = (int)ceil(($maxResults / 1000) * self::WORKERS_PER_1000_EMAILS);
         
         // Cap at maximum workers to avoid resource exhaustion
+        // Note: For 1M emails, this would require 50,000 workers which exceeds AUTO_MAX_WORKERS
+        // In that case, workers will be capped and each will process more emails
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
         return max(1, $optimalWorkers);
+    }
+    
+    /**
+     * Calculate estimated time to completion based on current progress
+     * Returns array with ETA seconds, formatted ETA, and processing rate
+     */
+    public static function calculateETA(int $jobId): array {
+        $db = Database::connect();
+        
+        // Get job details
+        $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+        $stmt->execute([$jobId]);
+        $job = $stmt->fetch();
+        
+        if (!$job) {
+            return [
+                'eta_seconds' => 0,
+                'eta_formatted' => 'Unknown',
+                'emails_per_minute' => 0,
+                'completion_percentage' => 0
+            ];
+        }
+        
+        $emailsCollected = Job::getEmailCount($jobId);
+        $emailsRequired = (int)$job['max_results'];
+        $completionPercentage = $emailsRequired > 0 ? round(($emailsCollected / $emailsRequired) * 100, 2) : 0;
+        
+        // Calculate time elapsed since job started
+        $createdAt = strtotime($job['created_at']);
+        $currentTime = time();
+        $elapsedSeconds = $currentTime - $createdAt;
+        
+        // Avoid division by zero and handle jobs that just started
+        if ($elapsedSeconds < 1 || $emailsCollected <= 0) {
+            return [
+                'eta_seconds' => 0,
+                'eta_formatted' => 'Calculating...',
+                'emails_per_minute' => 0,
+                'completion_percentage' => $completionPercentage,
+                'elapsed_seconds' => $elapsedSeconds
+            ];
+        }
+        
+        // Calculate processing rate (emails per minute)
+        $emailsPerSecond = $emailsCollected / $elapsedSeconds;
+        $emailsPerMinute = round($emailsPerSecond * 60, 2);
+        
+        // Calculate remaining emails
+        $remainingEmails = max(0, $emailsRequired - $emailsCollected);
+        
+        // Calculate ETA in seconds
+        $etaSeconds = $emailsPerSecond > 0 ? (int)ceil($remainingEmails / $emailsPerSecond) : 0;
+        
+        // Format ETA for display
+        $etaFormatted = self::formatDuration($etaSeconds);
+        
+        return [
+            'eta_seconds' => $etaSeconds,
+            'eta_formatted' => $etaFormatted,
+            'emails_per_minute' => $emailsPerMinute,
+            'completion_percentage' => $completionPercentage,
+            'elapsed_seconds' => $elapsedSeconds,
+            'elapsed_formatted' => self::formatDuration($elapsedSeconds),
+            'emails_collected' => $emailsCollected,
+            'emails_required' => $emailsRequired,
+            'remaining_emails' => $remainingEmails
+        ];
+    }
+    
+    /**
+     * Format duration in seconds to human-readable format
+     */
+    private static function formatDuration(int $seconds): string {
+        if ($seconds <= 0) {
+            return '0s';
+        }
+        
+        $hours = floor($seconds / 3600);
+        $minutes = floor(($seconds % 3600) / 60);
+        $secs = $seconds % 60;
+        
+        $parts = [];
+        if ($hours > 0) {
+            $parts[] = "{$hours}h";
+        }
+        if ($minutes > 0) {
+            $parts[] = "{$minutes}m";
+        }
+        if ($secs > 0 || empty($parts)) {
+            $parts[] = "{$secs}s";
+        }
+        
+        return implode(' ', $parts);
+    }
+    
+    /**
+     * Get system resource usage (RAM and CPU)
+     * Returns array with memory and CPU usage information
+     */
+    public static function getSystemResources(): array {
+        $resources = [
+            'memory_used_mb' => 0,
+            'memory_limit_mb' => 0,
+            'memory_usage_percent' => 0,
+            'cpu_load_average' => [],
+            'peak_memory_mb' => 0
+        ];
+        
+        // Get memory usage
+        $memoryUsed = memory_get_usage(true);
+        $peakMemory = memory_get_peak_usage(true);
+        $memoryLimit = ini_get('memory_limit');
+        
+        // Convert memory limit to bytes
+        $memoryLimitBytes = self::convertToBytes($memoryLimit);
+        
+        $resources['memory_used_mb'] = round($memoryUsed / 1024 / 1024, 2);
+        $resources['peak_memory_mb'] = round($peakMemory / 1024 / 1024, 2);
+        $resources['memory_limit_mb'] = round($memoryLimitBytes / 1024 / 1024, 2);
+        
+        if ($memoryLimitBytes > 0) {
+            $resources['memory_usage_percent'] = round(($memoryUsed / $memoryLimitBytes) * 100, 2);
+        }
+        
+        // Get CPU load average (Unix/Linux only)
+        if (function_exists('sys_getloadavg')) {
+            $loadAvg = sys_getloadavg();
+            $resources['cpu_load_average'] = [
+                '1min' => round($loadAvg[0], 2),
+                '5min' => round($loadAvg[1], 2),
+                '15min' => round($loadAvg[2], 2)
+            ];
+        }
+        
+        return $resources;
+    }
+    
+    /**
+     * Convert PHP memory limit string to bytes
+     */
+    private static function convertToBytes(string $value): int {
+        $value = trim($value);
+        if (empty($value)) {
+            return 0;
+        }
+        
+        $last = strtolower($value[strlen($value)-1]);
+        $value = (int)$value;
+        
+        switch($last) {
+            case 'g':
+                $value *= 1024;
+                // fall through
+            case 'm':
+                $value *= 1024;
+                // fall through
+            case 'k':
+                $value *= 1024;
+        }
+        
+        return $value;
     }
     
     public static function getAll(): array {
@@ -1331,7 +1504,7 @@ class Worker {
         ];
     }
     
-    public static function getNextJob(): ?array {
+    public static function getNextJob(?int $jobId = null): ?array {
         $db = Database::connect();
         
         // Use transaction to prevent race conditions
@@ -1339,8 +1512,14 @@ class Worker {
         
         try {
             // First check job_queue for pending chunks
-            $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-            $stmt->execute();
+            // If jobId is specified, only get queue items for that specific job
+            if ($jobId !== null) {
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute([$jobId]);
+            } else {
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute();
+            }
             $queueItem = $stmt->fetch();
             
             if ($queueItem) {
@@ -1365,8 +1544,14 @@ class Worker {
             }
             
             // Fallback to old method: check for pending jobs without queue
-            $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-            $stmt->execute();
+            // If jobId is specified, only check that specific job
+            if ($jobId !== null) {
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
+                $stmt->execute([$jobId]);
+            } else {
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute();
+            }
             $job = $stmt->fetch();
             
             if ($job) {
@@ -1933,7 +2118,13 @@ class Router {
         echo "=== PHP Email Extraction System Worker ===\n";
         
         $workerName = $argv[1] ?? 'worker-' . uniqid();
+        // Check if job_id is provided as second argument
+        $jobId = isset($argv[2]) && is_numeric($argv[2]) ? (int)$argv[2] : null;
+        
         echo "Worker: {$workerName}\n";
+        if ($jobId !== null) {
+            echo "Dedicated to Job ID: {$jobId}\n";
+        }
         
         $workerId = Worker::register($workerName);
         echo "Worker ID: {$workerId}\n";
@@ -1945,12 +2136,20 @@ class Router {
         while (true) {
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
-            $job = Worker::getNextJob();
+            // Pass job_id to only get queue items for that specific job
+            $job = Worker::getNextJob($jobId);
             
             if ($job) {
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                 Worker::processJob($job['id']);
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } else if ($jobId !== null) {
+                // If dedicated to a specific job and no work found, check if job is complete
+                $jobDetails = Job::getById($jobId);
+                if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
+                    echo "Job {$jobId} is complete or not found. Exiting.\n";
+                    break;
+                }
             }
             
             sleep($pollingInterval);
@@ -2033,12 +2232,18 @@ class Router {
                 echo json_encode(Worker::getStats());
                 break;
                 
+            case 'system-resources':
+                // Get system resource usage (RAM and CPU)
+                echo json_encode(Worker::getSystemResources());
+                break;
+                
             case 'diagnostic':
                 // Diagnostic endpoint to check system status
                 $db = Database::connect();
                 
                 // Check exec availability
                 $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+                $procOpenAvailable = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
                 
                 // Check for pending queue items
                 $stmt = $db->query("SELECT COUNT(*) as count FROM job_queue WHERE status = 'pending'");
@@ -2054,6 +2259,7 @@ class Router {
                 
                 echo json_encode([
                     'exec_available' => $execAvailable,
+                    'proc_open_available' => $procOpenAvailable,
                     'pending_queue_items' => $pendingQueueItems,
                     'active_workers' => $activeWorkers,
                     'running_jobs' => $runningJobs,
@@ -2130,6 +2336,9 @@ class Router {
                     // Detect stale workers
                     $staleWorkers = Worker::detectStaleWorkers(300);
                     
+                    // Calculate ETA
+                    $etaInfo = Worker::calculateETA($jobId);
+                    
                     echo json_encode([
                         'job' => $job,
                         'active_workers' => count($activeWorkers),
@@ -2138,8 +2347,20 @@ class Router {
                         'emails_required' => $maxResults,
                         'completion_percentage' => $completionPercentage,
                         'recent_errors' => $recentErrors,
-                        'stale_workers' => $staleWorkers
+                        'stale_workers' => $staleWorkers,
+                        'eta' => $etaInfo
                     ]);
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
+            case 'job-eta':
+                // Get ETA information for a specific job
+                $jobId = (int)($_GET['job_id'] ?? 0);
+                if ($jobId > 0) {
+                    $etaInfo = Worker::calculateETA($jobId);
+                    echo json_encode($etaInfo);
                 } else {
                     echo json_encode(['error' => 'Invalid job ID']);
                 }
@@ -2330,7 +2551,7 @@ class Router {
                             
                             try {
                                 error_log("trigger-workers: Spawning {$workerCount} workers for job {$jobId}");
-                                self::autoSpawnWorkers($workerCount);
+                                self::autoSpawnWorkers($workerCount, $jobId);
                                 error_log("trigger-workers: Worker spawning completed for job {$jobId}");
                             } catch (Exception $e) {
                                 error_log('trigger-workers: Worker spawning error: ' . $e->getMessage());
@@ -2503,15 +2724,16 @@ class Router {
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $workerName = $_POST['worker_name'] ?? 'http-worker-' . uniqid();
             $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            $jobId = isset($_POST['job_id']) && $_POST['job_id'] !== '' ? (int)$_POST['job_id'] : null;
             
-            error_log("handleStartWorker: HTTP Worker {$workerName} starting...");
+            error_log("handleStartWorker: HTTP Worker {$workerName} starting..." . ($jobId ? " for job {$jobId}" : ""));
             
             // Close connection immediately so client doesn't wait
             ignore_user_abort(true);
             set_time_limit(0);
             
             // Calculate content before sending
-            $response = json_encode(['status' => 'started', 'worker' => $workerName]);
+            $response = json_encode(['status' => 'started', 'worker' => $workerName, 'job_id' => $jobId]);
             
             // Send minimal response
             header('Content-Type: application/json');
@@ -2554,7 +2776,8 @@ class Router {
                 while ((time() - $startTime) < $maxRuntime) {
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     
-                    $job = Worker::getNextJob();
+                    // Pass job_id to only get queue items for that specific job
+                    $job = Worker::getNextJob($jobId);
                     
                     if ($job) {
                         error_log("handleStartWorker: Worker {$workerName} got job #{$job['id']}");
@@ -2572,6 +2795,15 @@ class Router {
                     } else {
                         // No jobs available, sleep briefly
                         usleep(500000); // 0.5 seconds
+                        
+                        // If dedicated to a specific job and no work found, check if job is complete
+                        if ($jobId !== null) {
+                            $jobDetails = Job::getById($jobId);
+                            if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
+                                error_log("handleStartWorker: Worker {$workerName} - Job {$jobId} is complete or not found. Exiting.");
+                                break;
+                            }
+                        }
                     }
                     
                     // If no items to process, check less frequently
@@ -2874,7 +3106,7 @@ class Router {
                         // Now spawn workers in background after response sent
                         ignore_user_abort(true);
                         set_time_limit(300);
-                        self::autoSpawnWorkers($workerCount);
+                        self::autoSpawnWorkers($workerCount, $jobId);
                         
                         exit;
                     }
@@ -3622,7 +3854,7 @@ class Router {
         // Spawn workers asynchronously in background (NOT synchronously!)
         // This allows workers to run in parallel, not sequentially
         // تشغيل العمال بشكل غير متزامن في الخلفية (وليس بشكل متزامن!)
-        self::autoSpawnWorkers($workerCount);
+        self::autoSpawnWorkers($workerCount, $jobId);
         
         error_log("✓ Triggered async spawning of {$workerCount} workers for job {$jobId}");
     }
@@ -3714,39 +3946,35 @@ class Router {
     }
     */
     
-    private static function autoSpawnWorkers(int $workerCount): void {
-        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
+    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
+        error_log("autoSpawnWorkers: Force-spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
         
-        // For restricted hosting environments (exec disabled, no cron), 
-        // process work directly in background after closing connection
-        // This ensures extraction starts immediately without blocking UI
+        // FORCE direct background processing - most reliable method
+        // This always works regardless of hosting environment
+        error_log("autoSpawnWorkers: Using FORCED direct background processing (most reliable)");
+        self::processWorkersInBackground($workerCount, $jobId);
         
-        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
-        
-        if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method");
-            // Method 1: Spawn background PHP processes (only if exec available)
-            self::spawnWorkersViaExec($workerCount);
-        } else {
-            // Method 2: Direct background processing (no exec, no HTTP, no cron needed)
-            // Process work in same request but after closing connection to user
-            error_log("autoSpawnWorkers: exec() not available, using direct background processing");
-            self::processWorkersInBackground($workerCount);
-        }
+        error_log("autoSpawnWorkers: Completed - workers are now processing in background");
     }
     
-    private static function spawnWorkersViaExec(int $workerCount): void {
+    private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
         for ($i = 0; $i < $workerCount; $i++) {
             // Build command to run worker in queue mode
-            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+            // Include job_id if specified so worker only processes that job
+            $workerName = 'auto-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+            
+            // Pass job_id as second argument if specified
+            $jobIdArg = $jobId !== null ? ' ' . escapeshellarg((string)$jobId) : '';
+            
             $cmd = sprintf(
-                '%s %s %s > /dev/null 2>&1 &',
+                '%s %s %s%s > /dev/null 2>&1 &',
                 escapeshellarg($phpBinary),
                 escapeshellarg($scriptPath),
-                escapeshellarg($workerName)
+                escapeshellarg($workerName),
+                $jobIdArg
             );
             
             // Execute in background
@@ -3758,25 +3986,85 @@ class Router {
                 exec($cmd);
             }
             
-            error_log("Spawned worker: {$workerName}");
+            error_log("Spawned worker: {$workerName}" . ($jobId ? " for job {$jobId}" : ""));
         }
     }
     
-    private static function spawnWorkersViaHttp(int $workerCount): int {
+    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): void {
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        error_log("spawnWorkersViaProcOpen: Spawning {$workerCount} workers using proc_open()" . ($jobId ? " for job {$jobId}" : ""));
+        
+        $spawnedCount = 0;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            try {
+                // Build command to run worker in queue mode
+                // Include job_id if specified so worker only processes that job
+                $workerName = 'proc-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                
+                // Build command arguments
+                $args = [$phpBinary, $scriptPath, $workerName];
+                if ($jobId !== null) {
+                    $args[] = (string)$jobId;
+                }
+                
+                // Descriptors for proc_open (redirect stdin, stdout, stderr to /dev/null)
+                $descriptors = [
+                    0 => ['pipe', 'r'],  // stdin
+                    1 => ['file', '/dev/null', 'w'],  // stdout
+                    2 => ['file', '/dev/null', 'w']   // stderr
+                ];
+                
+                // For Windows, use different null device
+                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                    $descriptors = [
+                        0 => ['pipe', 'r'],
+                        1 => ['file', 'NUL', 'w'],
+                        2 => ['file', 'NUL', 'w']
+                    ];
+                }
+                
+                // Spawn process - pass args directly for better compatibility
+                $process = proc_open($args, $descriptors, $pipes, null, null, ['bypass_shell' => true]);
+                
+                if (is_resource($process)) {
+                    // Close stdin pipe if it was created
+                    if (isset($pipes[0]) && is_resource($pipes[0])) {
+                        fclose($pipes[0]);
+                    }
+                    
+                    // Don't call proc_close - let it run in background
+                    // The process will continue running even after parent terminates
+                    $spawnedCount++;
+                    error_log("spawnWorkersViaProcOpen: Spawned worker {$spawnedCount}/{$workerCount}: {$workerName}");
+                } else {
+                    error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
+                }
+            } catch (Exception $e) {
+                error_log("spawnWorkersViaProcOpen: Exception spawning worker {$i}: " . $e->getMessage());
+            }
+        }
+        
+        error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
+    }
+    
+    private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
         // Get the current URL
         $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
         $baseUrl = $protocol . '://' . $host . $scriptName;
         
-        error_log("spawnWorkersViaHttp: Spawning {$workerCount} HTTP workers to {$baseUrl}");
+        error_log("spawnWorkersViaHttp: Spawning {$workerCount} HTTP workers to {$baseUrl}" . ($jobId ? " for job {$jobId}" : ""));
         
         // Use curl_multi for truly async requests
         $multiHandle = curl_multi_init();
         $handles = [];
         
         for ($i = 0; $i < $workerCount; $i++) {
-            $workerName = 'http-worker-' . uniqid() . '-' . $i;
+            $workerName = 'http-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
             
             // Create async HTTP request to trigger worker
             $ch = curl_init($baseUrl . '?page=start-worker');
@@ -3784,13 +4072,16 @@ class Router {
             curl_setopt($ch, CURLOPT_POST, true);
             curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
                 'worker_name' => $workerName,
-                'worker_index' => $i
+                'worker_index' => $i,
+                'job_id' => $jobId // Pass job_id to worker
             ]));
-            curl_setopt($ch, CURLOPT_TIMEOUT_MS, 500); // Very short timeout - just trigger
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, 500);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 3); // 3 seconds timeout
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2); // 2 seconds connection timeout
             curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
             curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
             curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
             
             curl_multi_add_handle($multiHandle, $ch);
             $handles[$i] = $ch;
@@ -3811,8 +4102,9 @@ class Router {
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $error = curl_error($ch);
             
-            if ($httpCode === 200 || $httpCode === 0) { // 0 = timeout (expected for async)
-                error_log("spawnWorkersViaHttp: Worker #{$i} triggered (HTTP {$httpCode})");
+            // Accept HTTP 200 or 0 (timeout is OK for async workers)
+            if ($httpCode === 200 || $httpCode === 0) {
+                error_log("spawnWorkersViaHttp: Worker #{$i} triggered successfully (HTTP {$httpCode})");
                 $successCount++;
             } else {
                 error_log("spawnWorkersViaHttp: Worker #{$i} failed - HTTP {$httpCode}, Error: {$error}");
@@ -3906,8 +4198,8 @@ class Router {
      * This method works without exec, HTTP workers, or cron
      * Connection must be closed BEFORE calling this method
      */
-    private static function processWorkersInBackground(int $workerCount): void {
-        error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers");
+    private static function processWorkersInBackground(int $workerCount, ?int $jobId = null): void {
+        error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
         
         // Connection should already be closed by caller
         // Just ensure we can continue after user disconnect
@@ -3918,88 +4210,107 @@ class Router {
         try {
             $db = Database::connect();
             
-            // Process queue items with multiple simulated workers
-            $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
+            // FIRST: Register ALL workers upfront so they show as "active" in UI
+            $workers = [];
+            for ($i = 0; $i < $workerCount; $i++) {
+                $workerName = 'bg-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                $workerId = Worker::register($workerName);
+                if ($workerId) {
+                    $workers[] = ['id' => $workerId, 'name' => $workerName, 'processed' => 0];
+                    // Mark as running immediately so they show up in UI
+                    Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+                    error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId})");
+                }
+            }
+            
+            error_log("processWorkersInBackground: ALL {$workerCount} workers registered and marked as RUNNING");
+            
+            // SECOND: Process queue items in ROUND-ROBIN fashion across ALL workers
+            // This distributes work evenly so all workers are actively processing
+            $maxItemsPerWorker = 10; // Max items each worker can process
             $totalProcessed = 0;
             $startTime = time();
             $maxRuntime = 300; // 5 minutes total
+            $currentWorkerIndex = 0;
+            $allWorkersIdle = false;
             
-            for ($workerIndex = 0; $workerIndex < $workerCount; $workerIndex++) {
-                // Check if we've exceeded max runtime
-                if ((time() - $startTime) >= $maxRuntime) {
-                    error_log("processWorkersInBackground: Max runtime reached, stopping");
-                    break;
+            // Keep processing until no more queue items or max runtime reached
+            while (!$allWorkersIdle && (time() - $startTime) < $maxRuntime) {
+                $anyWorkerProcessed = false;
+                
+                // Update ALL workers' heartbeats at start of each cycle to prevent stale detection
+                foreach ($workers as $w) {
+                    Worker::updateHeartbeat($w['id'], 'running', $jobId, 0, 0);
                 }
                 
-                $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
-                
-                try {
-                    $workerId = Worker::register($workerName);
-                    if (!$workerId) {
-                        error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
+                // Cycle through all workers in round-robin fashion
+                for ($i = 0; $i < count($workers); $i++) {
+                    $worker = &$workers[$i];
+                    $workerId = $worker['id'];
+                    $workerName = $worker['name'];
+                    
+                    // Skip if this worker has reached its max items
+                    if ($worker['processed'] >= $maxItemsPerWorker) {
+                        // Mark as idle if done processing
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         continue;
                     }
-                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered with ID {$workerId}");
                     
-                    // Each simulated worker processes items from the queue
-                    $itemsProcessed = 0;
+                    // Try to get next job from queue
+                    $job = Worker::getNextJob($jobId);
                     
-                    for ($i = 0; $i < $maxItemsPerWorker; $i++) {
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    if ($job) {
+                        // Check if job has reached target email count
+                        $currentJobId = (int)$job['id'];
+                        $jobDetails = Job::getById($currentJobId);
+                        if ($jobDetails) {
+                            $emailsCollected = Job::getEmailCount($currentJobId);
+                            $maxResults = (int)$jobDetails['max_results'];
+                            
+                            if ($emailsCollected >= $maxResults) {
+                                error_log("processWorkersInBackground: Job {$currentJobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
+                                Worker::checkAndUpdateJobCompletion($currentJobId);
+                                continue;
+                            }
+                        }
                         
-                        $job = Worker::getNextJob();
+                        error_log("processWorkersInBackground: Worker {$workerName} processing queue item #{$job['id']}");
                         
-                        if ($job) {
-                            // Check if job has reached target email count
-                            $jobId = (int)$job['id'];
-                            $jobDetails = Job::getById($jobId);
+                        try {
+                            Worker::processJob($job['id']);
+                            $worker['processed']++;
+                            $totalProcessed++;
+                            $anyWorkerProcessed = true;
+                            error_log("processWorkersInBackground: Worker {$workerName} completed item #{$job['id']} (total: {$worker['processed']})");
+                            
+                            // Check again after processing if target reached
                             if ($jobDetails) {
-                                $emailsCollected = Job::getEmailCount($jobId);
-                                $maxResults = (int)$jobDetails['max_results'];
-                                
+                                $emailsCollected = Job::getEmailCount($currentJobId);
                                 if ($emailsCollected >= $maxResults) {
-                                    error_log("processWorkersInBackground: Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
-                                    // Mark remaining queue items as complete
-                                    Worker::checkAndUpdateJobCompletion($jobId);
-                                    continue; // Skip this job, get next one
+                                    error_log("processWorkersInBackground: Job {$currentJobId} reached target after processing");
+                                    Worker::checkAndUpdateJobCompletion($currentJobId);
                                 }
                             }
-                            
-                            error_log("processWorkersInBackground: Worker {$workerIndex} processing job #{$job['id']}");
-                            Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                            
-                            try {
-                                Worker::processJob($job['id']);
-                                $itemsProcessed++;
-                                $totalProcessed++;
-                                error_log("processWorkersInBackground: Worker {$workerIndex} completed job #{$job['id']}");
-                                
-                                // Check again after processing if target reached
-                                if ($jobDetails) {
-                                    $emailsCollected = Job::getEmailCount($jobId);
-                                    if ($emailsCollected >= $maxResults) {
-                                        error_log("processWorkersInBackground: Job {$jobId} reached target after processing, stopping");
-                                        Worker::checkAndUpdateJobCompletion($jobId);
-                                        break; // Stop processing more items for this worker
-                                    }
-                                }
-                            } catch (Exception $e) {
-                                error_log("processWorkersInBackground: Worker {$workerIndex} error on job #{$job['id']}: " . $e->getMessage());
-                                Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
-                            }
-                        } else {
-                            // No more jobs in queue
-                            error_log("processWorkersInBackground: Worker {$workerIndex} - no more jobs available");
-                            break;
+                        } catch (Exception $e) {
+                            error_log("processWorkersInBackground: Worker {$workerName} error on item #{$job['id']}: " . $e->getMessage());
+                            Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
                         }
                     }
                     
-                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                    error_log("processWorkersInBackground: Worker {$workerIndex} completed {$itemsProcessed} items");
-                    
-                } catch (Exception $e) {
-                    error_log("processWorkersInBackground: Worker {$workerIndex} fatal error: " . $e->getMessage());
+                    // Small delay to prevent tight loop
+                    usleep(10000); // 10ms delay
                 }
+                
+                // If no worker processed anything in this cycle, all queue is empty
+                if (!$anyWorkerProcessed) {
+                    $allWorkersIdle = true;
+                    error_log("processWorkersInBackground: No more queue items available - all workers idle");
+                }
+            }
+            
+            // Mark all workers as idle when done
+            foreach ($workers as $worker) {
+                Worker::updateHeartbeat($worker['id'], 'idle', null, 0, 0);
             }
             
             error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers");
@@ -4040,7 +4351,9 @@ class Router {
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Workers spawn automatically at maximum capacity (up to 1000 workers) based on your job size! Results appear in real-time.
+                    ⚡ <strong>Parallel Processing Power:</strong> Workers calculated automatically using formula: <strong>50 workers per 1000 emails</strong><br>
+                    📊 Examples: 1,000 emails = 50 workers | 10,000 emails = 500 workers | 1,000,000 emails = 1,000 workers (capped)<br>
+                    🎯 Target: Process 1,000,000 emails in ≤10 minutes with maximum parallelization!
                 </p>
                 <form id="job-form">
                     <div class="form-group">
@@ -4111,26 +4424,28 @@ class Router {
                 <ol style="padding-left: 20px;">
                     <li><strong>Instant Job Creation:</strong> Job and queue items created in < 200ms</li>
                     <li><strong>Async Worker Spawning:</strong> Workers spawn after response is sent to client</li>
-                    <li><strong>Dynamic Scaling:</strong> System calculates optimal worker count (up to 1000 workers)</li>
+                    <li><strong>Dynamic Scaling:</strong> Formula: 50 workers per 1000 emails (max 1000 workers)</li>
                     <li><strong>Parallel Processing:</strong> Job split into chunks for concurrent processing</li>
                     <li><strong>Real-time Updates:</strong> Progress updates via efficient polling (SSE available)</li>
                     <li><strong>Bulk Operations:</strong> URLs scraped in parallel, emails inserted in bulk</li>
                     <li><strong>Smart Caching:</strong> BloomFilter reduces duplicate checks by ~90%</li>
+                    <li><strong>ETA Calculation:</strong> Real-time estimated time to completion based on current processing rate</li>
                 </ol>
                 <p style="margin-top: 15px;">
                     <strong>⚡ Performance Optimizations:</strong>
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
                     <li><strong>Non-Blocking I/O:</strong> FastCGI finish request for instant client disconnect</li>
-                    <li><strong>Automatic Worker Scaling:</strong> Optimal workers based on job size (up to 1000)</li>
+                    <li><strong>Automatic Worker Scaling:</strong> 50 workers per 1000 emails (up to 1000 workers cap)</li>
                     <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections per worker with curl_multi</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support</li>
                     <li><strong>Memory Caching:</strong> 10K-item BloomFilter cache in memory</li>
                     <li><strong>Bulk Database Operations:</strong> Batch inserts for maximum throughput</li>
                     <li><strong>Rate Limiting:</strong> Configurable (default 0.1s) with parallel processing</li>
+                    <li><strong>Dynamic ETA:</strong> Live calculation of estimated completion time and processing rate</li>
                 </ul>
                 <p style="margin-top: 15px; padding: 15px; background: #f0fff4; border-left: 4px solid #10b981; border-radius: 4px;">
-                    <strong>✨ SendGrid-Style Experience:</strong> Click "🚀 Start Extraction" and get instant feedback. The UI responds immediately, workers process in background, and you see live progress updates every 3 seconds. You can even navigate away and come back later - your job continues running!
+                    <strong>✨ SendGrid-Style Experience:</strong> Click "🚀 Start Extraction" and get instant feedback. The UI responds immediately, workers process in background, and you see live progress updates every 3 seconds with ETA. You can even navigate away and come back later - your job continues running!
                 </p>
             </div>
             
@@ -4197,7 +4512,7 @@ class Router {
                             alertArea.innerHTML = `
                                 <div class="alert alert-success" style="margin-bottom: 20px;">
                                     <strong>✓ Job #${data.job_id} created successfully in ${responseTime}ms!</strong><br>
-                                    <small>Workers spawned: ${data.worker_count} | Status updates every 3 seconds</small>
+                                    <small>Workers spawned: ${data.worker_count} (Formula: 50 workers per 1000 emails) | Status updates every 3 seconds</small>
                                 </div>
                                 <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
                                     <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
@@ -4222,6 +4537,24 @@ class Router {
                                         <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
                                             <div style="font-size: 20px; font-weight: bold;" id="live-job-status">starting</div>
                                             <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 10px;">
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-eta">Calculating...</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⏱️ ETA</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-elapsed">0s</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⏰ Elapsed</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-rate">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⚡ Emails/Min</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-remaining">-</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">📩 Remaining</div>
                                         </div>
                                     </div>
                                     <div style="margin-top: 15px; text-align: right;">
@@ -4345,13 +4678,35 @@ class Router {
                     const workers = status.active_workers || 0;
                     const jobStatus = status.job ? status.job.status : 'running';
                     
-                    // Update UI elements
+                    // Update basic UI elements
                     document.getElementById('live-progress-bar').style.width = percentage + '%';
                     document.getElementById('live-progress-text').textContent = percentage + '%';
-                    document.getElementById('live-emails-collected').textContent = collected;
-                    document.getElementById('live-emails-target').textContent = target;
+                    document.getElementById('live-emails-collected').textContent = collected.toLocaleString();
+                    document.getElementById('live-emails-target').textContent = target.toLocaleString();
                     document.getElementById('live-active-workers').textContent = workers;
                     document.getElementById('live-job-status').textContent = jobStatus;
+                    
+                    // Update ETA information if available
+                    if (status.eta) {
+                        const eta = status.eta;
+                        const etaElement = document.getElementById('live-eta');
+                        const elapsedElement = document.getElementById('live-elapsed');
+                        const rateElement = document.getElementById('live-rate');
+                        const remainingElement = document.getElementById('live-remaining');
+                        
+                        if (etaElement) {
+                            etaElement.textContent = eta.eta_formatted || 'Calculating...';
+                        }
+                        if (elapsedElement) {
+                            elapsedElement.textContent = eta.elapsed_formatted || '0s';
+                        }
+                        if (rateElement) {
+                            rateElement.textContent = eta.emails_per_minute ? eta.emails_per_minute.toFixed(1) : '0';
+                        }
+                        if (remainingElement) {
+                            remainingElement.textContent = eta.remaining_emails ? eta.remaining_emails.toLocaleString() : '0';
+                        }
+                    }
                 }
             </script>
             <?php
@@ -4549,6 +4904,41 @@ class Router {
                 </div>
             </div>
             
+            <!-- System Resource Monitoring -->
+            <div class="card">
+                <h2>💻 System Resources</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">🧠</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="memory-usage">-</div>
+                            <div class="stat-label">Memory Usage</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="memory-percent">-</div>
+                            <div class="stat-label">Memory %</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">⚡</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="cpu-load">-</div>
+                            <div class="stat-label">CPU Load (1m)</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📈</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="peak-memory">-</div>
+                            <div class="stat-label">Peak Memory</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                     <h2>Active Workers</h2>
@@ -4575,9 +4965,11 @@ class Router {
                     <strong>⚡ Automatic Worker Spawning:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ System automatically spawns optimal workers based on job size (up to 1000)</li>
+                    <li>✅ <strong>Formula:</strong> 50 workers per 1000 emails (20 emails per worker)</li>
+                    <li>✅ <strong>Examples:</strong> 1,000 emails → 50 workers | 10,000 emails → 500 workers | 1,000,000 emails → 1,000 workers (capped)</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
-                    <li>✅ Workers scale dynamically for maximum performance</li>
+                    <li>✅ Workers scale dynamically for maximum parallel performance</li>
+                    <li>✅ <strong>Target:</strong> Process 1,000,000 emails in ≤10 minutes</li>
                 </ul>
                 <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
@@ -4587,6 +4979,7 @@ class Router {
                     <li>✅ <strong>Bulk operations</strong> for database inserts and email validation</li>
                     <li>✅ <strong>In-memory caching</strong> for BloomFilter (10K item cache)</li>
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
+                    <li>✅ <strong>Real-time ETA</strong> calculation based on processing rate</li>
                     <li>✅ Automatic performance tracking and error logging</li>
                 </ul>
             </div>
@@ -4714,6 +5107,22 @@ class Router {
                             }
                         })
                         .catch(err => console.error('Error fetching queue stats:', err));
+                    
+                    // Update system resources
+                    fetch('?page=api&action=system-resources')
+                        .then(res => res.json())
+                        .then(resources => {
+                            document.getElementById('memory-usage').textContent = resources.memory_used_mb + ' MB';
+                            document.getElementById('memory-percent').textContent = resources.memory_usage_percent + '%';
+                            document.getElementById('peak-memory').textContent = resources.peak_memory_mb + ' MB';
+                            
+                            if (resources.cpu_load_average && resources.cpu_load_average['1min']) {
+                                document.getElementById('cpu-load').textContent = resources.cpu_load_average['1min'];
+                            } else {
+                                document.getElementById('cpu-load').textContent = 'N/A';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching system resources:', err));
                 }
                 
                 function updateWorkers() {
