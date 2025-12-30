@@ -1623,7 +1623,7 @@ class Worker {
         }
         
         // Calculate progress based on email count (more accurate)
-        $progress = min(100, (int)round(($emailsCollected / $maxResults) * 100));
+        $progress = $maxResults > 0 ? min(100, (int)round(($emailsCollected / $maxResults) * 100)) : 0;
         
         error_log("  checkAndUpdateJobCompletion: Job {$jobId} - emails: {$emailsCollected}/{$maxResults}, queue: {$completed}/{$total} completed");
         
@@ -1634,10 +1634,11 @@ class Worker {
             error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (target reached: {$emailsCollected}/{$maxResults})");
             
             // Cancel any pending queue items since target is reached
+            // Mark them as completed with a note that they were cancelled due to target reached
             if ($pending > 0) {
-                $stmt = $db->prepare("UPDATE job_queue SET status = 'completed' WHERE job_id = ? AND status = 'pending'");
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE job_id = ? AND status = 'pending'");
                 $stmt->execute([$jobId]);
-                error_log("  checkAndUpdateJobCompletion: Marked {$pending} pending queue items as completed (target reached)");
+                error_log("  checkAndUpdateJobCompletion: Cancelled {$pending} pending queue items (target reached)");
             }
         } elseif ($completed == $total) {
             // All queue items completed but target not reached
@@ -4165,8 +4166,11 @@ class Router {
                         fclose($pipes[0]);
                     }
                     
-                    // Don't call proc_close - let it run in background
-                    // The process will continue running even after parent terminates
+                    // NOTE: Not calling proc_close() here to allow process to run independently
+                    // This may leave zombie processes on some systems, but ensures workers continue
+                    // after the parent PHP process exits. In production, use a proper process manager
+                    // like systemd, supervisor, or pm2 to manage worker processes
+                    
                     $spawnedCount++;
                     error_log("spawnWorkersViaProcOpen: Spawned worker {$spawnedCount}/{$workerCount}: {$workerName}");
                 } else {
