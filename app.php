@@ -2207,47 +2207,33 @@ function get_job_stats(PDO $pdo, int $id) {
         'extracted'   => 0,
         'queries_processed' => 0,
         'target' => 0,
-        'target_after_bounces' => 0,
+        'progress_extracted' => 0,
+        'progress_total' => 0,
     ];
 
-    $stmt = $pdo->prepare("SELECT event_type, COUNT(*) as cnt FROM events WHERE campaign_id = ? GROUP BY event_type");
-    $stmt->execute([$id]);
-    foreach ($stmt as $row) {
-        $etype = $row['event_type'];
-        $cnt = (int)$row['cnt'];
-        if ($etype === 'delivered') {
-            $stats['delivered_raw'] = $cnt;
-        } elseif ($etype === 'bounce') {
-            $stats['bounce'] = $cnt;
-        } elseif (isset($stats[$etype])) {
-            $stats[$etype] = $cnt;
+    try {
+        // Get job details from jobs table
+        $stmt = $pdo->prepare("SELECT target_count, progress_extracted, progress_total FROM jobs WHERE id = ? LIMIT 1");
+        $stmt->execute([$id]);
+        $job = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($job) {
+            $stats['target'] = (int)($job['target_count'] ?? 0);
+            $stats['progress_extracted'] = (int)($job['progress_extracted'] ?? 0);
+            $stats['progress_total'] = (int)($job['progress_total'] ?? 0);
         }
+        
+        // Get actual count of extracted emails from extracted_emails table
+        $stmt2 = $pdo->prepare("SELECT COUNT(*) FROM extracted_emails WHERE job_id = ?");
+        $stmt2->execute([$id]);
+        $stats['extracted'] = (int)$stmt2->fetchColumn();
+        
+        // Queries processed is same as progress_extracted for now
+        $stats['queries_processed'] = $stats['progress_extracted'];
+        
+    } catch (Exception $e) {
+        // If tables don't exist yet, return default stats
     }
-
-    $stats['delivered'] = max(0, $stats['delivered_raw'] - $stats['bounce']);
-    $stats['sent_attempts'] = $stats['delivered_raw'] + $stats['bounce'];
-
-    try {
-        $stmt2 = $pdo->prepare("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND event_type = ?");
-        $stmt2->execute([$id, 'skipped_unsubscribe']);
-        $skipped = (int)$stmt2->fetchColumn();
-        if ($skipped > 0) {
-            $stats['unsubscribe'] += $skipped;
-        }
-    } catch (Exception $e) {}
-
-    try {
-        $stmtc = $pdo->prepare("SELECT total_recipients FROM campaigns WHERE id = ? LIMIT 1");
-        $stmtc->execute([$id]);
-        $camp = $stmtc->fetch(PDO::FETCH_ASSOC);
-        $target = 0;
-        if ($camp) {
-            // Audience column doesn't exist in user's table, use total_recipients instead
-            $target = (int)($camp['total_recipients'] ?? 0);
-        }
-        $stats['target'] = $target;
-        $stats['target_after_bounces'] = max(0, $target - $stats['bounce']);
-    } catch (Exception $e) {}
 
     return $stats;
 }
@@ -7553,144 +7539,19 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
 
           <?php elseif ($page === 'activity'): ?>
             <?php
-              if ($pdo === null) {
-                  echo '<div class="page-title">Database Error</div>';
-                  echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-              } else {
-                  // Activity page showing unified unsubscribes and bounces
-                  $stmt = $pdo->query("SELECT * FROM events WHERE event_type IN ('unsubscribe','bounce','skipped_unsubscribe','profile_disabled') ORDER BY created_at DESC LIMIT 200");
-                  $acts = $stmt->fetchAll(PDO::FETCH_ASSOC);
+              // Activity page not available in email extraction system
+              // Redirect to jobs list
+              header('Location: ?page=list');
+              exit;
             ?>
-            <div class="page-title">Activity</div>
-            <div class="page-subtitle">Recent unsubscribes, bounces, and profile disables.</div>
-
-            <div class="card">
-              <div class="card-header">
-                <div>
-                  <div class="card-title">Recent Activity</div>
-                  <div class="card-subtitle">Click an event to view details (emails, errors).</div>
-                </div>
-                <div>
-                  <a href="?page=list" class="btn btn-outline">← Single Sends</a>
-                </div>
-              </div>
-
-              <div style="display:flex; gap:8px; margin-bottom:10px;">
-                <form method="post" onsubmit="return confirm('Delete ALL unsubscribes?');">
-                  <input type="hidden" name="action" value="delete_unsubscribes">
-                  <button class="btn btn-outline" type="submit">Clear Unsubscribes</button>
-                </form>
-                <form method="post" onsubmit="return confirm('Delete ALL bounce events?');">
-                  <input type="hidden" name="action" value="delete_bounces">
-                  <button class="btn btn-outline" type="submit">Clear Bounces</button>
-                </form>
-              </div>
-
-              <?php if (empty($acts)): ?>
-                <div class="hint" style="padding:16px;">No recent unsubscribes or bounces.</div>
-              <?php else: ?>
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Type</th>
-                      <th>Summary</th>
-                      <th>Details</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php foreach ($acts as $a): 
-                      $details = json_decode($a['details'], true);
-                      $summary = '';
-                      if ($a['event_type'] === 'bounce') {
-                        $summary = isset($details['rcpt']) ? h($details['rcpt']) : 'Bounce';
-                      } elseif ($a['event_type'] === 'unsubscribe' || $a['event_type'] === 'skipped_unsubscribe') {
-                        $summary = isset($details['rcpt']) ? h($details['rcpt']) : 'Unsubscribe';
-                      } elseif ($a['event_type'] === 'profile_disabled') {
-                        $summary = 'Profile ' . (isset($details['profile_id']) ? h($details['profile_id']) : '');
-                      }
-                    ?>
-                      <tr>
-                        <td><?php echo h($a['created_at']); ?></td>
-                        <td><?php echo h(ucfirst($a['event_type'])); ?></td>
-                        <td><?php echo $summary; ?></td>
-                        <td><code style="font-size:11px;"><?php echo h($a['details']); ?></code></td>
-                      </tr>
-                    <?php endforeach; ?>
-                  </tbody>
-                </table>
-              <?php endif; ?>
-            </div>
-            <?php } // End PDO check for activity ?>
 
           <?php elseif ($page === 'tracking'): ?>
             <?php
-            // Handle tracking settings update
-            if (isset($_POST['action']) && $_POST['action'] === 'save_tracking_settings') {
-                $openTracking = isset($_POST['open_tracking_enabled']) ? '1' : '0';
-                $clickTracking = isset($_POST['click_tracking_enabled']) ? '1' : '0';
-                
-                set_setting($pdo, 'open_tracking_enabled', $openTracking);
-                set_setting($pdo, 'click_tracking_enabled', $clickTracking);
-                
-                echo '<div style="padding:12px; margin-bottom:16px; background:var(--sg-success-light); color:var(--sg-success); border-radius:6px; border:1px solid var(--sg-success);">✓ Tracking settings saved successfully</div>';
-            }
-            
-            $openTrackingEnabled = get_setting($pdo, 'open_tracking_enabled', '1') === '1';
-            $clickTrackingEnabled = get_setting($pdo, 'click_tracking_enabled', '1') === '1';
+              // Tracking page not available in email extraction system
+              // Redirect to jobs list
+              header('Location: ?page=list');
+              exit;
             ?>
-            
-            <div class="page-title">Tracking Settings</div>
-            <div class="page-subtitle">Global tracking configuration for all campaigns</div>
-
-            <div class="card">
-              <div class="card-header">
-                <div>
-                  <div class="card-title">Email Tracking</div>
-                  <div class="card-subtitle">Configure open and click tracking for all campaigns globally</div>
-                </div>
-              </div>
-
-              <form method="post">
-                <input type="hidden" name="action" value="save_tracking_settings">
-                
-                <div class="form-row">
-                  <div class="form-group">
-                    <label style="font-weight:600;">Open Tracking</label>
-                    <div class="checkbox-row">
-                      <input type="checkbox" name="open_tracking_enabled" id="open_tracking_enabled" <?php if ($openTrackingEnabled) echo 'checked'; ?>>
-                      <label for="open_tracking_enabled">Enable Open Tracking</label>
-                    </div>
-                    <small class="hint">Track when recipients open your emails using an invisible tracking pixel. This applies to all campaigns globally.</small>
-                  </div>
-                </div>
-
-                <div class="form-row">
-                  <div class="form-group">
-                    <label style="font-weight:600;">Click Tracking</label>
-                    <div class="checkbox-row">
-                      <input type="checkbox" name="click_tracking_enabled" id="click_tracking_enabled" <?php if ($clickTrackingEnabled) echo 'checked'; ?>>
-                      <label for="click_tracking_enabled">Enable Click Tracking</label>
-                    </div>
-                    <small class="hint">Track when recipients click links in your emails by wrapping URLs with tracking redirects. This applies to all campaigns globally.</small>
-                  </div>
-                </div>
-
-                <div style="margin-top:20px;">
-                  <button type="submit" class="btn btn-primary">Save Tracking Settings</button>
-                </div>
-              </form>
-
-              <div style="margin-top:32px; padding-top:24px; border-top:1px solid var(--sg-border);">
-                <div style="font-weight:600; margin-bottom:12px;">How Tracking Works</div>
-                <div style="color:var(--sg-text-muted); line-height:1.6;">
-                  <p><strong>Open Tracking:</strong> Adds a 1x1 pixel invisible image to detect when emails are opened.</p>
-                  <p><strong>Click Tracking:</strong> Wraps all links in your emails with tracking redirects to record clicks before sending users to the original destination.</p>
-                  <p style="margin-bottom:0;"><strong>Note:</strong> These settings apply globally to all campaigns. When disabled, no tracking code will be injected into outgoing emails.</p>
-                </div>
-              </div>
-            </div>
-
           <?php else: ?>
             <p>Unknown page.</p>
           <?php endif; ?>
