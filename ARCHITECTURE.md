@@ -88,7 +88,7 @@
 │  Worker N ─┘  ├─ Validate & deduplicate                            │
 │             └─ Insert into database (bulk)                          │
 │                                                                     │
-│  Stats: Up to 300 workers, 100 parallel HTTP requests each         │
+│  Stats: Up to 1000 workers, 100 parallel HTTP requests each        │
 └─────────────────────────────────────────────────────────────────────┘
          │
          │ Continuous heartbeat updates
@@ -134,7 +134,7 @@
 
 ### 2. Scalable Worker Management
 - Automatic worker count calculation
-- Up to 300 workers for large jobs
+- Up to 1000 workers for large jobs
 - Each worker processes independently
 
 ### 3. Real-time Progress Tracking

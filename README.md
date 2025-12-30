@@ -12,7 +12,7 @@ A high-performance PHP-based email extraction system with SendGrid-inspired asyn
 - **Real-time Updates**: Live progress tracking via polling or Server-Sent Events
 
 ### ⚡ Performance Optimizations
-- **Automatic Worker Scaling**: Up to 300 workers based on job size
+- **Automatic Worker Scaling**: Up to 1000 workers based on job size
 - **Parallel HTTP Requests**: curl_multi for 100+ simultaneous connections
 - **Bulk Operations**: Batch database inserts and bulk email validation
 - **Smart Caching**: 10K-item BloomFilter in-memory cache
@@ -118,8 +118,8 @@ Choose between polling and Server-Sent Events:
 Workers are automatically calculated but can be customized:
 ```php
 // In Worker class (app.php)
-private const AUTO_MAX_WORKERS = 300;
-private const OPTIMAL_RESULTS_PER_WORKER = 100;
+private const AUTO_MAX_WORKERS = 1000;
+private const OPTIMAL_RESULTS_PER_WORKER = 50;
 ```
 
 ## Performance Metrics
@@ -127,7 +127,7 @@ private const OPTIMAL_RESULTS_PER_WORKER = 100;
 - Worker spawn: Non-blocking (background)
 - Progress update interval: 3 seconds
 - Parallel connections: 100 per worker
-- Maximum workers: 300
+- Maximum workers: 1000
 - BloomFilter cache: 10,000 items
 
 ## Browser Compatibility

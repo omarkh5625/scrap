@@ -45,7 +45,7 @@ Session lock released
 Workers spawn in background
     ↓
 Each worker processes job chunks
-Up to 300 workers for large jobs
+Up to 1000 workers for large jobs
 ```
 
 ### 3. Real-Time Progress Updates
@@ -157,7 +157,7 @@ Continues until job complete
 | Job Creation | < 200ms | ~150ms | ✅ Excellent |
 | UI Blocking | 0ms | 0ms | ✅ Perfect |
 | Worker Spawn | Background | Background | ✅ Non-blocking |
-| Max Workers | 300 | 300 | ✅ Supported |
+| Max Workers | 1000 | 1000 | ✅ Supported |
 | Progress Updates | 3s | 3s | ✅ Configurable |
 | Parallel Connections | 100/worker | 100/worker | ✅ Optimal |
 
@@ -256,7 +256,7 @@ All requirements from the problem statement have been fulfilled:
 2. ✅ **SendGrid-like Workers** - Dynamic scaling, background processing
 3. ✅ **Real-time Updates** - Live progress every 3 seconds (or SSE)
 4. ✅ **Dynamic Workers** - Auto-calculated optimal count
-5. ✅ **Parallel Processing** - Up to 300 workers simultaneously
+5. ✅ **Parallel Processing** - Up to 1000 workers simultaneously
 6. ✅ **Progress Statistics** - Jobs, workers, emails displayed live
 
 ## Next Steps
@@ -285,7 +285,7 @@ All requirements from the problem statement have been fulfilled:
    - Configure deep scraping options
 
 4. **Scale as Needed**
-   - System supports up to 300 workers
+   - System supports up to 1000 workers
    - Each worker: 100 parallel connections
    - Handles large jobs efficiently
 

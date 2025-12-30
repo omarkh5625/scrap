@@ -1162,8 +1162,8 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 300; // Maximum workers to spawn automatically for maximum performance
-    private const OPTIMAL_RESULTS_PER_WORKER = 100; // Optimal number of results per worker for best performance
+    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
+    private const OPTIMAL_RESULTS_PER_WORKER = 50; // Optimal number of results per worker for best performance (reduced to spawn more workers)
     
     /**
      * Calculate optimal worker count based on job size
@@ -2223,7 +2223,7 @@ class Router {
                             break;
                         }
                         
-                        // Calculate optimal worker count (up to 300)
+                        // Calculate optimal worker count (up to 1000)
                         $workerCount = Worker::calculateOptimalWorkerCount($maxResults);
                         
                         // Create job - this should be fast (< 100ms)
@@ -2984,7 +2984,7 @@ class Router {
                 <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
                     <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
                     <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
-                        <li>🚀 Workers spawn automatically based on job size (up to 300 workers for maximum speed)</li>
+                        <li>🚀 Workers spawn automatically based on job size (up to 1000 workers for maximum speed)</li>
                         <li>Business email filter removes junk and social media emails</li>
                         <li>Specific queries (industry + location) yield better quality emails</li>
                         <li>System automatically filters famous sites and placeholder emails</li>
@@ -4002,7 +4002,7 @@ class Router {
             <div class="card">
                 <h2>Create New Email Extraction Job</h2>
                 <p style="margin-bottom: 20px; color: #4a5568;">
-                    ⚡ Workers spawn automatically at maximum capacity (up to 300 workers) based on your job size! Results appear in real-time.
+                    ⚡ Workers spawn automatically at maximum capacity (up to 1000 workers) based on your job size! Results appear in real-time.
                 </p>
                 <form id="job-form">
                     <div class="form-group">
@@ -4067,7 +4067,7 @@ class Router {
                 <ol style="padding-left: 20px;">
                     <li><strong>Instant Job Creation:</strong> Job and queue items created in < 200ms</li>
                     <li><strong>Async Worker Spawning:</strong> Workers spawn after response is sent to client</li>
-                    <li><strong>Dynamic Scaling:</strong> System calculates optimal worker count (up to 300 workers)</li>
+                    <li><strong>Dynamic Scaling:</strong> System calculates optimal worker count (up to 1000 workers)</li>
                     <li><strong>Parallel Processing:</strong> Job split into chunks for concurrent processing</li>
                     <li><strong>Real-time Updates:</strong> Progress updates via efficient polling (SSE available)</li>
                     <li><strong>Bulk Operations:</strong> URLs scraped in parallel, emails inserted in bulk</li>
@@ -4078,7 +4078,7 @@ class Router {
                 </p>
                 <ul style="padding-left: 20px; color: #4a5568;">
                     <li><strong>Non-Blocking I/O:</strong> FastCGI finish request for instant client disconnect</li>
-                    <li><strong>Automatic Worker Scaling:</strong> Optimal workers based on job size (up to 300)</li>
+                    <li><strong>Automatic Worker Scaling:</strong> Optimal workers based on job size (up to 1000)</li>
                     <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections per worker with curl_multi</li>
                     <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support</li>
                     <li><strong>Memory Caching:</strong> 10K-item BloomFilter cache in memory</li>
@@ -4531,7 +4531,7 @@ class Router {
                     <strong>⚡ Automatic Worker Spawning:</strong>
                 </p>
                 <ul style="color: #718096; padding-left: 20px;">
-                    <li>✅ System automatically spawns optimal workers based on job size (up to 300)</li>
+                    <li>✅ System automatically spawns optimal workers based on job size (up to 1000)</li>
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum performance</li>
                 </ul>
