@@ -6748,11 +6748,11 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               echo '<div class="page-title">Database Error</div>';
               echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
           } else {
-              $stmt = $pdo->query("SELECT * FROM campaigns ORDER BY created_at DESC");
+              $stmt = $pdo->query("SELECT * FROM jobs ORDER BY created_at DESC");
               $campaigns = $stmt->fetchAll(PDO::FETCH_ASSOC);
         ?>
-        <div class="page-title">Single Sends</div>
-        <div class="page-subtitle">Design, review, and send one-off campaigns, just like SendGrid.</div>
+        <div class="page-title">Extraction Jobs</div>
+        <div class="page-subtitle">Create and manage email extraction jobs using serper.dev API.</div>
 
         <div class="card">
           <div class="card-header">
@@ -7939,14 +7939,23 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
               } else {
                   $id = (int)($_GET['id'] ?? 0);
-                  $campaign = get_campaign($pdo, $id);
-                  if (!$campaign) {
-                    echo "<p>Campaign not found.</p>";
+                  $job = get_job($pdo, $id);
+                  if (!$job) {
+                    echo "<p>Job not found.</p>";
                   } else {
-                    $stats = get_campaign_stats($pdo, $id);
-                    $delivered = max(1, (int)$stats['delivered']);
-                    $openRate  = $delivered ? round(($stats['open'] / $delivered) * 100, 1) : 0;
-                $clickRate = $delivered ? round(($stats['click'] / $delivered) * 100, 1) : 0;
+                    $stats = get_job_stats($pdo, $id);
+                    
+                    // Get profile information
+                    $profile = null;
+                    if (!empty($job['profile_id'])) {
+                        $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
+                        $profile_stmt->execute([$job['profile_id']]);
+                        $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+                    }
+                    
+                    $extracted = (int)($job['progress_extracted'] ?? 0);
+                    $target = (int)($job['progress_total'] ?? $job['target_count'] ?? 0);
+                    $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
 
                 // Per-profile aggregation for this campaign (PHP-side)
                 $profilesAll = get_profiles($pdo);
@@ -7974,147 +7983,129 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                     }
                 } catch (Exception $e) {}
             ?>
-              <div class="page-title">Stats — <?php echo h($campaign['name']); ?></div>
-              <div class="page-subtitle">Delivery &amp; engagement metrics for your Single Send.</div>
+              <div class="page-title">Job Stats — <?php echo h($job['name']); ?></div>
+              <div class="page-subtitle">Extraction results and progress for this job.</div>
 
               <div class="card" style="margin-bottom:18px;">
                 <div class="card-header">
                   <div>
                     <div class="card-title">Summary</div>
                   </div>
-                  <a href="?page=list" class="btn btn-outline">← Back to Single Sends</a>
+                  <a href="?page=list" class="btn btn-outline">← Back to Jobs</a>
                 </div>
                 <div class="form-row">
                   <div class="form-group">
-                    <label>Subject</label>
-                    <div><?php echo h($campaign['subject']); ?></div>
+                    <label>Profile</label>
+                    <div><?php echo $profile ? h($profile['profile_name']) : 'N/A'; ?></div>
                   </div>
                   <div class="form-group">
-                    <label>Sent at</label>
-                    <div><?php echo $campaign['sent_at'] ? h($campaign['sent_at']) : '<span class="hint">Not sent</span>'; ?></div>
+                    <label>Search Query</label>
+                    <div><?php echo $profile ? h($profile['search_query']) : 'N/A'; ?></div>
+                  </div>
+                  <div class="form-group">
+                    <label>Started at</label>
+                    <div><?php echo $job['started_at'] ? h($job['started_at']) : '<span class="hint">Not started</span>'; ?></div>
+                  </div>
+                  <div class="form-group">
+                    <label>Completed at</label>
+                    <div><?php echo $job['completed_at'] ? h($job['completed_at']) : '<span class="hint">Not completed</span>'; ?></div>
                   </div>
                 </div>
               </div>
 
-              <!-- Real-time Campaign Progress -->
+              <!-- Real-time Job Progress -->
               <?php 
-                $progress = get_campaign_progress($pdo, $id);
-                if ($progress['status'] === 'queued' || $progress['status'] === 'sending' || ($campaign['status'] === 'sending' && $progress['total'] > 0)):
+                $jobStatus = $job['status'];
+                if ($jobStatus === 'queued' || $jobStatus === 'extracting'):
               ?>
               <div class="card" style="margin-bottom:18px;" id="progressCard">
                 <div class="card-header">
                   <div>
-                    <div class="card-title">Campaign Progress</div>
-                    <div class="card-subtitle">Real-time sending progress (updates automatically)</div>
+                    <div class="card-title">Extraction Progress</div>
+                    <div class="card-subtitle">Real-time extraction progress (updates automatically)</div>
                   </div>
                 </div>
                 <div style="padding:16px;">
                   <div style="margin-bottom:12px; font-size:18px; font-weight:600;">
-                    <span id="progressText"><?php echo $progress['sent']; ?> / <?php echo $progress['total']; ?> sent (<?php echo $progress['percentage']; ?>%)</span>
+                    <span id="progressText"><?php echo $extracted; ?> / <?php echo $target; ?> extracted (<?php echo $progress; ?>%)</span>
                   </div>
                   <div style="background:#E4E7EB; border-radius:4px; height:24px; overflow:hidden; position:relative;">
-                    <div id="progressBar" style="background:linear-gradient(90deg, #1A82E2, #3B9EF3); height:100%; width:<?php echo $progress['percentage']; ?>%; transition:width 0.3s;"></div>
+                    <div id="progressBar" style="background:linear-gradient(90deg, #1A82E2, #3B9EF3); height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
                   </div>
-                  <div style="margin-top:8px; color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($progress['status']); ?></div>
+                  <div style="margin-top:8px; color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($jobStatus); ?></div>
                 </div>
               </div>
               <?php endif; ?>
 
-              <!-- Simplified header stats matching requested layout -->
+              <!-- Simplified header stats for extraction -->
               <div class="header-stats">
                 <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['target']; ?></div>
-                  <div class="stat-label">Emails Triggered</div>
+                  <div class="stat-num"><?php echo $target; ?></div>
+                  <div class="stat-label">Target Emails</div>
                 </div>
                 <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['delivered']; ?></div>
-                  <div class="stat-label">Delivered</div>
+                  <div class="stat-num"><?php echo $extracted; ?></div>
+                  <div class="stat-label">Extracted</div>
                 </div>
                 <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['open']; ?></div>
-                  <div class="stat-label">Unique Opens</div>
+                  <div class="stat-num"><?php echo $progress; ?>%</div>
+                  <div class="stat-label">Progress</div>
                 </div>
                 <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['click']; ?></div>
-                  <div class="stat-label">Unique Clicks</div>
+                  <div class="stat-num"><?php echo $jobStatus === 'completed' ? 'Complete' : ucfirst($jobStatus); ?></div>
+                  <div class="stat-label">Status</div>
                 </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['bounce']; ?></div>
-                  <div class="stat-label">Bounces</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['unsubscribe']; ?></div>
-                  <div class="stat-label">Unsubscribes</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['spam']; ?></div>
-                  <div class="stat-label">Spam Reports</div>
-                </div>
-              </div>
-
-              <div style="margin-bottom:18px;">
-                <!-- Placeholder for chart (not implemented) -->
-                <div style="background:#fff;border:1px solid var(--sg-border);border-radius:6px;height:320px;"></div>
-              </div>
-
-              <div class="card" style="margin-bottom:18px;">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">By Sending Profile (this campaign)</div>
-                    <div class="card-subtitle">Counts of sends, delivered, bounces and unsubscribes per profile for this campaign.</div>
-                  </div>
-                </div>
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Profile</th>
-                      <th>From Email</th>
-                      <th>Sent Attempts</th>
-                      <th>Delivered</th>
-                      <th>Bounces</th>
-                      <th>Unsubscribes</th>
-                      <th>Opens</th>
-                      <th>Clicks</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php if (empty($perProfile)): ?>
-                      <tr>
-                        <td colspan="8" style="text-align:center; padding:16px; color:var(--sg-muted);">No per-profile events found for this campaign.</td>
-                      </tr>
-                    <?php else: ?>
-                      <?php foreach ($perProfile as $pid => $vals):
-                        $pf = $profilesMap[$pid] ?? ['profile_name'=>'Profile #'.$pid,'from_email'=>''];
-                      ?>
-                        <tr>
-                          <td><?php echo h($pf['profile_name']); ?></td>
-                          <td><?php echo h($pf['from_email']); ?></td>
-                          <td><?php echo (int)$vals['sent']; ?></td>
-                          <td><?php echo (int)$vals['delivered']; ?></td>
-                          <td><?php echo (int)$vals['bounces']; ?></td>
-                          <td><?php echo (int)$vals['unsubscribes']; ?></td>
-                          <td><?php echo (int)$vals['opens']; ?></td>
-                          <td><?php echo (int)$vals['clicks']; ?></td>
-                        </tr>
-                      <?php endforeach; ?>
-                    <?php endif; ?>
-                  </tbody>
-                </table>
               </div>
 
               <div class="card">
                 <div class="card-header">
                   <div>
-                    <div class="card-title">Raw Events</div>
-                    <div class="card-subtitle">Last 50 events (demo).</div>
+                    <div class="card-title">Extracted Emails</div>
+                    <div class="card-subtitle">List of all emails extracted for this job (most recent first).</div>
+                  </div>
+                  <div>
+                    <a href="?page=list" class="btn btn-outline">Download CSV</a>
                   </div>
                 </div>
                 <table class="table">
                   <thead>
                     <tr>
-                      <th>Time</th>
-                      <th>Type</th>
-                      <th>Details</th>
+                      <th>Email</th>
+                      <th>Source Query</th>
+                      <th>Extracted At</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php
+                      $stmt = $pdo->prepare("SELECT * FROM extracted_emails WHERE job_id = ? ORDER BY extracted_at DESC LIMIT 100");
+                      $stmt->execute([$id]);
+                      $emails = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                      if (empty($emails)):
+                    ?>
+                      <tr>
+                        <td colspan="3" style="text-align:center; padding:16px; color:var(--sg-muted);">
+                          No emails extracted yet.
+                        </td>
+                      </tr>
+                    <?php else: ?>
+                      <?php foreach ($emails as $em): ?>
+                        <tr>
+                          <td><?php echo h($em['email']); ?></td>
+                          <td><?php echo h($em['source'] ?? 'N/A'); ?></td>
+                          <td><?php echo h($em['extracted_at']); ?></td>
+                        </tr>
+                      <?php endforeach; ?>
+                      <?php if (count($emails) >= 100): ?>
+                        <tr>
+                          <td colspan="3" style="text-align:center; padding:12px; color:var(--sg-muted);">
+                            Showing first 100 results. Export to CSV for full list.
+                          </td>
+                        </tr>
+                      <?php endif; ?>
+                    <?php endif; ?>
+                  </tbody>
+                </table>
+              </div>
                     </tr>
                   </thead>
                   <tbody>
