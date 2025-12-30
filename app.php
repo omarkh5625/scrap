@@ -7157,6 +7157,25 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
           <div class="page-title">Job Configuration — <?php echo h($job['name']); ?></div>
           <div class="page-subtitle">Configure your email extraction job and select profiles to execute.</div>
 
+          <!-- Status Message Display -->
+          <div id="extraction-status" style="display:none; margin-bottom:20px; padding:15px; border-radius:5px; position:relative;">
+            <button type="button" onclick="document.getElementById('extraction-status').style.display='none'" 
+                    style="position:absolute; top:10px; right:10px; background:none; border:none; font-size:20px; cursor:pointer; color:inherit; opacity:0.7;">
+              ×
+            </button>
+            <div style="display:flex; align-items:flex-start; gap:12px;">
+              <div id="status-icon" style="font-size:24px; line-height:1;"></div>
+              <div style="flex:1;">
+                <strong id="status-title" style="display:block; margin-bottom:8px; font-size:16px;"></strong>
+                <p id="status-message" style="margin:0; line-height:1.5;"></p>
+                <div id="status-details-toggle" style="margin-top:10px; display:none;">
+                  <a href="#" onclick="event.preventDefault(); document.getElementById('status-details').style.display = document.getElementById('status-details').style.display === 'none' ? 'block' : 'none'; this.textContent = document.getElementById('status-details').style.display === 'none' ? '▼ Show Technical Details' : '▲ Hide Technical Details';" style="color:inherit; opacity:0.8; text-decoration:underline; font-size:13px;">▼ Show Technical Details</a>
+                </div>
+                <pre id="status-details" style="display:none; margin:10px 0 0 0; padding:10px; background:rgba(0,0,0,0.05); border-radius:4px; font-size:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-wrap:break-word;"></pre>
+              </div>
+            </div>
+          </div>
+
           <form method="post" id="jobForm">
             <input type="hidden" name="action" value="save_job">
             <input type="hidden" name="id" value="<?php echo (int)$job['id']; ?>">
@@ -7229,6 +7248,50 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               var profileTarget = document.getElementById('profileTarget');
               var startJobBtn = document.getElementById('startJobBtn');
 
+              // Function to show status messages
+              function showStatus(type, title, message, details) {
+                var statusBox = document.getElementById('extraction-status');
+                var statusIcon = document.getElementById('status-icon');
+                var statusTitle = document.getElementById('status-title');
+                var statusMessage = document.getElementById('status-message');
+                var statusDetails = document.getElementById('status-details');
+                var statusDetailsToggle = document.getElementById('status-details-toggle');
+                
+                // Set colors based on type
+                if (type === 'success') {
+                  statusBox.style.backgroundColor = '#d4edda';
+                  statusBox.style.borderLeft = '4px solid #28a745';
+                  statusBox.style.color = '#155724';
+                  statusIcon.innerHTML = '✓';
+                  statusIcon.style.color = '#28a745';
+                } else if (type === 'error') {
+                  statusBox.style.backgroundColor = '#f8d7da';
+                  statusBox.style.borderLeft = '4px solid #dc3545';
+                  statusBox.style.color = '#721c24';
+                  statusIcon.innerHTML = '✗';
+                  statusIcon.style.color = '#dc3545';
+                } else if (type === 'info') {
+                  statusBox.style.backgroundColor = '#d1ecf1';
+                  statusBox.style.borderLeft = '4px solid #17a2b8';
+                  statusBox.style.color = '#0c5460';
+                  statusIcon.innerHTML = 'ℹ';
+                  statusIcon.style.color = '#17a2b8';
+                }
+                
+                statusTitle.textContent = title;
+                statusMessage.textContent = message;
+                
+                if (details) {
+                  statusDetails.textContent = details;
+                  statusDetailsToggle.style.display = 'block';
+                } else {
+                  statusDetailsToggle.style.display = 'none';
+                }
+                
+                statusBox.style.display = 'block';
+                statusBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+              }
+
               function updateProfileDetails() {
                 var selectedOption = profileSelect.options[profileSelect.selectedIndex];
                 if (selectedOption.value) {
@@ -7254,36 +7317,62 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   console.log('START EXTRACTION BUTTON: Button clicked');
                   console.log('START EXTRACTION BUTTON: Profile selected:', profileSelect.value);
                   
+                  // Hide any previous status messages
+                  document.getElementById('extraction-status').style.display = 'none';
+                  
                   if (!profileSelect.value) {
-                    alert('Please select a profile first');
                     console.log('START EXTRACTION BUTTON: ERROR - No profile selected');
+                    showStatus('error', 
+                      '✗ Error: No Profile Selected', 
+                      'Please select an extraction profile from the dropdown before starting the job.',
+                      'START_EXTRACTION: profile_id is empty or invalid');
                     return;
                   }
+                  
                   if (confirm('Start extraction job now?')) {
                     console.log('START EXTRACTION BUTTON: User confirmed, proceeding...');
-                    // First save the job configuration (profile_id, name, target_count)
-                    // Then start the job
+                    
                     var jobForm = document.getElementById('jobForm');
-                    if (jobForm) {
-                      console.log('START EXTRACTION BUTTON: Job form found');
-                      console.log('START EXTRACTION BUTTON: Form action:', jobForm.action);
-                      console.log('START EXTRACTION BUTTON: Form method:', jobForm.method);
-                      
-                      // Create hidden input to trigger start after save
-                      var startInput = document.createElement('input');
-                      startInput.type = 'hidden';
-                      startInput.name = 'start_immediately';
-                      startInput.value = '1';
-                      jobForm.appendChild(startInput);
-                      
-                      console.log('START EXTRACTION BUTTON: Added start_immediately=1 input');
-                      console.log('START EXTRACTION BUTTON: Submitting form...');
-                      
-                      // Submit the form (will save job and redirect to start)
-                      jobForm.submit();
-                    } else {
+                    if (!jobForm) {
                       console.log('START EXTRACTION BUTTON: ERROR - Job form not found');
+                      showStatus('error', 
+                        '✗ Error: Form Not Found', 
+                        'Unable to locate the job configuration form. Please refresh the page and try again.',
+                        'START_EXTRACTION: document.getElementById("jobForm") returned null');
+                      return;
                     }
+                    
+                    console.log('START EXTRACTION BUTTON: Job form found');
+                    
+                    // Show loading message
+                    var selectedOption = profileSelect.options[profileSelect.selectedIndex];
+                    var profileName = selectedOption.text.split(' — ')[0];
+                    showStatus('info', 
+                      '⏳ Starting Extraction...', 
+                      'Saving job configuration and starting extraction with profile: ' + profileName,
+                      null);
+                    
+                    // Create hidden input to trigger start after save
+                    var startInput = document.createElement('input');
+                    startInput.type = 'hidden';
+                    startInput.name = 'start_immediately';
+                    startInput.value = '1';
+                    jobForm.appendChild(startInput);
+                    
+                    console.log('START EXTRACTION BUTTON: Added start_immediately=1 input');
+                    console.log('START EXTRACTION BUTTON: Submitting form...');
+                    
+                    // Submit the form (will save job and redirect to start)
+                    jobForm.submit();
+                    
+                    // Show success message (form submission will redirect, but show optimistic message)
+                    setTimeout(function() {
+                      showStatus('success', 
+                        '✓ Extraction Started Successfully!', 
+                        'Job has been saved and extraction is starting. Redirecting to job list...',
+                        null);
+                    }, 100);
+                    
                   } else {
                     console.log('START EXTRACTION BUTTON: User cancelled');
                   }
