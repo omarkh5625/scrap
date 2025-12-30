@@ -4210,34 +4210,44 @@ class Router {
         try {
             $db = Database::connect();
             
-            // Process queue items with multiple simulated workers
-            $maxItemsPerWorker = 10; // Process up to 10 items per simulated worker
+            // FIRST: Register ALL workers upfront so they show as "active" in UI
+            $workers = [];
+            for ($i = 0; $i < $workerCount; $i++) {
+                $workerName = 'bg-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                $workerId = Worker::register($workerName);
+                if ($workerId) {
+                    $workers[] = ['id' => $workerId, 'name' => $workerName];
+                    // Mark as running immediately so they show up in UI
+                    Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+                    error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId})");
+                }
+            }
+            
+            error_log("processWorkersInBackground: ALL {$workerCount} workers registered and marked as RUNNING");
+            
+            // SECOND: Process queue items with the registered workers
+            $maxItemsPerWorker = 10; // Process up to 10 items per worker
             $totalProcessed = 0;
             $startTime = time();
             $maxRuntime = 300; // 5 minutes total
             
-            for ($workerIndex = 0; $workerIndex < $workerCount; $workerIndex++) {
+            foreach ($workers as $workerIndex => $worker) {
                 // Check if we've exceeded max runtime
                 if ((time() - $startTime) >= $maxRuntime) {
                     error_log("processWorkersInBackground: Max runtime reached, stopping");
                     break;
                 }
                 
-                $workerName = 'bg-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $workerIndex;
+                $workerId = $worker['id'];
+                $workerName = $worker['name'];
                 
                 try {
-                    $workerId = Worker::register($workerName);
-                    if (!$workerId) {
-                        error_log("processWorkersInBackground: Failed to register worker {$workerName}, skipping");
-                        continue;
-                    }
-                    error_log("processWorkersInBackground: Worker {$workerIndex}/{$workerCount} ({$workerName}) registered with ID {$workerId}");
-                    
-                    // Each simulated worker processes items from the queue
+                    // Each worker processes items from the queue
                     $itemsProcessed = 0;
                     
                     for ($i = 0; $i < $maxItemsPerWorker; $i++) {
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        // Keep heartbeat updated as "running"
+                        Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
                         
                         // Pass job_id to only get queue items for that specific job
                         $job = Worker::getNextJob($jobId);
@@ -4258,14 +4268,14 @@ class Router {
                                 }
                             }
                             
-                            error_log("processWorkersInBackground: Worker {$workerIndex} processing job #{$job['id']}");
+                            error_log("processWorkersInBackground: Worker {$workerName} processing job #{$job['id']}");
                             Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                             
                             try {
                                 Worker::processJob($job['id']);
                                 $itemsProcessed++;
                                 $totalProcessed++;
-                                error_log("processWorkersInBackground: Worker {$workerIndex} completed job #{$job['id']}");
+                                error_log("processWorkersInBackground: Worker {$workerName} completed job #{$job['id']}");
                                 
                                 // Check again after processing if target reached
                                 if ($jobDetails) {
@@ -4277,21 +4287,21 @@ class Router {
                                     }
                                 }
                             } catch (Exception $e) {
-                                error_log("processWorkersInBackground: Worker {$workerIndex} error on job #{$job['id']}: " . $e->getMessage());
+                                error_log("processWorkersInBackground: Worker {$workerName} error on job #{$job['id']}: " . $e->getMessage());
                                 Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
                             }
                         } else {
                             // No more jobs in queue
-                            error_log("processWorkersInBackground: Worker {$workerIndex} - no more jobs available");
+                            error_log("processWorkersInBackground: Worker {$workerName} - no more jobs available");
                             break;
                         }
                     }
                     
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                    error_log("processWorkersInBackground: Worker {$workerIndex} completed {$itemsProcessed} items");
+                    error_log("processWorkersInBackground: Worker {$workerName} completed {$itemsProcessed} items");
                     
                 } catch (Exception $e) {
-                    error_log("processWorkersInBackground: Worker {$workerIndex} fatal error: " . $e->getMessage());
+                    error_log("processWorkersInBackground: Worker {$workerName} fatal error: " . $e->getMessage());
                 }
             }
             
