@@ -2832,6 +2832,27 @@ class Router {
                 while ((time() - $startTime) < $maxRuntime) {
                     Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     
+                    // If dedicated to a specific job, check if target reached
+                    if ($jobId !== null) {
+                        $jobDetails = Job::getById($jobId);
+                        if ($jobDetails) {
+                            $emailsCollected = Job::getEmailCount($jobId);
+                            $maxResults = (int)$jobDetails['max_results'];
+                            
+                            if ($emailsCollected >= $maxResults) {
+                                error_log("handleStartWorker: Worker {$workerName} - Job {$jobId} reached target ({$emailsCollected}/{$maxResults}). Exiting.");
+                                Worker::checkAndUpdateJobCompletion($jobId);
+                                break;
+                            }
+                            
+                            // Check if job is complete or failed
+                            if (in_array($jobDetails['status'], ['completed', 'failed'])) {
+                                error_log("handleStartWorker: Worker {$workerName} - Job {$jobId} is {$jobDetails['status']}. Exiting.");
+                                break;
+                            }
+                        }
+                    }
+                    
                     // Pass job_id to only get queue items for that specific job
                     $job = Worker::getNextJob($jobId);
                     
@@ -2843,6 +2864,9 @@ class Router {
                             Worker::processJob($job['id']);
                             $itemsProcessed++;
                             error_log("handleStartWorker: Worker {$workerName} completed job #{$job['id']} (total: {$itemsProcessed})");
+                            
+                            // Check job completion after each item
+                            Worker::checkAndUpdateJobCompletion($job['id']);
                         } catch (Exception $e) {
                             error_log("handleStartWorker: Worker {$workerName} error processing job #{$job['id']}: " . $e->getMessage());
                         }
@@ -2937,8 +2961,27 @@ class Router {
                 
                 // Keep processing until we run out of queue items for this job
                 while ((time() - $startTime) < $maxRuntime) {
+                    // Check if job target reached before processing more
+                    $job = Job::getById($jobId);
+                    if ($job) {
+                        $emailsCollected = Job::getEmailCount($jobId);
+                        $maxResults = (int)$job['max_results'];
+                        
+                        if ($emailsCollected >= $maxResults) {
+                            error_log("  Worker {$workerName}: Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), exiting");
+                            Worker::checkAndUpdateJobCompletion($jobId);
+                            break;
+                        }
+                        
+                        // Also check if job is already completed or failed
+                        if (in_array($job['status'], ['completed', 'failed'])) {
+                            error_log("  Worker {$workerName}: Job {$jobId} is {$job['status']}, exiting");
+                            break;
+                        }
+                    }
+                    
                     // Get next queue item for this specific job
-                    $job = Worker::getNextJob();
+                    $job = Worker::getNextJob($jobId);
                     
                     // Check if we got a job and it's for our target job_id
                     if (!$job) {
@@ -2963,6 +3006,9 @@ class Router {
                     $itemsProcessed++;
                     error_log("  Worker {$workerName}: Completed queue item {$itemsProcessed} for job {$jobId}");
                     
+                    // Check job completion status after each item
+                    Worker::checkAndUpdateJobCompletion($jobId);
+                    
                     // Check if all queue items for this job are done
                     $db = Database::connect();
                     $stmt = $db->prepare("SELECT COUNT(*) as pending FROM job_queue WHERE job_id = ? AND status = 'pending'");
@@ -2971,6 +3017,7 @@ class Router {
                     
                     if ($pendingCount == 0) {
                         error_log("✓ Worker {$workerName}: All queue items completed for job {$jobId}. Exiting.");
+                        Worker::checkAndUpdateJobCompletion($jobId);
                         break;
                     }
                     
