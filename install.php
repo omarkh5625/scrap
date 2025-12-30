@@ -128,6 +128,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         progress_extracted INT NOT NULL DEFAULT 0,
                         progress_total INT NOT NULL DEFAULT 0,
                         progress_status VARCHAR(50) DEFAULT 'draft',
+                        error_message TEXT DEFAULT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         started_at TIMESTAMP NULL DEFAULT NULL,
                         completed_at TIMESTAMP NULL DEFAULT NULL

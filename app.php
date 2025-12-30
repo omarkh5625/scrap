@@ -866,12 +866,12 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
         }
         
         if (!$result['success']) {
-            // Mark job as failed
+            // Mark job as failed and store error message
             $errorMsg = $result['error'] ?? 'Unknown error';
             error_log("PERFORM_EXTRACTION: Extraction failed: {$errorMsg}");
             error_log("PERFORM_EXTRACTION: Full error details: " . json_encode($result));
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', progress_extracted = 0 WHERE id = ?");
-            $stmt->execute([$jobId]);
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
+            $stmt->execute([$errorMsg, $jobId]);
             error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log'] ?? []));
             throw new Exception("API extraction failed: {$errorMsg}");
         }
@@ -919,8 +919,8 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
         error_log("PERFORM_EXTRACTION: Stack trace: " . $e->getTraceAsString());
         
         try {
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error' WHERE id = ?");
-            $stmt->execute([$jobId]);
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
+            $stmt->execute([$e->getMessage(), $jobId]);
             error_log("PERFORM_EXTRACTION: Job marked as draft due to error");
         } catch (Exception $e2) {
             error_log("PERFORM_EXTRACTION: Failed to mark job as draft: " . $e2->getMessage());
@@ -7628,25 +7628,38 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               <div class="page-title">Job Stats — <?php echo h($job['name']); ?></div>
               <div class="page-subtitle">Extraction results and progress for this job.</div>
 
-              <!-- Error Alert Display -->
-              <?php if ($job['status'] === 'draft' && isset($job['progress_status']) && $job['progress_status'] === 'error'): ?>
+              <!-- Error Alert Display - Shows Actual Error Message -->
+              <?php if (!empty($job['error_message'])): ?>
               <div class="card" style="margin-bottom:18px; border-left:4px solid #dc3545; background:#f8d7da;">
                 <div style="padding:20px;">
                   <h3 style="margin:0 0 12px 0; color:#721c24; font-size:18px;">⚠️ Extraction Failed</h3>
                   <p style="margin:0 0 12px 0; color:#721c24;">The extraction job did not complete successfully.</p>
+                  
+                  <!-- Actual Error Message Box -->
+                  <div style="background:#fff; padding:12px; border:1px solid #f5c6cb; border-radius:4px; margin:12px 0;">
+                    <strong style="color:#721c24;">Error Details:</strong>
+                    <pre style="color:#dc3545; margin:8px 0; font-family:monospace; font-size:14px; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars($job['error_message']); ?></pre>
+                  </div>
+                  
                   <div style="margin:12px 0;">
-                    <strong style="color:#721c24;">Possible causes:</strong>
+                    <strong style="color:#721c24;">Common causes:</strong>
                     <ul style="margin:8px 0; padding-left:20px; color:#721c24;">
                       <li>Invalid or expired serper.dev API key</li>
-                      <li>API rate limit exceeded (HTTP 429 error)</li>
-                      <li>Network connection timeout or error</li>
-                      <li>Search query returned no results</li>
-                      <li>Server configuration issue (check PHP error_reporting)</li>
+                      <li>API rate limit exceeded (check your subscription plan)</li>
+                      <li>Network connection timeout or firewall blocking</li>
+                      <li>Malformed search query or invalid parameters</li>
+                      <li>Server PHP configuration issues (curl not enabled)</li>
                     </ul>
                   </div>
-                  <p style="margin:12px 0 0 0; color:#721c24;">
-                    <strong>Next steps:</strong> Check the <code>error.log</code> file on your server for detailed technical information, error messages, and stack traces.
-                  </p>
+                  <div style="margin:12px 0;">
+                    <strong style="color:#721c24;">Next steps:</strong>
+                    <ul style="margin:8px 0; padding-left:20px; color:#721c24;">
+                      <li>Verify your serper.dev API key in Job Profiles settings</li>
+                      <li>Check <code style="background:#fff;padding:2px 6px;border:1px solid #f5c6cb;border-radius:3px;">error.log</code> file for full technical stack trace</li>
+                      <li>Test your API key at <a href="https://serper.dev/playground" target="_blank" style="color:#0056b3;">serper.dev/playground</a></li>
+                      <li>Try running the extraction again after fixing the issue</li>
+                    </ul>
+                  </div>
                 </div>
               </div>
               <?php endif; ?>
