@@ -4681,13 +4681,22 @@ if ($action === 'save_job' || $action === 'save_campaign') {
         
         // Check if should start immediately
         if ($start_immediately) {
-            error_log("SAVE_JOB ACTION: start_immediately flag detected, redirecting to start_job action");
-            // Redirect with POST to start_job action
-            header("Location: ?page=list");
-            echo '<!DOCTYPE html><html><body><form id="startForm" method="POST" action="?page=list">';
+            error_log("SAVE_JOB ACTION: start_immediately flag detected, auto-submitting to start_job action");
+            // Auto-submit form to start_job action (DO NOT redirect before form submission!)
+            echo '<!DOCTYPE html><html><head><title>Starting Extraction...</title></head><body>';
+            echo '<div style="text-align:center; padding:50px; font-family:sans-serif;">';
+            echo '<h2>⏳ Starting Extraction...</h2>';
+            echo '<p>Please wait while we start the extraction job...</p>';
+            echo '</div>';
+            echo '<form id="startForm" method="POST" action="?page=list">';
             echo '<input type="hidden" name="action" value="start_job">';
             echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
-            echo '</form><script>document.getElementById("startForm").submit();</script></body></html>';
+            echo '</form>';
+            echo '<script>';
+            echo 'console.log("SAVE_JOB: Auto-submitting start_job form for job_id=' . (int)$id . '");';
+            echo 'document.getElementById("startForm").submit();';
+            echo '</script>';
+            echo '</body></html>';
             exit;
         } else {
             error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
