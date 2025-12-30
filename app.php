@@ -4323,14 +4323,14 @@ if ($action === 'get_campaign_progress') {
     }
 }
 
-if ($action === 'create_campaign') {
+if ($action === 'create_job' || $action === 'create_campaign') {
     $name = trim($_POST['name'] ?? '');
     if ($name === '') {
-        $name = 'New Single Send';
+        $name = 'New Extraction Job';
     }
     $stmt = $pdo->prepare("
-        INSERT INTO campaigns (name, subject, preheader, status)
-        VALUES (?, '', '', 'draft')
+        INSERT INTO jobs (name, status)
+        VALUES (?, 'draft')
     ");
     $stmt->execute([$name]);
     $newId = (int)$pdo->lastInsertId();
@@ -4338,26 +4338,21 @@ if ($action === 'create_campaign') {
     exit;
 }
 
-if ($action === 'duplicate_campaign') {
-    $cid = (int)($_POST['campaign_id'] ?? 0);
-    if ($cid > 0) {
+if ($action === 'duplicate_job' || $action === 'duplicate_campaign') {
+    $jid = (int)($_POST['job_id'] ?? $_POST['campaign_id'] ?? 0);
+    if ($jid > 0) {
         try {
-            $orig = get_campaign($pdo, $cid);
+            $orig = get_job($pdo, $jid);
             if ($orig) {
                 $newName = $orig['name'] . ' (Copy)';
                 $stmt = $pdo->prepare("
-                    INSERT INTO campaigns (name, subject, preheader, from_email, html, unsubscribe_enabled, sender_name, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')
+                    INSERT INTO jobs (name, profile_id, target_count, status)
+                    VALUES (?, ?, ?, 'draft')
                 ");
-                $htmlToStore = is_string($orig['html']) ? ('BASE64:' . base64_encode($orig['html'])) : '';
                 $stmt->execute([
                     $newName,
-                    $orig['subject'] ?? '',
-                    $orig['preheader'] ?? '',
-                    $orig['from_email'] ?? '',
-                    $htmlToStore,
-                    $orig['unsubscribe_enabled'] ?? 0,
-                    $orig['sender_name'] ?? '',
+                    $orig['profile_id'] ?? null,
+                    $orig['target_count'] ?? 100,
                 ]);
                 $newId = (int)$pdo->lastInsertId();
                 header("Location: ?page=editor&id={$newId}");
@@ -4369,8 +4364,8 @@ if ($action === 'duplicate_campaign') {
     exit;
 }
 
-if ($action === 'bulk_campaigns') {
-    $ids = $_POST['campaign_ids'] ?? [];
+if ($action === 'bulk_jobs' || $action === 'bulk_campaigns') {
+    $ids = $_POST['job_ids'] ?? $_POST['campaign_ids'] ?? [];
     $bulk_action = $_POST['bulk_action'] ?? '';
     if (!is_array($ids) || empty($ids)) {
         header("Location: ?page=list");
@@ -4380,31 +4375,26 @@ if ($action === 'bulk_campaigns') {
     if ($bulk_action === 'delete_selected') {
         foreach ($ids as $id) {
             try {
-                $stmt = $pdo->prepare("DELETE FROM events WHERE campaign_id = ?");
+                $stmt = $pdo->prepare("DELETE FROM extracted_emails WHERE job_id = ?");
                 $stmt->execute([$id]);
-                $stmt = $pdo->prepare("DELETE FROM campaigns WHERE id = ?");
+                $stmt = $pdo->prepare("DELETE FROM jobs WHERE id = ?");
                 $stmt->execute([$id]);
             } catch (Exception $e) {}
         }
     } elseif ($bulk_action === 'duplicate_selected') {
         foreach ($ids as $id) {
             try {
-                $orig = get_campaign($pdo, $id);
+                $orig = get_job($pdo, $id);
                 if ($orig) {
                     $newName = $orig['name'] . ' (Copy)';
                     $stmt = $pdo->prepare("
-                        INSERT INTO campaigns (name, subject, preheader, from_email, html, unsubscribe_enabled, sender_name, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')
+                        INSERT INTO jobs (name, profile_id, target_count, status)
+                        VALUES (?, ?, ?, 'draft')
                     ");
-                    $htmlToStore = is_string($orig['html']) ? ('BASE64:' . base64_encode($orig['html'])) : '';
                     $stmt->execute([
                         $newName,
-                        $orig['subject'] ?? '',
-                        $orig['preheader'] ?? '',
-                        $orig['from_email'] ?? '',
-                        $htmlToStore,
-                        $orig['unsubscribe_enabled'] ?? 0,
-                        $orig['sender_name'] ?? '',
+                        $orig['profile_id'] ?? null,
+                        $orig['target_count'] ?? 100,
                     ]);
                 }
             } catch (Exception $e) {}
@@ -4441,14 +4431,14 @@ if ($action === 'delete_bounces') {
     exit;
 }
 
-if ($action === 'delete_campaign') {
-    $cid = (int)($_POST['campaign_id'] ?? 0);
-    if ($cid > 0) {
+if ($action === 'delete_job' || $action === 'delete_campaign') {
+    $jid = (int)($_POST['job_id'] ?? $_POST['campaign_id'] ?? 0);
+    if ($jid > 0) {
         try {
-            $stmt = $pdo->prepare("DELETE FROM events WHERE campaign_id = ?");
-            $stmt->execute([$cid]);
-            $stmt = $pdo->prepare("DELETE FROM campaigns WHERE id = ?");
-            $stmt->execute([$cid]);
+            $stmt = $pdo->prepare("DELETE FROM extracted_emails WHERE job_id = ?");
+            $stmt->execute([$jid]);
+            $stmt = $pdo->prepare("DELETE FROM jobs WHERE id = ?");
+            $stmt->execute([$jid]);
         } catch (Exception $e) {
             // ignore
         }
@@ -4457,7 +4447,7 @@ if ($action === 'delete_campaign') {
     exit;
 }
 
-if ($action === 'save_campaign') {
+if ($action === 'save_campaign' || $action === 'save_job') {
     $id        = (int)($_POST['id'] ?? 0);
     $subject   = trim($_POST['subject'] ?? '');
     $preheader = trim($_POST['preheader'] ?? '');
@@ -5071,138 +5061,58 @@ if ($action === 'save_rotation') {
 if ($action === 'save_profile') {
     $profile_id   = (int)($_POST['profile_id'] ?? 0);
     $profile_name = trim($_POST['profile_name'] ?? '');
-    $type         = $_POST['type'] === 'api' ? 'api' : 'smtp';
-    $from_email   = trim($_POST['from_email'] ?? '');
-    $provider     = trim($_POST['provider'] ?? '');
-    
-    // Handle host selection: prioritize custom_host, then dropdown selection
-    $custom_host  = trim($_POST['custom_host'] ?? '');
-    if ($custom_host !== '') {
-        $host = $custom_host;
-    } else {
-        $host = trim($_POST['host'] ?? '');
-    }
-    
-    $port         = (int)($_POST['port'] ?? 0);
-    $username     = trim($_POST['username'] ?? '');
-    $password     = trim($_POST['password'] ?? '');
     $api_key      = trim($_POST['api_key'] ?? '');
-    $api_url      = trim($_POST['api_url'] ?? '');
-    $headers_json = trim($_POST['headers_json'] ?? '');
+    $search_query = trim($_POST['search_query'] ?? '');
+    $target_count = max(1, min(10000, (int)($_POST['target_count'] ?? 100)));
+    $country      = trim($_POST['country'] ?? '');
+    $filter_business_only = isset($_POST['filter_business_only']) ? 1 : 0;
     $active       = isset($_POST['active']) ? 1 : 0;
-
-    $profile_sender_name = trim($_POST['sender_name'] ?? '');
-
-    $bounce_server = trim($_POST['bounce_imap_server'] ?? '');
-    $bounce_user = trim($_POST['bounce_imap_user'] ?? '');
-    $bounce_pass = trim($_POST['bounce_imap_pass'] ?? '');
     
     // Workers field - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
     $profile_workers = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
     
     // OPTIONAL logging for monitoring (NOT a limit)
     if ($profile_workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Sending profile saved with $profile_workers workers (NOT an error)");
+        error_log("Info: Job profile saved with $profile_workers workers (NOT an error)");
     }
     
-    // Messages per worker field - controls maximum number of messages each worker handles
-    $profile_messages_per_worker = max(MIN_MESSAGES_PER_WORKER, min(MAX_MESSAGES_PER_WORKER, (int)($_POST['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER)));
+    // Emails per worker field - controls maximum number of emails each worker extracts
+    $profile_emails_per_worker = max(MIN_EMAILS_PER_WORKER, min(MAX_EMAILS_PER_WORKER, (int)($_POST['emails_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER)));
     
     // Cycle delay in milliseconds - delay between worker processing cycles
     $profile_cycle_delay_ms = max(MIN_CYCLE_DELAY_MS, min(MAX_CYCLE_DELAY_MS, (int)($_POST['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS)));
-    
-    // Keep old fields for backward compatibility (but set defaults, not from form)
-    $random_en    = 0;
-    $max_sends    = 0;
-    $send_rate    = 0;
 
     try {
         if ($profile_id > 0) {
             $stmt = $pdo->prepare("
-                UPDATE sending_profiles SET
-                  profile_name=?, type=?, from_email=?, provider=?, host=?, port=?, username=?, password=?,
-                  api_key=?, api_url=?, headers_json=?, active=?,
-                  bounce_imap_server=?, bounce_imap_user=?, bounce_imap_pass=?, sender_name=?, workers=?, messages_per_worker=?, cycle_delay_ms=?
+                UPDATE job_profiles SET
+                  profile_name=?, api_key=?, search_query=?, target_count=?, 
+                  filter_business_only=?, country=?, active=?,
+                  workers=?, emails_per_worker=?, cycle_delay_ms=?
                 WHERE id=?
             ");
             $stmt->execute([
-                $profile_name, $type, $from_email, $provider, $host, $port, $username, $password,
-                $api_key, $api_url, $headers_json, $active,
-                $bounce_server, $bounce_user, $bounce_pass, $profile_sender_name, $profile_workers, $profile_messages_per_worker, $profile_cycle_delay_ms,
+                $profile_name, $api_key, $search_query, $target_count,
+                $filter_business_only, $country, $active,
+                $profile_workers, $profile_emails_per_worker, $profile_cycle_delay_ms,
                 $profile_id
             ]);
         } else {
             $stmt = $pdo->prepare("
-                INSERT INTO sending_profiles
-                  (profile_name, type, from_email, provider, host, port, username, password,
-                   api_key, api_url, headers_json, active,
-                   bounce_imap_server, bounce_imap_user, bounce_imap_pass, sender_name, workers, messages_per_worker, cycle_delay_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO job_profiles
+                  (profile_name, api_key, search_query, target_count,
+                   filter_business_only, country, active,
+                   workers, emails_per_worker, cycle_delay_ms)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             ");
             $stmt->execute([
-                $profile_name, $type, $from_email, $provider, $host, $port, $username, $password,
-                $api_key, $api_url, $headers_json, $active,
-                $bounce_server, $bounce_user, $bounce_pass, $profile_sender_name, $profile_workers, $profile_messages_per_worker, $profile_cycle_delay_ms
+                $profile_name, $api_key, $search_query, $target_count,
+                $filter_business_only, $country, $active,
+                $profile_workers, $profile_emails_per_worker, $profile_cycle_delay_ms
             ]);
         }
     } catch (Exception $e) {
-        // Fallback for tables without newer columns
-        try {
-            if ($profile_id > 0) {
-                $stmt = $pdo->prepare("
-                    UPDATE sending_profiles SET
-                      profile_name=?, type=?, from_email=?, host=?, port=?, username=?, password=?,
-                      api_key=?, api_url=?, headers_json=?, active=?, sender_name=?, workers=?, messages_per_worker=?
-                    WHERE id=?
-                ");
-                $stmt->execute([
-                    $profile_name, $type, $from_email, $host, $port, $username, $password,
-                    $api_key, $api_url, $headers_json, $active, $profile_sender_name, $profile_workers, $profile_messages_per_worker,
-                    $profile_id
-                ]);
-            } else {
-                $stmt = $pdo->prepare("
-                    INSERT INTO sending_profiles
-                      (profile_name, type, from_email, host, port, username, password,
-                       api_key, api_url, headers_json, active, sender_name, workers, messages_per_worker)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ");
-                $stmt->execute([
-                    $profile_name, $type, $from_email, $host, $port, $username, $password,
-                    $api_key, $api_url, $headers_json, $active, $profile_sender_name, $profile_workers, $profile_messages_per_worker
-                ]);
-            }
-        } catch (Exception $e2) {
-            // Final fallback without provider, workers
-            try {
-                if ($profile_id > 0) {
-                    $stmt = $pdo->prepare("
-                        UPDATE sending_profiles SET
-                          profile_name=?, type=?, from_email=?, host=?, port=?, username=?, password=?,
-                          api_key=?, api_url=?, headers_json=?, active=?, sender_name=?
-                        WHERE id=?
-                    ");
-                    $stmt->execute([
-                        $profile_name, $type, $from_email, $host, $port, $username, $password,
-                        $api_key, $api_url, $headers_json, $active, $profile_sender_name,
-                        $profile_id
-                    ]);
-                } else {
-                    $stmt = $pdo->prepare("
-                        INSERT INTO sending_profiles
-                          (profile_name, type, from_email, host, port, username, password,
-                           api_key, api_url, headers_json, active, sender_name)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ");
-                    $stmt->execute([
-                        $profile_name, $type, $from_email, $host, $port, $username, $password,
-                        $api_key, $api_url, $headers_json, $active, $profile_sender_name
-                    ]);
-                }
-            } catch (Exception $e3) {
-                error_log("Failed to save profile: " . $e3->getMessage());
-            }
-        }
+        error_log("Failed to save job profile: " . $e->getMessage());
     }
 
     header("Location: ?page=list&profiles=1");
@@ -5212,7 +5122,7 @@ if ($action === 'save_profile') {
 if ($action === 'delete_profile') {
     $pid = (int)($_POST['profile_id'] ?? 0);
     if ($pid > 0) {
-        $stmt = $pdo->prepare("DELETE FROM sending_profiles WHERE id = ?");
+        $stmt = $pdo->prepare("DELETE FROM job_profiles WHERE id = ?");
         $stmt->execute([$pid]);
     }
     header("Location: ?page=list&profiles=1");
