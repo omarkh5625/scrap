@@ -6428,100 +6428,89 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
       <div class="nav-avatar"><?php echo strtoupper(substr($_SESSION['admin_username'] ?? 'A', 0, 1)); ?></div>
       <div class="nav-user-info">
         <div class="nav-user-email"><?php echo htmlspecialchars($_SESSION['admin_username'] ?? 'Admin'); ?></div>
-        <div class="nav-user-sub">MAFIA MAILER</div>
+        <div class="nav-user-sub">EMAIL EXTRACTOR</div>
       </div>
     </div>
     <div class="nav-scroll">
-      <div class="nav-section-title">Email Marketing</div>
+      <div class="nav-section-title">Email Extraction</div>
 
-      <div class="nav-section-title">Marketing</div>
+      <div class="nav-section-title">Jobs</div>
       <a href="?page=list" class="nav-link <?php echo $isSingleSendsPage ? 'active' : ''; ?>">
-        <span>Single Sends</span>
+        <span>Extraction Jobs</span>
       </a>
-      <a href="?page=contacts" class="nav-link <?php echo $isContactsPage ? 'active' : ''; ?>">
-        <span>Contacts</span>
-      </a>
-      <a href="#" class="nav-link"><span>Design Library</span></a>
+      <a href="#" class="nav-link"><span>Export Data</span></a>
 
       <div class="nav-section-title">Analytics</div>
       <a href="?page=stats" class="nav-link"><span>Stats</span></a>
-      <a href="?page=activity" class="nav-link"><span>Activity</span></a>
-      <a href="?page=tracking" class="nav-link"><span>Tracking Settings</span></a>
     </div>
     <div class="nav-footer">
       <a href="?action=logout" style="color: var(--sg-danger); display: block; padding: 8px 0; font-weight: 600;">🚪 Logout</a>
-      MAFIA MAILER v1.0<br>Professional Email Marketing
+      EMAIL EXTRACTOR v1.0<br>Professional Email Extraction
     </div>
   </aside>
 
-  <!-- LEFT SLIDE PANEL: Sending Profiles -->
+  <!-- LEFT SLIDE PANEL: Job Profiles -->
   <div class="sidebar-sp" id="spSidebar">
     <div class="sidebar-inner">
       <div class="sidebar-header">
-        <div class="sidebar-header-title">Sending Profiles</div>
+        <div class="sidebar-header-title">Job Profiles</div>
         <button class="btn btn-outline" type="button" id="spCloseBtn">✕</button>
       </div>
       <div class="sidebar-body">
         <!-- Rotation settings -->
         <form method="post" class="sp-rotation-card">
           <input type="hidden" name="action" value="save_rotation">
-          <div class="sidebar-section-title">Rotation Settings</div>
+          <div class="sidebar-section-title">Extraction Settings</div>
           <div class="checkbox-row">
             <input type="checkbox" name="rotation_enabled" id="rot_enabled" <?php if ($rotationSettings['rotation_enabled']) echo 'checked'; ?>>
-            <label for="rot_enabled">Enable Global SMTP/API Rotation</label>
+            <label for="rot_enabled">Enable Profile Rotation</label>
           </div>
           <div class="form-group">
             <label>Workers</label>
             <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo (int)($rotationSettings['workers'] ?? DEFAULT_WORKERS); ?>">
-            <small class="hint">⚠️ NO LIMIT - accepts ANY number (1, 100, 500, 1000+). Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical volume, 10-50 for high volume. Note: Values above 50 will log informational messages (not errors) for monitoring purposes only.</small>
+            <small class="hint">⚠️ NO LIMIT - accepts ANY number (1, 100, 500, 1000+). Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical volume, 10-50 for high volume.</small>
           </div>
           <div class="form-group">
-            <label>Messages Per Worker</label>
-            <input type="number" name="messages_per_worker" min="<?php echo MIN_MESSAGES_PER_WORKER; ?>" max="<?php echo MAX_MESSAGES_PER_WORKER; ?>" value="<?php echo (int)($rotationSettings['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER); ?>">
-            <small class="hint">Number of emails each worker processes (<?php echo MIN_MESSAGES_PER_WORKER; ?>-<?php echo MAX_MESSAGES_PER_WORKER; ?>, default: <?php echo DEFAULT_MESSAGES_PER_WORKER; ?>). Controls distribution granularity across workers.</small>
+            <label>Emails Per Worker</label>
+            <input type="number" name="emails_per_worker" min="<?php echo MIN_EMAILS_PER_WORKER; ?>" max="<?php echo MAX_EMAILS_PER_WORKER; ?>" value="<?php echo (int)($rotationSettings['emails_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER); ?>">
+            <small class="hint">Number of emails each worker extracts (<?php echo MIN_EMAILS_PER_WORKER; ?>-<?php echo MAX_EMAILS_PER_WORKER; ?>, default: <?php echo DEFAULT_EMAILS_PER_WORKER; ?>). Controls distribution granularity across workers.</small>
           </div>
           <div class="form-group">
             <small class="hint" style="display:block; margin-top:8px;">
-              When enabled, campaigns will rotate through all active sending profiles. 
-              Configure individual profiles with Workers to control parallel sending speed.
+              When enabled, jobs will rotate through all active extraction profiles. 
+              Configure individual profiles with Workers to control parallel extraction speed.
               <?php if (function_exists('pcntl_fork')): ?>
-                <br><strong style="color:#4CAF50;">✓ Parallel Mode Available:</strong> Multiple workers will send in parallel for maximum speed.
+                <br><strong style="color:#4CAF50;">✓ Parallel Mode Available:</strong> Multiple workers will extract in parallel for maximum speed.
               <?php else: ?>
                 <br><strong style="color:#ff9800;">⚠ Sequential Mode:</strong> PHP pcntl extension not available. Workers will process sequentially.
               <?php endif; ?>
             </small>
           </div>
-          <button class="btn btn-primary" type="submit">Save Rotation</button>
+          <button class="btn btn-primary" type="submit">Save Settings</button>
         </form>
 
         <!-- Profiles list -->
         <div class="profiles-list">
-          <div class="sidebar-section-title">Profiles</div>
+          <div class="sidebar-section-title">Extraction Profiles</div>
           <?php if (empty($profiles)): ?>
-            <div class="hint">No profiles yet. Create your first SMTP or API profile below.</div>
+            <div class="hint">No profiles yet. Create your first extraction profile below.</div>
           <?php else: ?>
             <?php foreach ($profiles as $p): ?>
               <div class="profile-card" id="profile-card-<?php echo (int)$p['id']; ?>">
                 <div class="profile-card-header">
                   <div class="profile-name"><?php echo h($p['profile_name']); ?></div>
-                  <div class="pill"><?php echo strtoupper($p['type']); ?> · <?php echo h($p['provider'] ?? 'Custom'); ?></div>
+                  <div class="pill">SERPER.DEV</div>
                 </div>
                 <div class="profile-meta">
-                  <span>From: <?php echo h($p['from_email']); ?></span>
-                  <?php if (!empty($p['sender_name'])): ?>
-                    <span>Sender: <?php echo h($p['sender_name']); ?></span>
-                  <?php endif; ?>
+                  <span>Query: <?php echo h(substr($p['search_query'] ?? '', 0, 50)); ?><?php echo strlen($p['search_query'] ?? '') > 50 ? '...' : ''; ?></span>
+                  <span>Target: <?php echo (int)($p['target_count'] ?? 100); ?> emails</span>
                   <span>Status: <?php echo $p['active'] ? 'Active' : 'Disabled'; ?></span>
                   <?php if (!empty($p['workers'])): ?>
                     <span>Workers: <?php echo (int)$p['workers']; ?></span>
                   <?php endif; ?>
-                  <?php if (!empty($p['messages_per_worker'])): ?>
-                    <span>Msgs/Worker: <?php echo (int)$p['messages_per_worker']; ?></span>
-                  <?php endif; ?>
                 </div>
                 <div class="profile-actions">
                   <a href="?page=list&edit_profile=<?php echo (int)$p['id']; ?>" class="btn-mini">Edit</a>
-                  <button type="button" class="btn-mini check-conn-btn" data-pid="<?php echo (int)$p['id']; ?>">Check Connection</button>
                   <form method="post" style="display:inline;">
                     <input type="hidden" name="action" value="delete_profile">
                     <input type="hidden" name="profile_id" value="<?php echo (int)$p['id']; ?>">
@@ -6546,8 +6535,53 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
             <input type="text" name="profile_name" required value="<?php echo $editProfile ? h($editProfile['profile_name']) : ''; ?>">
           </div>
           <div class="form-group">
-            <label>Profile Type</label>
-            <select name="type" id="pf_type">
+            <label>Serper.dev API Key</label>
+            <input type="text" name="api_key" required value="<?php echo $editProfile ? h($editProfile['api_key']) : ''; ?>">
+            <small class="hint">Your Serper.dev API key for email extraction</small>
+          </div>
+          <div class="form-group">
+            <label>Search Query</label>
+            <textarea name="search_query" rows="3" required><?php echo $editProfile ? h($editProfile['search_query']) : ''; ?></textarea>
+            <small class="hint">e.g., "real estate agents california"</small>
+          </div>
+          <div class="form-group">
+            <label>Target Email Count</label>
+            <input type="number" name="target_count" min="1" max="10000" value="<?php echo $editProfile ? (int)$editProfile['target_count'] : 100; ?>">
+            <small class="hint">Number of emails to extract (1-10000)</small>
+          </div>
+          <div class="form-group">
+            <label>Country (optional)</label>
+            <input type="text" name="country" placeholder="us" value="<?php echo $editProfile ? h($editProfile['country']) : ''; ?>">
+            <small class="hint">ISO country code (e.g., us, uk, ca)</small>
+          </div>
+          <div class="checkbox-row">
+            <input type="checkbox" name="filter_business_only" id="pf_business" <?php if (!$editProfile || $editProfile['filter_business_only']) echo 'checked'; ?>>
+            <label for="pf_business">Business Emails Only (filter out free providers)</label>
+          </div>
+          <div class="form-group">
+            <label>Workers</label>
+            <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)$editProfile['workers'] : DEFAULT_WORKERS; ?>">
+            <small class="hint">Number of parallel extraction workers</small>
+          </div>
+          <div class="form-group">
+            <label>Emails Per Worker</label>
+            <input type="number" name="emails_per_worker" min="<?php echo MIN_EMAILS_PER_WORKER; ?>" max="<?php echo MAX_EMAILS_PER_WORKER; ?>" value="<?php echo $editProfile ? (int)$editProfile['emails_per_worker'] : DEFAULT_EMAILS_PER_WORKER; ?>">
+            <small class="hint">Emails per worker cycle</small>
+          </div>
+          <div class="checkbox-row">
+            <input type="checkbox" name="active" id="pf_active" <?php if (!$editProfile || $editProfile['active']) echo 'checked'; ?>>
+            <label for="pf_active">Active</label>
+          </div>
+          <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <?php if ($editProfile): ?>
+              <a href="?page=list" class="btn btn-outline">Cancel</a>
+            <?php endif; ?>
+            <button class="btn btn-primary" type="submit"><?php echo $editProfile ? 'Update' : 'Create'; ?> Profile</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
               <option value="smtp" <?php if(!$editProfile || $editProfile['type']==='smtp') echo 'selected'; ?>>SMTP</option>
               <option value="api"  <?php if($editProfile && $editProfile['type']==='api') echo 'selected'; ?>>API</option>
             </select>
@@ -6732,20 +6766,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
         <div class="card">
           <div class="card-header">
             <div>
-              <div class="card-title">Campaigns</div>
-              <div class="card-subtitle">Draft and sent Single Sends with live stats.</div>
+              <div class="card-title">Extraction Jobs</div>
+              <div class="card-subtitle">Create and manage email extraction jobs.</div>
             </div>
             <form method="post" style="display:flex; gap:8px; align-items:center;">
-              <input type="hidden" name="action" value="create_campaign">
-              <input type="text" name="name" placeholder="Campaign name" style="font-size:13px; padding:6px 8px;">
-              <button type="submit" class="btn btn-primary">+ Create Single Send</button>
+              <input type="hidden" name="action" value="create_job">
+              <input type="text" name="name" placeholder="Job name" style="font-size:13px; padding:6px 8px;">
+              <button type="submit" class="btn btn-primary">+ Create Extraction Job</button>
             </form>
           </div>
 
           <!-- Bulk actions toolbar -->
           <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
             <form method="post" id="bulkActionsForm" style="display:flex; gap:8px; align-items:center;">
-              <input type="hidden" name="action" value="bulk_campaigns">
+              <input type="hidden" name="action" value="bulk_jobs">
               <select name="bulk_action" id="bulkActionSelect" style="padding:6px;">
                 <option value="">Bulk actions</option>
                 <option value="delete_selected">Delete selected</option>
@@ -6753,63 +6787,67 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               </select>
               <button type="submit" class="btn btn-outline">Apply</button>
             </form>
-
-            <div style="margin-left:auto; display:flex; gap:8px;">
-              <form method="post" onsubmit="return confirm('Delete ALL unsubscribes? This will remove every address from unsubscribes table.');">
-                <input type="hidden" name="action" value="delete_unsubscribes">
-                <button class="btn btn-outline" type="submit">Clear Unsubscribes</button>
-              </form>
-              <form method="post" onsubmit="return confirm('Delete ALL bounce events? This will remove all bounce events from events table.');">
-                <input type="hidden" name="action" value="delete_bounces">
-                <button class="btn btn-outline" type="submit">Clear Bounces</button>
-              </form>
-            </div>
           </div>
 
-          <form method="post" id="campaignsTableForm">
-            <input type="hidden" name="action" value="bulk_campaigns">
+          <form method="post" id="jobsTableForm">
+            <input type="hidden" name="action" value="bulk_jobs">
             <table class="table">
               <thead>
                 <tr>
                   <th style="width:36px;"><input type="checkbox" id="chkAll"></th>
-                  <th>Campaign</th>
+                  <th>Job Name</th>
                   <th>Status</th>
-                  <th>Subject</th>
-                  <th>Sent</th>
+                  <th>Profile</th>
+                  <th>Extracted</th>
                   <th>Target</th>
-                  <th>Bounces</th>
-                  <th>Delivered</th>
-                  <th>Opens</th>
-                  <th>Clicks</th>
-                  <th>Updated</th>
+                  <th>Progress</th>
+                  <th>Created</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 <?php if (empty($campaigns)): ?>
                   <tr>
-                    <td colspan="12" style="text-align:center; padding:20px; color:var(--sg-muted);">
-                      No campaigns yet. Create your first Single Send above.
+                    <td colspan="9" style="text-align:center; padding:20px; color:var(--sg-muted);">
+                      No jobs yet. Create your first extraction job above.
                     </td>
                   </tr>
-                                 <?php else: ?>
+                <?php else: ?>
                   <?php foreach ($campaigns as $c):
-                    $stats = get_campaign_stats($pdo, (int)$c['id']);
+                    $stats = get_job_stats($pdo, (int)$c['id']);
                     $status = $c['status'];
-                    // Support queued status: Grey (draft) → Orange (queued) → Yellow (sending) → Green (sent)
-                    if ($status === 'sent') {
+                    // Support statuses: Grey (draft) → Orange (queued) → Yellow (extracting) → Green (completed)
+                    if ($status === 'completed' || $status === 'sent') {
                         $dotClass = 'status-sent';
-                    } elseif ($status === 'sending') {
+                        $statusLabel = 'Completed';
+                    } elseif ($status === 'extracting' || $status === 'sending') {
                         $dotClass = 'status-sending';
+                        $statusLabel = 'Extracting';
                     } elseif ($status === 'queued') {
                         $dotClass = 'status-queued';
+                        $statusLabel = 'Queued';
                     } else {
                         $dotClass = 'status-draft';
+                        $statusLabel = 'Draft';
                     }
-                    $link = ($status === 'sent' || $status === 'sending' || $status === 'queued') ? '?page=stats&id='.$c['id'] : '?page=editor&id='.$c['id'];
+                    $link = ($status === 'completed' || $status === 'sent' || $status === 'extracting' || $status === 'sending' || $status === 'queued') ? '?page=stats&id='.$c['id'] : '?page=editor&id='.$c['id'];
+                    
+                    $profileName = 'N/A';
+                    if (!empty($c['profile_id'])) {
+                        foreach ($profiles as $p) {
+                            if ($p['id'] == $c['profile_id']) {
+                                $profileName = $p['profile_name'];
+                                break;
+                            }
+                        }
+                    }
+                    
+                    $extracted = (int)($c['progress_extracted'] ?? 0);
+                    $target = (int)($c['progress_total'] ?? $c['target_count'] ?? 0);
+                    $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
                   ?>
                     <tr data-cid="<?php echo (int)$c['id']; ?>">
-                      <td><input type="checkbox" name="campaign_ids[]" value="<?php echo (int)$c['id']; ?>" class="campaign-checkbox"></td>
+                      <td><input type="checkbox" name="job_ids[]" value="<?php echo (int)$c['id']; ?>" class="job-checkbox"></td>
                       <td>
                         <a href="<?php echo $link; ?>">
                           <span class="status-dot <?php echo $dotClass; ?>"></span>
