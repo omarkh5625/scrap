@@ -1279,6 +1279,70 @@ class Worker {
         return implode(' ', $parts);
     }
     
+    /**
+     * Get system resource usage (RAM and CPU)
+     * Returns array with memory and CPU usage information
+     */
+    public static function getSystemResources(): array {
+        $resources = [
+            'memory_used_mb' => 0,
+            'memory_limit_mb' => 0,
+            'memory_usage_percent' => 0,
+            'cpu_load_average' => [],
+            'peak_memory_mb' => 0
+        ];
+        
+        // Get memory usage
+        $memoryUsed = memory_get_usage(true);
+        $peakMemory = memory_get_peak_usage(true);
+        $memoryLimit = ini_get('memory_limit');
+        
+        // Convert memory limit to bytes
+        $memoryLimitBytes = self::convertToBytes($memoryLimit);
+        
+        $resources['memory_used_mb'] = round($memoryUsed / 1024 / 1024, 2);
+        $resources['peak_memory_mb'] = round($peakMemory / 1024 / 1024, 2);
+        $resources['memory_limit_mb'] = round($memoryLimitBytes / 1024 / 1024, 2);
+        
+        if ($memoryLimitBytes > 0) {
+            $resources['memory_usage_percent'] = round(($memoryUsed / $memoryLimitBytes) * 100, 2);
+        }
+        
+        // Get CPU load average (Unix/Linux only)
+        if (function_exists('sys_getloadavg')) {
+            $loadAvg = sys_getloadavg();
+            $resources['cpu_load_average'] = [
+                '1min' => round($loadAvg[0], 2),
+                '5min' => round($loadAvg[1], 2),
+                '15min' => round($loadAvg[2], 2)
+            ];
+        }
+        
+        return $resources;
+    }
+    
+    /**
+     * Convert PHP memory limit string to bytes
+     */
+    private static function convertToBytes(string $value): int {
+        $value = trim($value);
+        $last = strtolower($value[strlen($value)-1]);
+        $value = (int)$value;
+        
+        switch($last) {
+            case 'g':
+                $value *= 1024;
+                // fall through
+            case 'm':
+                $value *= 1024;
+                // fall through
+            case 'k':
+                $value *= 1024;
+        }
+        
+        return $value;
+    }
+    
     public static function getAll(): array {
         $db = Database::connect();
         $stmt = $db->query("SELECT * FROM workers ORDER BY created_at DESC");
@@ -2130,6 +2194,11 @@ class Router {
                 
             case 'worker-stats':
                 echo json_encode(Worker::getStats());
+                break;
+                
+            case 'system-resources':
+                // Get system resource usage (RAM and CPU)
+                echo json_encode(Worker::getSystemResources());
                 break;
                 
             case 'diagnostic':
@@ -4707,6 +4776,41 @@ class Router {
                 </div>
             </div>
             
+            <!-- System Resource Monitoring -->
+            <div class="card">
+                <h2>💻 System Resources</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">🧠</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="memory-usage">-</div>
+                            <div class="stat-label">Memory Usage</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="memory-percent">-</div>
+                            <div class="stat-label">Memory %</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">⚡</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="cpu-load">-</div>
+                            <div class="stat-label">CPU Load (1m)</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📈</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="peak-memory">-</div>
+                            <div class="stat-label">Peak Memory</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                     <h2>Active Workers</h2>
@@ -4875,6 +4979,22 @@ class Router {
                             }
                         })
                         .catch(err => console.error('Error fetching queue stats:', err));
+                    
+                    // Update system resources
+                    fetch('?page=api&action=system-resources')
+                        .then(res => res.json())
+                        .then(resources => {
+                            document.getElementById('memory-usage').textContent = resources.memory_used_mb + ' MB';
+                            document.getElementById('memory-percent').textContent = resources.memory_usage_percent + '%';
+                            document.getElementById('peak-memory').textContent = resources.peak_memory_mb + ' MB';
+                            
+                            if (resources.cpu_load_average && resources.cpu_load_average['1min']) {
+                                document.getElementById('cpu-load').textContent = resources.cpu_load_average['1min'];
+                            } else {
+                                document.getElementById('cpu-load').textContent = 'N/A';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching system resources:', err));
                 }
                 
                 function updateWorkers() {
