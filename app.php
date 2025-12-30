@@ -3739,13 +3739,16 @@ class Router {
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method");
-            // Method 1: Spawn background PHP processes (only if exec available)
+            error_log("autoSpawnWorkers: Using exec() method for {$workerCount} workers");
+            // Method 1: Spawn background PHP processes (only if exec available) - TRULY PARALLEL
             self::spawnWorkersViaExec($workerCount);
+        } elseif (function_exists('curl_init')) {
+            error_log("autoSpawnWorkers: exec() not available, using HTTP method for {$workerCount} workers");
+            // Method 2: HTTP-based worker spawning via curl_multi - PARALLEL via HTTP
+            self::spawnWorkersViaHttp($workerCount);
         } else {
-            // Method 2: Direct background processing (no exec, no HTTP, no cron needed)
-            // Process work in same request but after closing connection to user
-            error_log("autoSpawnWorkers: exec() not available, using direct background processing");
+            // Method 3: Direct background processing (no exec, no curl, no cron needed) - SEQUENTIAL FALLBACK
+            error_log("autoSpawnWorkers: Neither exec() nor curl available, using sequential processing for {$workerCount} workers");
             self::processWorkersInBackground($workerCount);
         }
     }
