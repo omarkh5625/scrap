@@ -192,6 +192,12 @@ class Database {
                 self::$pdo->exec("ALTER TABLE workers ADD COLUMN error_count INT DEFAULT 0 AFTER runtime_seconds");
                 self::$pdo->exec("ALTER TABLE workers ADD COLUMN last_error TEXT AFTER error_count");
             }
+            
+            // Migration: Add worker_count column to jobs table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'worker_count'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN worker_count INT DEFAULT 1 AFTER max_results");
+            }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
             // Don't die on migration errors, just log them
@@ -253,6 +259,7 @@ class Database {
                     query VARCHAR(500) NOT NULL,
                     api_key VARCHAR(255) NOT NULL,
                     max_results INT DEFAULT 100,
+                    worker_count INT DEFAULT 1,
                     country VARCHAR(100),
                     email_filter VARCHAR(50),
                     status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
@@ -1012,11 +1019,11 @@ class Job {
     // Configuration constants
     private const BULK_INSERT_BATCH_SIZE = 1000;
     
-    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
+    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null, int $workerCount = 1): int {
         try {
             $db = Database::connect();
-            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
-            $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
+            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, worker_count, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')");
+            $stmt->execute([$userId, $query, $apiKey, $maxResults, $workerCount, $country, $emailFilter]);
             
             $jobId = (int)$db->lastInsertId();
             
@@ -1162,7 +1169,7 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
+    public const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
     private const OPTIMAL_RESULTS_PER_WORKER = 50; // Optimal number of results per worker for best performance (reduced to spawn more workers)
     
     /**
@@ -2150,10 +2157,17 @@ class Router {
                 $jobId = (int)($_POST['job_id'] ?? 0);
                 
                 if ($jobId > 0) {
-                    // Get job details to calculate optimal worker count
+                    // Get job details to get stored worker count
                     $job = Job::getById($jobId);
                     if ($job) {
-                        $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                        // Use the worker count specified when the job was created
+                        // This respects the user's input from the UI
+                        $workerCount = isset($job['worker_count']) && $job['worker_count'] > 0
+                            ? (int)$job['worker_count']
+                            : Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                        
+                        // Ensure worker count is within valid range
+                        $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                     } else {
                         // Default fallback to at least 1 worker
                         $workerCount = 1;
@@ -2223,7 +2237,7 @@ class Router {
                             : Worker::calculateOptimalWorkerCount($maxResults);
                         
                         // Ensure worker count is within valid range
-                        $workerCount = max(1, min(1000, $workerCount));
+                        $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                         
                         if (empty($query) || empty($apiKey)) {
                             header('Content-Type: application/json');
@@ -2232,7 +2246,7 @@ class Router {
                         }
                         
                         // Create job - this should be fast (< 100ms)
-                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter, $workerCount);
                         
                         // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
                         // This divides the work among workers so they search in parallel without duplication
@@ -2293,7 +2307,14 @@ class Router {
                         // Get job to determine worker count
                         $job = Job::getById($jobId);
                         if ($job) {
-                            $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            // Use the worker count specified when the job was created
+                            // This respects the user's input from the UI
+                            $workerCount = isset($job['worker_count']) && $job['worker_count'] > 0
+                                ? (int)$job['worker_count']
+                                : Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            
+                            // Ensure worker count is within valid range (1 to AUTO_MAX_WORKERS)
+                            $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                             
                             // Prepare response
                             $response = json_encode([
@@ -2845,14 +2866,14 @@ class Router {
                         : Worker::calculateOptimalWorkerCount($maxResults);
                     
                     // Ensure worker count is within valid range
-                    $workerCount = max(1, min(1000, $workerCount));
+                    $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                     
                     // Validate required fields
                     if (!$query || !$apiKey) {
                         $error = 'Query and API Key are required';
                     } else {
-                        // Create job for immediate processing
-                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        // Create job for immediate processing with worker count
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter, $workerCount);
                         
                         // Prepare queue items with specified worker count
                         // This divides the work among workers so they search in parallel without duplication
@@ -3716,6 +3737,8 @@ class Router {
     
     private static function autoSpawnWorkers(int $workerCount): void {
         error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
+        error_log("autoSpawnWorkers: Current PHP version: " . PHP_VERSION);
+        error_log("autoSpawnWorkers: PHP_BINARY: " . PHP_BINARY);
         
         // For restricted hosting environments (exec disabled, no cron), 
         // process work directly in background after closing connection
@@ -3723,8 +3746,10 @@ class Router {
         
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
         
+        error_log("autoSpawnWorkers: exec() available: " . ($execAvailable ? 'YES' : 'NO'));
+        
         if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method");
+            error_log("autoSpawnWorkers: Using exec() method to spawn workers");
             // Method 1: Spawn background PHP processes (only if exec available)
             self::spawnWorkersViaExec($workerCount);
         } else {
@@ -3733,11 +3758,17 @@ class Router {
             error_log("autoSpawnWorkers: exec() not available, using direct background processing");
             self::processWorkersInBackground($workerCount);
         }
+        
+        error_log("autoSpawnWorkers: Completed worker spawning for {$workerCount} workers");
     }
     
     private static function spawnWorkersViaExec(int $workerCount): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
+        
+        error_log("spawnWorkersViaExec: Starting to spawn {$workerCount} workers using exec()");
+        error_log("spawnWorkersViaExec: PHP Binary: {$phpBinary}");
+        error_log("spawnWorkersViaExec: Script Path: {$scriptPath}");
         
         for ($i = 0; $i < $workerCount; $i++) {
             // Build command to run worker in queue mode
@@ -3758,8 +3789,10 @@ class Router {
                 exec($cmd);
             }
             
-            error_log("Spawned worker: {$workerName}");
+            error_log("spawnWorkersViaExec: Spawned worker #{$i}: {$workerName} with command: {$cmd}");
         }
+        
+        error_log("spawnWorkersViaExec: Completed spawning {$workerCount} workers");
     }
     
     private static function spawnWorkersViaHttp(int $workerCount): int {
