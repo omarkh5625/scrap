@@ -1504,7 +1504,7 @@ class Worker {
         ];
     }
     
-    public static function getNextJob(): ?array {
+    public static function getNextJob(?int $jobId = null): ?array {
         $db = Database::connect();
         
         // Use transaction to prevent race conditions
@@ -1512,8 +1512,14 @@ class Worker {
         
         try {
             // First check job_queue for pending chunks
-            $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-            $stmt->execute();
+            // If jobId is specified, only get queue items for that specific job
+            if ($jobId !== null) {
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute([$jobId]);
+            } else {
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute();
+            }
             $queueItem = $stmt->fetch();
             
             if ($queueItem) {
@@ -1538,8 +1544,14 @@ class Worker {
             }
             
             // Fallback to old method: check for pending jobs without queue
-            $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-            $stmt->execute();
+            // If jobId is specified, only check that specific job
+            if ($jobId !== null) {
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
+                $stmt->execute([$jobId]);
+            } else {
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute();
+            }
             $job = $stmt->fetch();
             
             if ($job) {
@@ -2106,7 +2118,13 @@ class Router {
         echo "=== PHP Email Extraction System Worker ===\n";
         
         $workerName = $argv[1] ?? 'worker-' . uniqid();
+        // Check if job_id is provided as second argument
+        $jobId = isset($argv[2]) && is_numeric($argv[2]) ? (int)$argv[2] : null;
+        
         echo "Worker: {$workerName}\n";
+        if ($jobId !== null) {
+            echo "Dedicated to Job ID: {$jobId}\n";
+        }
         
         $workerId = Worker::register($workerName);
         echo "Worker ID: {$workerId}\n";
@@ -2118,12 +2136,20 @@ class Router {
         while (true) {
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
-            $job = Worker::getNextJob();
+            // Pass job_id to only get queue items for that specific job
+            $job = Worker::getNextJob($jobId);
             
             if ($job) {
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                 Worker::processJob($job['id']);
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } else if ($jobId !== null) {
+                // If dedicated to a specific job and no work found, check if job is complete
+                $jobDetails = Job::getById($jobId);
+                if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
+                    echo "Job {$jobId} is complete or not found. Exiting.\n";
+                    break;
+                }
             }
             
             sleep($pollingInterval);
@@ -2523,7 +2549,7 @@ class Router {
                             
                             try {
                                 error_log("trigger-workers: Spawning {$workerCount} workers for job {$jobId}");
-                                self::autoSpawnWorkers($workerCount);
+                                self::autoSpawnWorkers($workerCount, $jobId);
                                 error_log("trigger-workers: Worker spawning completed for job {$jobId}");
                             } catch (Exception $e) {
                                 error_log('trigger-workers: Worker spawning error: ' . $e->getMessage());
@@ -3067,7 +3093,7 @@ class Router {
                         // Now spawn workers in background after response sent
                         ignore_user_abort(true);
                         set_time_limit(300);
-                        self::autoSpawnWorkers($workerCount);
+                        self::autoSpawnWorkers($workerCount, $jobId);
                         
                         exit;
                     }
@@ -3815,7 +3841,7 @@ class Router {
         // Spawn workers asynchronously in background (NOT synchronously!)
         // This allows workers to run in parallel, not sequentially
         // تشغيل العمال بشكل غير متزامن في الخلفية (وليس بشكل متزامن!)
-        self::autoSpawnWorkers($workerCount);
+        self::autoSpawnWorkers($workerCount, $jobId);
         
         error_log("✓ Triggered async spawning of {$workerCount} workers for job {$jobId}");
     }
@@ -3907,8 +3933,8 @@ class Router {
     }
     */
     
-    private static function autoSpawnWorkers(int $workerCount): void {
-        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers");
+    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
+        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers for job " . ($jobId ?? 'any'));
         
         // For restricted hosting environments (exec disabled, no cron), 
         // process work directly in background after closing connection
@@ -3919,27 +3945,33 @@ class Router {
         if ($execAvailable) {
             error_log("autoSpawnWorkers: Using exec() method");
             // Method 1: Spawn background PHP processes (only if exec available)
-            self::spawnWorkersViaExec($workerCount);
+            self::spawnWorkersViaExec($workerCount, $jobId);
         } else {
             // Method 2: Direct background processing (no exec, no HTTP, no cron needed)
             // Process work in same request but after closing connection to user
             error_log("autoSpawnWorkers: exec() not available, using direct background processing");
-            self::processWorkersInBackground($workerCount);
+            self::processWorkersInBackground($workerCount, $jobId);
         }
     }
     
-    private static function spawnWorkersViaExec(int $workerCount): void {
+    private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
         for ($i = 0; $i < $workerCount; $i++) {
             // Build command to run worker in queue mode
-            $workerName = 'auto-worker-' . uniqid() . '-' . $i;
+            // Include job_id if specified so worker only processes that job
+            $workerName = 'auto-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+            
+            // Pass job_id as second argument if specified
+            $jobIdArg = $jobId !== null ? ' ' . escapeshellarg((string)$jobId) : '';
+            
             $cmd = sprintf(
-                '%s %s %s > /dev/null 2>&1 &',
+                '%s %s %s%s > /dev/null 2>&1 &',
                 escapeshellarg($phpBinary),
                 escapeshellarg($scriptPath),
-                escapeshellarg($workerName)
+                escapeshellarg($workerName),
+                $jobIdArg
             );
             
             // Execute in background
@@ -3951,7 +3983,7 @@ class Router {
                 exec($cmd);
             }
             
-            error_log("Spawned worker: {$workerName}");
+            error_log("Spawned worker: {$workerName}" . ($jobId ? " for job {$jobId}" : ""));
         }
     }
     
@@ -4099,8 +4131,8 @@ class Router {
      * This method works without exec, HTTP workers, or cron
      * Connection must be closed BEFORE calling this method
      */
-    private static function processWorkersInBackground(int $workerCount): void {
-        error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers");
+    private static function processWorkersInBackground(int $workerCount, ?int $jobId = null): void {
+        error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
         
         // Connection should already be closed by caller
         // Just ensure we can continue after user disconnect
@@ -4124,7 +4156,7 @@ class Router {
                     break;
                 }
                 
-                $workerName = 'bg-worker-' . uniqid() . '-' . $workerIndex;
+                $workerName = 'bg-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $workerIndex;
                 
                 try {
                     $workerId = Worker::register($workerName);
@@ -4140,20 +4172,21 @@ class Router {
                     for ($i = 0; $i < $maxItemsPerWorker; $i++) {
                         Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                         
-                        $job = Worker::getNextJob();
+                        // Pass job_id to only get queue items for that specific job
+                        $job = Worker::getNextJob($jobId);
                         
                         if ($job) {
                             // Check if job has reached target email count
-                            $jobId = (int)$job['id'];
-                            $jobDetails = Job::getById($jobId);
+                            $currentJobId = (int)$job['id'];
+                            $jobDetails = Job::getById($currentJobId);
                             if ($jobDetails) {
-                                $emailsCollected = Job::getEmailCount($jobId);
+                                $emailsCollected = Job::getEmailCount($currentJobId);
                                 $maxResults = (int)$jobDetails['max_results'];
                                 
                                 if ($emailsCollected >= $maxResults) {
-                                    error_log("processWorkersInBackground: Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
+                                    error_log("processWorkersInBackground: Job {$currentJobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
                                     // Mark remaining queue items as complete
-                                    Worker::checkAndUpdateJobCompletion($jobId);
+                                    Worker::checkAndUpdateJobCompletion($currentJobId);
                                     continue; // Skip this job, get next one
                                 }
                             }
