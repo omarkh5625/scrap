@@ -197,7 +197,6 @@ class Database {
             $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'worker_count'");
             if ($stmt->rowCount() === 0) {
                 self::$pdo->exec("ALTER TABLE jobs ADD COLUMN worker_count INT DEFAULT 1 AFTER max_results");
-                self::$pdo->exec("ALTER TABLE jobs ADD INDEX idx_worker_count (worker_count)");
             }
         } catch (PDOException $e) {
             error_log('Migration error: ' . $e->getMessage());
@@ -270,8 +269,7 @@ class Database {
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                     INDEX idx_status (status),
                     INDEX idx_created (created_at),
-                    INDEX idx_country (country),
-                    INDEX idx_worker_count (worker_count)
+                    INDEX idx_country (country)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             ");
             
@@ -1171,7 +1169,7 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
+    public const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
     private const OPTIMAL_RESULTS_PER_WORKER = 50; // Optimal number of results per worker for best performance (reduced to spawn more workers)
     
     /**
@@ -2232,7 +2230,7 @@ class Router {
                             : Worker::calculateOptimalWorkerCount($maxResults);
                         
                         // Ensure worker count is within valid range
-                        $workerCount = max(1, min(1000, $workerCount));
+                        $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                         
                         if (empty($query) || empty($apiKey)) {
                             header('Content-Type: application/json');
@@ -2308,8 +2306,8 @@ class Router {
                                 ? (int)$job['worker_count']
                                 : Worker::calculateOptimalWorkerCount((int)$job['max_results']);
                             
-                            // Ensure worker count is within valid range
-                            $workerCount = max(1, min(1000, $workerCount));
+                            // Ensure worker count is within valid range (1 to AUTO_MAX_WORKERS)
+                            $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                             
                             // Prepare response
                             $response = json_encode([
@@ -2861,7 +2859,7 @@ class Router {
                         : Worker::calculateOptimalWorkerCount($maxResults);
                     
                     // Ensure worker count is within valid range
-                    $workerCount = max(1, min(1000, $workerCount));
+                    $workerCount = max(1, min(Worker::AUTO_MAX_WORKERS, $workerCount));
                     
                     // Validate required fields
                     if (!$query || !$apiKey) {
