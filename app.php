@@ -104,6 +104,12 @@ class Database {
                 self::$pdo->exec("ALTER TABLE jobs ADD COLUMN email_filter VARCHAR(50) AFTER country");
             }
             
+            // Migration: Add error_message column to jobs table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'error_message'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN error_message TEXT DEFAULT NULL AFTER progress");
+            }
+            
             // Migration: Create emails table if it doesn't exist (rename from results)
             $stmt = self::$pdo->query("SHOW TABLES LIKE 'emails'");
             if ($stmt->rowCount() === 0) {
@@ -257,6 +263,7 @@ class Database {
                     email_filter VARCHAR(50),
                     status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
                     progress INT DEFAULT 0,
+                    error_message TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -1050,6 +1057,12 @@ class Job {
         $stmt->execute([$status, $progress, $jobId]);
     }
     
+    public static function setError(int $jobId, string $errorMessage): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+        $stmt->execute([$errorMessage, $jobId]);
+    }
+    
     public static function getResults(int $jobId): array {
         $db = Database::connect();
         $stmt = $db->prepare("SELECT * FROM emails WHERE job_id = ? ORDER BY created_at DESC");
@@ -1746,7 +1759,7 @@ class Worker {
         }
     }
     
-    public static function processJob(int $jobId): void {
+    public static function processJob(int $jobId, ?int $existingWorkerId = null, ?string $existingWorkerName = null): void {
         $job = Job::getById($jobId);
         if (!$job) {
             return;
@@ -1754,9 +1767,14 @@ class Worker {
         
         echo "Processing job #{$jobId}: {$job['query']}\n";
         
-        // Register this worker for tracking
-        $workerName = 'cli-worker-' . getmypid();
-        $workerId = self::register($workerName);
+        // Register this worker for tracking (or use existing worker)
+        if ($existingWorkerId && $existingWorkerName) {
+            $workerName = $existingWorkerName;
+            $workerId = $existingWorkerId;
+        } else {
+            $workerName = 'cli-worker-' . getmypid();
+            $workerId = self::register($workerName);
+        }
         self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
         
         $apiKey = $job['api_key'];
@@ -2452,11 +2470,24 @@ class Router {
                             break;
                         }
                         
+                        // CHECK: Verify proc_open is available BEFORE creating job
+                        if (!function_exists('proc_open') || in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+                            $errorMsg = 'proc_open is not available on this server. Parallel worker processing requires proc_open to be enabled in PHP configuration. Please contact your hosting provider to enable proc_open function.';
+                            error_log("Job creation failed: {$errorMsg}");
+                            header('Content-Type: application/json');
+                            echo json_encode([
+                                'success' => false, 
+                                'error' => $errorMsg
+                            ]);
+                            break;
+                        }
+                        
                         // Create job - this should be fast (< 100ms)
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
                         // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
                         // This divides the work among workers so they search in parallel without duplication
+                        // NOTE: This will mark job as "running" - we'll update to "failed" if workers don't spawn
                         self::createQueueItems($jobId, $workerCount);
                         
                         // Return success IMMEDIATELY to prevent UI hanging
@@ -3946,15 +3977,39 @@ class Router {
     }
     */
     
-    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
-        error_log("autoSpawnWorkers: Force-spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
+    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): int {
+        error_log("autoSpawnWorkers: Spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
         
-        // FORCE direct background processing - most reliable method
-        // This always works regardless of hosting environment
-        error_log("autoSpawnWorkers: Using FORCED direct background processing (most reliable)");
-        self::processWorkersInBackground($workerCount, $jobId);
-        
-        error_log("autoSpawnWorkers: Completed - workers are now processing in background");
+        // Use proc_open for parallel processing (compatible with cPanel)
+        if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+            error_log("autoSpawnWorkers: Using proc_open for PARALLEL processing");
+            $spawnedCount = self::spawnWorkersViaProcOpen($workerCount, $jobId);
+            
+            if ($spawnedCount === 0 && $jobId) {
+                // No workers spawned - mark job as failed
+                $errorMsg = "Failed to spawn any workers using proc_open. Check server logs for details.";
+                error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
+                Job::updateStatus($jobId, 'failed', 0);
+                Job::setError($jobId, $errorMsg);
+            } elseif ($spawnedCount < $workerCount && $jobId) {
+                // Some workers failed to spawn - log warning but continue
+                error_log("autoSpawnWorkers: WARNING - Only {$spawnedCount}/{$workerCount} workers spawned successfully");
+            }
+            
+            error_log("autoSpawnWorkers: Completed - {$spawnedCount}/{$workerCount} workers spawned");
+            return $spawnedCount;
+        } else {
+            $errorMsg = "proc_open is not available. Please enable proc_open in PHP configuration for parallel worker processing.";
+            error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
+            
+            // Mark job as failed with clear error message
+            if ($jobId) {
+                Job::updateStatus($jobId, 'failed', 0);
+                Job::setError($jobId, $errorMsg);
+            }
+            
+            throw new Exception($errorMsg);
+        }
     }
     
     private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
@@ -3990,7 +4045,7 @@ class Router {
         }
     }
     
-    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): void {
+    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): int {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
@@ -4048,6 +4103,7 @@ class Router {
         }
         
         error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
+        return $spawnedCount;
     }
     
     private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
@@ -4197,6 +4253,8 @@ class Router {
      * Process workers in background after closing connection
      * This method works without exec, HTTP workers, or cron
      * Connection must be closed BEFORE calling this method
+     * 
+     * All workers process their assigned queue items in parallel (within single PHP process)
      */
     private static function processWorkersInBackground(int $workerCount, ?int $jobId = null): void {
         error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
@@ -4204,108 +4262,135 @@ class Router {
         // Connection should already be closed by caller
         // Just ensure we can continue after user disconnect
         ignore_user_abort(true);
-        set_time_limit(300); // 5 minutes max to prevent runaway processes
+        set_time_limit(600); // 10 minutes max to allow more processing time
         
         // Now process work in background - user has already received response
         try {
             $db = Database::connect();
             
-            // FIRST: Register ALL workers upfront so they show as "active" in UI
+            // FIRST: Register ALL workers and assign each one a queue item immediately
             $workers = [];
             for ($i = 0; $i < $workerCount; $i++) {
                 $workerName = 'bg-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
                 $workerId = Worker::register($workerName);
                 if ($workerId) {
-                    $workers[] = ['id' => $workerId, 'name' => $workerName, 'processed' => 0];
-                    // Mark as running immediately so they show up in UI
-                    Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
-                    error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId})");
+                    // Immediately get a queue item for this worker
+                    $queueItem = Worker::getNextJob($jobId);
+                    
+                    $workers[] = [
+                        'id' => $workerId, 
+                        'name' => $workerName, 
+                        'queue_item' => $queueItem,
+                        'processed' => 0
+                    ];
+                    
+                    if ($queueItem) {
+                        // Mark as running with assigned job
+                        Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+                        error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId}) - assigned queue item");
+                    } else {
+                        // No queue item available for this worker
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId}) - NO queue item available");
+                    }
                 }
             }
             
-            error_log("processWorkersInBackground: ALL {$workerCount} workers registered and marked as RUNNING");
+            error_log("processWorkersInBackground: ALL {$workerCount} workers registered with queue items assigned");
             
-            // SECOND: Process queue items in ROUND-ROBIN fashion across ALL workers
-            // This distributes work evenly so all workers are actively processing
-            $maxItemsPerWorker = 10; // Max items each worker can process
+            // SECOND: Process assigned queue items for each worker
             $totalProcessed = 0;
             $startTime = time();
-            $maxRuntime = 300; // 5 minutes total
-            $currentWorkerIndex = 0;
-            $allWorkersIdle = false;
+            $maxRuntime = 600; // 10 minutes total
+            $lastHeartbeatUpdate = time();
             
-            // Keep processing until no more queue items or max runtime reached
-            while (!$allWorkersIdle && (time() - $startTime) < $maxRuntime) {
-                $anyWorkerProcessed = false;
-                
-                // Update ALL workers' heartbeats at start of each cycle to prevent stale detection
-                foreach ($workers as $w) {
-                    Worker::updateHeartbeat($w['id'], 'running', $jobId, 0, 0);
+            // Process all workers' queue items
+            $workersWithWork = array_filter($workers, function($w) { return $w['queue_item'] !== null; });
+            error_log("processWorkersInBackground: " . count($workersWithWork) . " workers have queue items to process");
+            
+            foreach ($workers as &$worker) {
+                // Check timeout
+                if ((time() - $startTime) >= $maxRuntime) {
+                    error_log("processWorkersInBackground: Max runtime reached, stopping");
+                    break;
                 }
                 
-                // Cycle through all workers in round-robin fashion
-                for ($i = 0; $i < count($workers); $i++) {
-                    $worker = &$workers[$i];
-                    $workerId = $worker['id'];
-                    $workerName = $worker['name'];
-                    
-                    // Skip if this worker has reached its max items
-                    if ($worker['processed'] >= $maxItemsPerWorker) {
-                        // Mark as idle if done processing
-                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                        continue;
+                // Update heartbeats periodically
+                if (time() - $lastHeartbeatUpdate >= 30) {
+                    foreach ($workers as $w) {
+                        Worker::updateHeartbeat($w['id'], $w['queue_item'] ? 'running' : 'idle', $jobId, 0, 0);
                     }
+                    $lastHeartbeatUpdate = time();
+                }
+                
+                if (!$worker['queue_item']) {
+                    continue; // Skip workers with no queue items
+                }
+                
+                $workerId = $worker['id'];
+                $workerName = $worker['name'];
+                $job = $worker['queue_item'];
+                
+                // NOTE: Don't check target here - let all workers process their assigned queue items
+                // Target check happens after all workers complete their initial assignments
+                
+                error_log("processWorkersInBackground: Worker {$workerName} processing assigned queue item");
+                Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                
+                try {
+                    // Pass worker ID and name so processJob uses existing worker instead of creating new one
+                    Worker::processJob($job['id'], $workerId, $workerName);
+                    $worker['processed']++;
+                    $totalProcessed++;
+                    error_log("processWorkersInBackground: Worker {$workerName} completed queue item (total processed: {$totalProcessed})");
                     
-                    // Try to get next job from queue
-                    $job = Worker::getNextJob($jobId);
-                    
-                    if ($job) {
-                        // Check if job has reached target email count
-                        $currentJobId = (int)$job['id'];
-                        $jobDetails = Job::getById($currentJobId);
+                    // After processing, try to get another queue item (only if target not yet reached)
+                    if ($jobId) {
+                        $jobDetails = Job::getById($jobId);
                         if ($jobDetails) {
-                            $emailsCollected = Job::getEmailCount($currentJobId);
+                            $emailsCollected = Job::getEmailCount($jobId);
                             $maxResults = (int)$jobDetails['max_results'];
                             
                             if ($emailsCollected >= $maxResults) {
-                                error_log("processWorkersInBackground: Job {$currentJobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
-                                Worker::checkAndUpdateJobCompletion($currentJobId);
-                                continue;
-                            }
-                        }
-                        
-                        error_log("processWorkersInBackground: Worker {$workerName} processing queue item #{$job['id']}");
-                        
-                        try {
-                            Worker::processJob($job['id']);
-                            $worker['processed']++;
-                            $totalProcessed++;
-                            $anyWorkerProcessed = true;
-                            error_log("processWorkersInBackground: Worker {$workerName} completed item #{$job['id']} (total: {$worker['processed']})");
-                            
-                            // Check again after processing if target reached
-                            if ($jobDetails) {
-                                $emailsCollected = Job::getEmailCount($currentJobId);
-                                if ($emailsCollected >= $maxResults) {
-                                    error_log("processWorkersInBackground: Job {$currentJobId} reached target after processing");
-                                    Worker::checkAndUpdateJobCompletion($currentJobId);
+                                error_log("processWorkersInBackground: Job {$jobId} reached target after worker {$workerName} ({$emailsCollected}/{$maxResults})");
+                                Worker::checkAndUpdateJobCompletion($jobId);
+                                $worker['queue_item'] = null; // Don't get more items
+                            } else {
+                                // Try to get another queue item for this worker
+                                $nextQueueItem = Worker::getNextJob($jobId);
+                                if ($nextQueueItem) {
+                                    $worker['queue_item'] = $nextQueueItem;
+                                    error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
+                                } else {
+                                    $worker['queue_item'] = null;
+                                    error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
                                 }
                             }
-                        } catch (Exception $e) {
-                            error_log("processWorkersInBackground: Worker {$workerName} error on item #{$job['id']}: " . $e->getMessage());
-                            Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
+                        }
+                    } else {
+                        // No job ID specified, try to get another queue item
+                        $nextQueueItem = Worker::getNextJob($jobId);
+                        if ($nextQueueItem) {
+                            $worker['queue_item'] = $nextQueueItem;
+                            error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
+                        } else {
+                            $worker['queue_item'] = null;
+                            error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
                         }
                     }
                     
-                    // Small delay to prevent tight loop
-                    usleep(10000); // 10ms delay
+                } catch (Exception $e) {
+                    error_log("processWorkersInBackground: Worker {$workerName} error: " . $e->getMessage());
+                    Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
+                    $worker['queue_item'] = null; // Don't retry same item
                 }
                 
-                // If no worker processed anything in this cycle, all queue is empty
-                if (!$anyWorkerProcessed) {
-                    $allWorkersIdle = true;
-                    error_log("processWorkersInBackground: No more queue items available - all workers idle");
-                }
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            }
+            
+            // Final job completion check
+            if ($jobId) {
+                Worker::checkAndUpdateJobCompletion($jobId);
             }
             
             // Mark all workers as idle when done
@@ -4313,7 +4398,7 @@ class Router {
                 Worker::updateHeartbeat($worker['id'], 'idle', null, 0, 0);
             }
             
-            error_log("processWorkersInBackground: Completed - total {$totalProcessed} jobs processed by {$workerCount} workers");
+            error_log("processWorkersInBackground: Completed - total {$totalProcessed} queue items processed by " . count($workersWithWork) . " workers");
             
         } catch (Exception $e) {
             error_log("processWorkersInBackground: Fatal error: " . $e->getMessage());
