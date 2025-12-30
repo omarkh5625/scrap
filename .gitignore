@@ -1,0 +1,21 @@
+# Test files
+test_*.php
+
+# PHP errors
+php_errors.log
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
