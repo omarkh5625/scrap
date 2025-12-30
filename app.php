@@ -7628,6 +7628,29 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               <div class="page-title">Job Stats — <?php echo h($job['name']); ?></div>
               <div class="page-subtitle">Extraction results and progress for this job.</div>
 
+              <!-- Error Alert Display -->
+              <?php if ($job['status'] === 'draft' && isset($job['progress_status']) && $job['progress_status'] === 'error'): ?>
+              <div class="card" style="margin-bottom:18px; border-left:4px solid #dc3545; background:#f8d7da;">
+                <div style="padding:20px;">
+                  <h3 style="margin:0 0 12px 0; color:#721c24; font-size:18px;">⚠️ Extraction Failed</h3>
+                  <p style="margin:0 0 12px 0; color:#721c24;">The extraction job did not complete successfully.</p>
+                  <div style="margin:12px 0;">
+                    <strong style="color:#721c24;">Possible causes:</strong>
+                    <ul style="margin:8px 0; padding-left:20px; color:#721c24;">
+                      <li>Invalid or expired serper.dev API key</li>
+                      <li>API rate limit exceeded (HTTP 429 error)</li>
+                      <li>Network connection timeout or error</li>
+                      <li>Search query returned no results</li>
+                      <li>Server configuration issue (check PHP error_reporting)</li>
+                    </ul>
+                  </div>
+                  <p style="margin:12px 0 0 0; color:#721c24;">
+                    <strong>Next steps:</strong> Check the <code>error.log</code> file on your server for detailed technical information, error messages, and stack traces.
+                  </p>
+                </div>
+              </div>
+              <?php endif; ?>
+
               <div class="card" style="margin-bottom:18px;">
                 <div class="card-header">
                   <div>
@@ -7744,36 +7767,6 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                           </td>
                         </tr>
                       <?php endif; ?>
-                    <?php endif; ?>
-                  </tbody>
-                </table>
-              </div>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php
-                      $stmt = $pdo->prepare("SELECT * FROM events WHERE campaign_id=? ORDER BY created_at DESC LIMIT 50");
-                      $stmt->execute([$id]);
-                      $evs = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                      if (empty($evs)):
-                    ?>
-                      <tr>
-                        <td colspan="3" style="text-align:center; padding:16px; color:var(--sg-muted);">
-                          No events yet.
-                        </td>
-                      </tr>
-                    <?php else: ?>
-                      <?php foreach ($evs as $ev):
-                        $dt = h($ev['created_at']);
-                        $type = strtoupper($ev['event_type']);
-                        $details = $ev['details'] ? h($ev['details']) : '—';
-                      ?>
-                        <tr>
-                          <td><?php echo $dt; ?></td>
-                          <td><?php echo $type; ?></td>
-                          <td><code style="font-size:11px;"><?php echo $details; ?></code></td>
-                        </tr>
-                      <?php endforeach; ?>
                     <?php endif; ?>
                   </tbody>
                 </table>
