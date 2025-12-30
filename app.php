@@ -1,22 +1,22 @@
 <?php
 /**
- * MAFIA SINGLE SENDS ROTATION
+ * EMAIL EXTRACTION SYSTEM
  *
- * Professional Email Marketing System with Installation Wizard
+ * Professional Email Extraction Tool using serper.dev API
  * 
  * Features:
  * - Database Installation Wizard
  * - Admin Authentication System
- * - Multi-profile rotation sending
- * - Real-time campaign progress tracking
- * - Contact list management
- * - Email tracking (opens, clicks, bounces)
+ * - Multi-worker parallel extraction
+ * - Real-time job progress tracking
+ * - API job profiles management
+ * - Serper.dev API integration for email extraction
  * 
  * Enhanced with:
  * - First-time setup wizard with professional UI
  * - Secure admin login
  * - Automatic database table creation
- * - Fixed campaign status bug (campaigns no longer stuck at "sending")
+ * - Efficient parallel worker system
  */
 
 ///////////////////////
@@ -53,31 +53,21 @@ if ($configExists) {
 //  CONSTANTS
 ///////////////////////
 // Brand configuration
-define('BRAND_NAME', 'MAFIA MAILER');
+define('BRAND_NAME', 'EMAIL EXTRACTOR');
 
-// Worker configuration defaults (kept for backward compatibility)
+// Worker configuration defaults for extraction
 define('DEFAULT_WORKERS', 4);
-define('DEFAULT_MESSAGES_PER_WORKER', 100);
+define('DEFAULT_EMAILS_PER_WORKER', 100);
 define('MIN_WORKERS', 1);
 // MAX_WORKERS removed - NO LIMIT on number of workers - accepts ANY value
-define('MIN_MESSAGES_PER_WORKER', 1);
-define('MAX_MESSAGES_PER_WORKER', 10000);
+define('MIN_EMAILS_PER_WORKER', 1);
+define('MAX_EMAILS_PER_WORKER', 10000);
 // IMPORTANT: This is ONLY for logging warnings - NOT a limit!
 // Workers can be set to ANY number (100, 500, 1000+)
 // This threshold just triggers informational log messages for monitoring
 define('WORKERS_LOG_WARNING_THRESHOLD', 50);
 
-// Connection Numbers configuration (MaxBulk Mailer style)
-define('DEFAULT_CONNECTIONS', 5);
-define('MIN_CONNECTIONS', 1);
-define('MAX_CONNECTIONS', 40);
-
-// Batch size configuration (emails per single SMTP connection)
-define('DEFAULT_BATCH_SIZE', 50);
-define('MIN_BATCH_SIZE', 1);
-define('MAX_BATCH_SIZE', 500);
-
-// Progress update frequency (update progress every N emails)
+// Progress update frequency (update progress every N emails extracted)
 define('PROGRESS_UPDATE_FREQUENCY', 10);
 
 // Cycle delay configuration (delay between worker processing cycles in milliseconds)
@@ -253,40 +243,25 @@ if (isset($_GET['action']) && $_GET['action'] === 'install') {
 }
 
 ///////////////////////
-//  OPTIONAL SCHEMA (Contacts + added columns)
+//  OPTIONAL SCHEMA (Job Profiles + Extraction Jobs)
 ///////////////////////
 // Only run schema updates if PDO is connected and user is authenticated
 if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_logged_in'] === true)) {
     try {
+        // Create extracted_emails table to store extracted emails
         $pdo->exec("
-            CREATE TABLE IF NOT EXISTS contact_lists (
+            CREATE TABLE IF NOT EXISTS extracted_emails (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                type ENUM('global','list') NOT NULL DEFAULT 'list',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS contacts (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                list_id INT NOT NULL,
+                job_id INT NOT NULL,
                 email VARCHAR(255) NOT NULL,
-                first_name VARCHAR(100) DEFAULT NULL,
-                last_name VARCHAR(100) DEFAULT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX(list_id),
+                source VARCHAR(500) DEFAULT NULL,
+                extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX(job_id),
                 INDEX(email)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         ");
 
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS unsubscribes (
-                email VARCHAR(255) PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-
-        // Create global settings table for tracking configuration
+        // Create global settings table
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS settings (
                 setting_key VARCHAR(100) PRIMARY KEY,
@@ -294,76 +269,79 @@ if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_lo
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         ");
-        
-        // Initialize default tracking settings
-        try {
-            $pdo->exec("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('open_tracking_enabled', '1')");
-            $pdo->exec("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('click_tracking_enabled', '1')");
-        } catch (Exception $e) {}
 
-        // Ensure sending_profiles has useful columns
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) NOT NULL DEFAULT ''"); } catch (Exception $e) {}
-        // Add provider column for profile identification
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS provider VARCHAR(100) NOT NULL DEFAULT 'Custom'"); } catch (Exception $e) {}
-        // Add connection_numbers field (MaxBulk Mailer style - concurrent SMTP connections)
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS connection_numbers INT NOT NULL DEFAULT 5"); } catch (Exception $e) {}
-        // Add batch_size field (number of emails to send per single SMTP connection)
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS batch_size INT NOT NULL DEFAULT 50"); } catch (Exception $e) {}
+        // Ensure job_profiles table exists (replacing sending_profiles)
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS job_profiles (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                profile_name VARCHAR(255) NOT NULL,
+                api_key TEXT NOT NULL,
+                search_query TEXT NOT NULL,
+                target_count INT DEFAULT 100,
+                filter_business_only TINYINT(1) DEFAULT 1,
+                country VARCHAR(100) DEFAULT '',
+                workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS . ",
+                emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER . ",
+                cycle_delay_ms INT NOT NULL DEFAULT " . DEFAULT_CYCLE_DELAY_MS . ",
+                active TINYINT(1) DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
 
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS unsubscribe_enabled TINYINT(1) NOT NULL DEFAULT 0"); } catch (Exception $e) {}
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) NOT NULL DEFAULT ''"); } catch (Exception $e) {}
-        // Add tracking settings columns
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS open_tracking_enabled TINYINT(1) NOT NULL DEFAULT 1"); } catch (Exception $e) {}
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS click_tracking_enabled TINYINT(1) NOT NULL DEFAULT 1"); } catch (Exception $e) {}
-        // Add campaign progress tracking fields
+        // Ensure jobs table exists (renamed from campaigns)
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                status VARCHAR(50) DEFAULT 'draft',
+                profile_id INT DEFAULT NULL,
+                target_count INT DEFAULT 100,
+                progress_extracted INT NOT NULL DEFAULT 0,
+                progress_total INT NOT NULL DEFAULT 0,
+                progress_status VARCHAR(50) DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP NULL DEFAULT NULL,
+                completed_at TIMESTAMP NULL DEFAULT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
+
+        // Add job progress tracking fields if they don't exist
         try { 
-            $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS progress_sent INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS progress_total INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS progress_status VARCHAR(50) DEFAULT 'draft'");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_extracted INT NOT NULL DEFAULT 0");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_total INT NOT NULL DEFAULT 0");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_status VARCHAR(50) DEFAULT 'draft'");
         } catch (Exception $e) {}
-        try {
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS bounce_imap_server VARCHAR(255) DEFAULT ''");
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS bounce_imap_user VARCHAR(255) DEFAULT ''");
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS bounce_imap_pass VARCHAR(255) DEFAULT ''");
-        } catch (Exception $e) {}
-        
-        // Keep old fields for backward compatibility but they won't be shown in UI
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS send_rate INT NOT NULL DEFAULT 0"); } catch (Exception $e) {}
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS sends_used INT NOT NULL DEFAULT 0"); } catch (Exception $e) {}
+
+        // Update rotation settings for extraction
         try {
             $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS);
-            $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS messages_per_worker INT NOT NULL DEFAULT " . DEFAULT_MESSAGES_PER_WORKER);
-        } catch (Exception $e) {}
-        try {
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS);
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS messages_per_worker INT NOT NULL DEFAULT " . DEFAULT_MESSAGES_PER_WORKER);
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS cycle_delay_ms INT NOT NULL DEFAULT " . DEFAULT_CYCLE_DELAY_MS);
+            $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER);
         } catch (Exception $e) {}
         
-        // RETROACTIVE FIX: Convert stuck campaigns to 'sent'
-        // Fix campaigns that are 100% complete but stuck at 'sending' status
+        // RETROACTIVE FIX: Convert stuck jobs to 'completed'
+        // Fix jobs that are 100% complete but stuck at 'extracting' status
         try {
             $pdo->exec("
-                UPDATE campaigns 
-                SET status = 'sent', 
-                    sent_at = COALESCE(sent_at, NOW()),
+                UPDATE jobs 
+                SET status = 'completed', 
+                    completed_at = COALESCE(completed_at, NOW()),
                     progress_status = 'completed'
-                WHERE status IN ('sending', 'queued')
+                WHERE status IN ('extracting', 'queued')
                   AND progress_total > 0
-                  AND progress_sent >= progress_total
-                  AND progress_sent > 0
+                  AND progress_extracted >= progress_total
+                  AND progress_extracted > 0
             ");
             
-            // Also fix campaigns where progress_status is 'completed' but main status is not 'sent'
+            // Also fix jobs where progress_status is 'completed' but main status is not 'completed'
             $pdo->exec("
-                UPDATE campaigns 
-                SET status = 'sent', 
-                    sent_at = COALESCE(sent_at, NOW())
+                UPDATE jobs 
+                SET status = 'completed', 
+                    completed_at = COALESCE(completed_at, NOW())
                 WHERE progress_status = 'completed'
-                  AND status != 'sent'
+                  AND status != 'completed'
             ");
         } catch (Exception $e) {
-            error_log("Retroactive campaign fix error: " . $e->getMessage());
+            error_log("Retroactive job fix error: " . $e->getMessage());
         }
     } catch (Exception $e) {
         // Log error but don't stop execution
@@ -885,6 +863,121 @@ function build_tracked_html(array $campaign, string $recipientEmail = ''): strin
     }
 
     return $html;
+}
+
+/**
+ * Extract emails using serper.dev API
+ * @param string $apiKey The serper.dev API key
+ * @param string $query Search query (e.g., "real estate agents california")
+ * @param string $country Optional country code (e.g., "us")
+ * @param bool $businessOnly Filter for business emails only
+ * @param int $numResults Number of results to fetch (default: 10)
+ * @return array Array with 'success' boolean and 'emails' array or 'error' string
+ */
+function extract_emails_serper(string $apiKey, string $query, string $country = '', bool $businessOnly = true, int $numResults = 10): array {
+    $log = [];
+    
+    if ($apiKey === '' || $query === '') {
+        return ['success' => false, 'error' => 'Missing API key or search query', 'log' => $log];
+    }
+    
+    $apiUrl = 'https://google.serper.dev/search';
+    
+    // Build request payload
+    $payload = [
+        'q' => $query,
+        'num' => min($numResults, 100) // serper.dev typically supports up to 100 results
+    ];
+    
+    if ($country !== '') {
+        $payload['gl'] = $country;
+    }
+    
+    $headers = [
+        'X-API-KEY: ' . $apiKey,
+        'Content-Type: application/json'
+    ];
+    
+    $log[] = 'Calling serper.dev API...';
+    $log[] = 'Query: ' . $query;
+    if ($country) $log[] = 'Country: ' . $country;
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $apiUrl);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    
+    if ($response === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        $log[] = 'cURL error: ' . $error;
+        return ['success' => false, 'error' => 'API request failed: ' . $error, 'log' => $log];
+    }
+    
+    curl_close($ch);
+    
+    $log[] = 'HTTP Code: ' . $httpCode;
+    
+    if ($httpCode !== 200) {
+        $log[] = 'API error response: ' . substr($response, 0, 200);
+        return ['success' => false, 'error' => 'API returned HTTP ' . $httpCode, 'log' => $log];
+    }
+    
+    $data = json_decode($response, true);
+    if (!is_array($data)) {
+        $log[] = 'Invalid JSON response';
+        return ['success' => false, 'error' => 'Invalid API response', 'log' => $log];
+    }
+    
+    // Extract emails from search results
+    $emails = [];
+    $emailPattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/';
+    
+    // Check organic results
+    if (isset($data['organic']) && is_array($data['organic'])) {
+        foreach ($data['organic'] as $result) {
+            $text = '';
+            if (isset($result['snippet'])) $text .= ' ' . $result['snippet'];
+            if (isset($result['title'])) $text .= ' ' . $result['title'];
+            if (isset($result['link'])) $text .= ' ' . $result['link'];
+            
+            // Extract all emails from text
+            if (preg_match_all($emailPattern, $text, $matches)) {
+                foreach ($matches[0] as $email) {
+                    $email = strtolower($email);
+                    
+                    // Filter business emails if requested
+                    if ($businessOnly) {
+                        // Skip common free email providers
+                        $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
+                        $domain = substr($email, strpos($email, '@') + 1);
+                        if (in_array($domain, $freeProviders)) {
+                            continue;
+                        }
+                    }
+                    
+                    if (!in_array($email, $emails)) {
+                        $emails[] = $email;
+                    }
+                }
+            }
+        }
+    }
+    
+    $log[] = 'Extracted ' . count($emails) . ' unique emails';
+    
+    return [
+        'success' => true,
+        'emails' => $emails,
+        'log' => $log
+    ];
 }
 
 function smtp_check_connection(array $profile): array {
@@ -2038,32 +2131,22 @@ function api_send_batch(array $profile, array $campaign, array $recipients, arra
     ];
 }
 
-function get_campaign(PDO $pdo, int $id) {
-    $stmt = $pdo->prepare("SELECT * FROM campaigns WHERE id = ?");
+function get_job(PDO $pdo, int $id) {
+    $stmt = $pdo->prepare("SELECT * FROM jobs WHERE id = ?");
     $stmt->execute([$id]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$row) return false;
-    if (isset($row['html']) && is_string($row['html'])) {
-        if (strpos($row['html'], 'BASE64:') === 0) {
-            $decoded = base64_decode(substr($row['html'], 7));
-            if ($decoded !== false) {
-                $row['html'] = $decoded;
-            }
-        }
-    }
-    return $row;
+    return $row ?: false;
 }
 
-function get_campaign_stats(PDO $pdo, int $id) {
+// Keep get_campaign as alias for backward compatibility during transition
+function get_campaign(PDO $pdo, int $id) {
+    return get_job($pdo, $id);
+}
+
+function get_job_stats(PDO $pdo, int $id) {
     $stats = [
-        'delivered'   => 0,
-        'delivered_raw' => 0,
-        'open'        => 0,
-        'click'       => 0,
-        'bounce'      => 0,
-        'spam'        => 0,
-        'unsubscribe' => 0,
-        'sent_attempts' => 0,
+        'extracted'   => 0,
+        'queries_processed' => 0,
         'target' => 0,
         'target_after_bounces' => 0,
     ];
@@ -2156,7 +2239,7 @@ function get_campaign_progress(PDO $pdo, int $campaignId): array {
 }
 
 function get_profiles(PDO $pdo) {
-    $stmt = $pdo->query("SELECT * FROM sending_profiles ORDER BY id ASC");
+    $stmt = $pdo->query("SELECT * FROM job_profiles ORDER BY id ASC");
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
@@ -2172,8 +2255,7 @@ function get_rotation_settings(PDO $pdo) {
 }
 
 function update_rotation_settings(PDO $pdo, array $data) {
-    // Only update columns that exist in the schema (rotation_enabled, workers, messages_per_worker)
-    // Older columns like batch_size and max_sends_per_profile may not exist
+    // Only update columns that exist in the schema (rotation_enabled, workers, emails_per_worker)
     $stmt = $pdo->prepare("
         UPDATE rotation_settings
         SET rotation_enabled = :rotation_enabled,
