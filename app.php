@@ -2243,6 +2243,7 @@ class Router {
                 
                 // Check exec availability
                 $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+                $procOpenAvailable = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
                 
                 // Check for pending queue items
                 $stmt = $db->query("SELECT COUNT(*) as count FROM job_queue WHERE status = 'pending'");
@@ -2258,6 +2259,7 @@ class Router {
                 
                 echo json_encode([
                     'exec_available' => $execAvailable,
+                    'proc_open_available' => $procOpenAvailable,
                     'pending_queue_items' => $pendingQueueItems,
                     'active_workers' => $activeWorkers,
                     'running_jobs' => $runningJobs,
@@ -3951,18 +3953,24 @@ class Router {
         // process work directly in background after closing connection
         // This ensures extraction starts immediately without blocking UI
         
+        // Check which spawning methods are available
         $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+        $procOpenAvailable = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
         
         if ($execAvailable) {
             error_log("autoSpawnWorkers: Using exec() method for parallel workers");
-            // Method 1: Spawn background PHP processes (only if exec available)
+            // Method 1: Spawn background PHP processes using exec (best performance)
             self::spawnWorkersViaExec($workerCount, $jobId);
+        } else if ($procOpenAvailable) {
+            error_log("autoSpawnWorkers: exec() not available, using proc_open() for parallel workers");
+            // Method 2: Spawn background PHP processes using proc_open (cPanel compatible)
+            self::spawnWorkersViaProcOpen($workerCount, $jobId);
         } else {
-            // Method 2: Try HTTP-based spawning for true parallel workers
-            error_log("autoSpawnWorkers: exec() not available, trying HTTP method for parallel workers");
+            // Method 3: Try HTTP-based spawning for true parallel workers
+            error_log("autoSpawnWorkers: exec() and proc_open() not available, trying HTTP method for parallel workers");
             $successCount = self::spawnWorkersViaHttp($workerCount, $jobId);
             
-            // Method 3: Fallback to direct background processing if HTTP also fails
+            // Method 4: Fallback to direct background processing if HTTP also fails
             if ($successCount < $workerCount / 2) { // If less than 50% workers spawned via HTTP
                 error_log("autoSpawnWorkers: HTTP method insufficient ({$successCount}/{$workerCount}), using direct background processing");
                 self::processWorkersInBackground($workerCount, $jobId);
@@ -4003,6 +4011,66 @@ class Router {
             
             error_log("Spawned worker: {$workerName}" . ($jobId ? " for job {$jobId}" : ""));
         }
+    }
+    
+    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): void {
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        error_log("spawnWorkersViaProcOpen: Spawning {$workerCount} workers using proc_open()" . ($jobId ? " for job {$jobId}" : ""));
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            // Build command to run worker in queue mode
+            // Include job_id if specified so worker only processes that job
+            $workerName = 'proc-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+            
+            // Build command arguments
+            $args = [$phpBinary, $scriptPath, $workerName];
+            if ($jobId !== null) {
+                $args[] = (string)$jobId;
+            }
+            
+            // Build command string for proc_open
+            $cmd = implode(' ', array_map('escapeshellarg', $args));
+            
+            // Descriptors for proc_open (redirect stdin, stdout, stderr to /dev/null)
+            $descriptors = [
+                0 => ['pipe', 'r'],  // stdin
+                1 => ['file', '/dev/null', 'w'],  // stdout
+                2 => ['file', '/dev/null', 'w']   // stderr
+            ];
+            
+            // For Windows, use different null device
+            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                $descriptors = [
+                    0 => ['pipe', 'r'],
+                    1 => ['file', 'NUL', 'w'],
+                    2 => ['file', 'NUL', 'w']
+                ];
+                $cmd = "start /B " . $cmd;
+            } else {
+                // Add background operator for Unix/Linux
+                $cmd .= ' > /dev/null 2>&1 &';
+            }
+            
+            // Spawn process
+            $process = proc_open($cmd, $descriptors, $pipes);
+            
+            if (is_resource($process)) {
+                // Close stdin pipe if it was created
+                if (isset($pipes[0])) {
+                    fclose($pipes[0]);
+                }
+                
+                // Don't wait for the process - let it run in background
+                // proc_close would wait, so we just leave it running
+                error_log("spawnWorkersViaProcOpen: Spawned worker {$i}/{$workerCount}: {$workerName}");
+            } else {
+                error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
+            }
+        }
+        
+        error_log("spawnWorkersViaProcOpen: Completed spawning {$workerCount} workers");
     }
     
     private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
