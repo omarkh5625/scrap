@@ -5363,7 +5363,7 @@ if ($pdo === null) {
     // PDO is available, fetch data
     $rotationSettings = get_rotation_settings($pdo);
     $profiles         = get_profiles($pdo);
-    $contactLists     = get_contact_lists($pdo);
+    $contactLists     = []; // Not used in email extraction system
 }
 
 $editProfile      = null;
@@ -6784,8 +6784,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
         <?php elseif ($page === 'contacts'): ?>
           <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
         <?php else: ?>
-          <a href="?page=list" class="btn btn-outline">Single Sends</a>
-          <a href="?page=contacts" class="btn btn-outline">Contacts</a>
+          <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
         <?php endif; ?>
       </div>
     </div>
@@ -7693,196 +7692,11 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
 
           <?php elseif ($page === 'contacts'): ?>
             <?php
-              if ($pdo === null) {
-                  echo '<div class="page-title">Database Error</div>';
-                  echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-              } else {
-                  $listId   = isset($_GET['list_id']) ? (int)$_GET['list_id'] : 0;
-                  $showCreate = isset($_GET['show_create']);
+              // Contacts feature not available in email extraction system
+              // Redirect to jobs list
+              header('Location: ?page=list');
+              exit;
             ?>
-
-            <?php if ($listId === 0): ?>
-              <?php
-                $lists = get_contact_lists($pdo);
-              ?>
-              <div class="page-title">Contact Lists</div>
-              <div class="page-subtitle">Manage lists and segments used by your Single Sends, like SendGrid Contacts.</div>
-
-              <div class="card">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">Lists</div>
-                    <div class="card-subtitle">Global list and individual marketing lists.</div>
-                  </div>
-                  <div style="display:flex; gap:8px;">
-                    <a href="?page=contacts&show_create=1" class="btn btn-outline">Create</a>
-                    <?php if (!empty($lists)): ?>
-                      <a href="?page=contacts&list_id=<?php echo (int)$lists[0]['id']; ?>" class="btn btn-primary">Add Contacts</a>
-                    <?php endif; ?>
-                  </div>
-                </div>
-
-                                <?php if (empty($lists)): ?>
-                  <div class="card" style="margin-top:12px;">
-                    <div class="hint">No contact lists found. Create one to start adding contacts.</div>
-                  </div>
-                <?php else: ?>
-                  <table class="table">
-                    <thead>
-                      <tr>
-                        <th>List Name</th>
-                        <th>Type</th>
-                        <th>Contacts</th>
-                        <th>Created</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <?php foreach ($lists as $l): ?>
-                        <tr>
-                          <td><a href="?page=contacts&list_id=<?php echo (int)$l['id']; ?>"><?php echo h($l['name']); ?></a></td>
-                          <td><?php echo h($l['type']); ?></td>
-                          <td><?php echo (int)$l['contact_count']; ?></td>
-                          <td><?php echo h($l['created_at']); ?></td>
-                          <td>
-                            <a class="btn-mini" href="?page=contacts&list_id=<?php echo (int)$l['id']; ?>">View</a>
-                            <form method="post" style="display:inline;">
-                              <input type="hidden" name="action" value="delete_contact_list">
-                              <input type="hidden" name="list_id" value="<?php echo (int)$l['id']; ?>">
-                              <button type="submit" class="btn-mini" onclick="return confirm('Delete this list and its contacts?');">Delete</button>
-                            </form>
-                          </td>
-                        </tr>
-                      <?php endforeach; ?>
-                    </tbody>
-                  </table>
-                <?php endif; ?>
-              </div>
-
-              <?php if ($showCreate): ?>
-                <div class="modal-backdrop" id="createListModal">
-                  <div class="modal-panel">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                      <div style="font-weight:600;">Create Contact List</div>
-                      <button class="btn btn-outline" onclick="document.getElementById('createListModal').style.display='none'">✕</button>
-                    </div>
-                    <form method="post">
-                      <input type="hidden" name="action" value="create_contact_list">
-                      <div class="form-group">
-                        <label>List name</label>
-                        <input type="text" name="list_name" required>
-                      </div>
-                      <div style="display:flex; gap:8px; justify-content:flex-end;">
-                        <a href="?page=contacts" class="btn btn-outline">Cancel</a>
-                        <button class="btn btn-primary" type="submit">Create</button>
-                      </div>
-                    </form>
-                  </div>
-                </div>
-                <script>document.getElementById('createListModal').style.display='flex';</script>
-              <?php endif; ?>
-
-            <?php else: ?>
-              <?php
-                $list = get_contact_list($pdo, $listId);
-                if (!$list) {
-                  echo "<p>List not found.</p>";
-                } else {
-                  $contacts = get_contacts_for_list($pdo, $listId);
-              ?>
-                <div class="page-title">Contacts — <?php echo h($list['name']); ?></div>
-                <div class="page-subtitle">Manage recipients in this list (manual add or CSV upload).</div>
-
-                <div class="card">
-                  <div class="card-header">
-                    <div>
-                      <div class="card-title">Add Contacts</div>
-                      <div class="card-subtitle">Manual add or upload a CSV file (first column header 'email' is recommended).</div>
-                    </div>
-                    <div style="display:flex; gap:8px;">
-                      <a href="?page=contacts" class="btn btn-outline">← Back to Lists</a>
-                    </div>
-                  </div>
-
-                  <form method="post" style="margin-bottom:12px;">
-                    <input type="hidden" name="action" value="add_contact_manual">
-                    <input type="hidden" name="list_id" value="<?php echo (int)$listId; ?>">
-                    <div class="form-row">
-                      <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" required>
-                      </div>
-                      <div class="form-group">
-                        <input type="text" name="first_name" placeholder="First name">
-                      </div>
-                      <div class="form-group">
-                        <label>Last name</label>
-                        <input type="text" name="last_name" placeholder="Last name">
-                      </div>
-                    </div>
-                    <div style="display:flex; gap:8px; justify-content:flex-end;">
-                      <button type="submit" class="btn btn-primary">Add Contact</button>
-                    </div>
-                  </form>
-
-                  <form method="post" enctype="multipart/form-data" style="margin-top:12px;">
-                    <input type="hidden" name="action" value="upload_contacts_csv">
-                    <input type="hidden" name="list_id" value="<?php echo (int)$listId; ?>">
-                    <div class="form-row">
-                      <div class="form-group">
-                        <label>Upload CSV</label>
-                        <input type="file" name="csv_file" accept=".csv,text/csv">
-                        <small class="hint">CSV should contain an 'email' column or have emails in first column.</small>
-                      </div>
-                    </div>
-                    <div style="display:flex; gap:8px; justify-content:flex-end;">
-                      <button class="btn btn-outline" type="submit">Upload</button>
-                    </div>
-                  </form>
-                </div>
-
-                <div class="card">
-                  <div class="card-header">
-                    <div>
-                      <div class="card-title">Contacts (<?php echo count($contacts); ?>)</div>
-                    </div>
-                    <div>
-                      <form method="get" style="display:inline;">
-                        <input type="hidden" name="page" value="contacts">
-                        <input type="hidden" name="list_id" value="<?php echo (int)$listId; ?>">
-                        <input type="text" name="q" placeholder="Search email or name" style="padding:6px 8px;">
-                        <button class="btn btn-outline" type="submit">Search</button>
-                      </form>
-                    </div>
-                  </div>
-
-                  <?php if (empty($contacts)): ?>
-                    <div class="hint" style="padding:16px;">No contacts in this list yet.</div>
-                  <?php else: ?>
-                    <table class="table">
-                      <thead>
-                        <tr>
-                          <th>Email</th>
-                          <th>Name</th>
-                          <th>Added</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <?php foreach ($contacts as $ct): ?>
-                          <tr>
-                            <td><?php echo h($ct['email']); ?></td>
-                            <td><?php echo h(trim($ct['first_name'] . ' ' . $ct['last_name'])); ?></td>
-                            <td><?php echo h($ct['created_at']); ?></td>
-                          </tr>
-                        <?php endforeach; ?>
-                      </tbody>
-                    </table>
-                  <?php endif; ?>
-                </div>
-              <?php } // End else block for if (!$list) ?>
-
-            <?php endif; ?> <!-- End if ($listId === 0) -->
-            <?php } // End if($pdo === null) else block for contacts ?>
 
           <?php elseif ($page === 'activity'): ?>
             <?php
