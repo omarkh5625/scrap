@@ -4280,21 +4280,8 @@ class Router {
                 $workerName = $worker['name'];
                 $job = $worker['queue_item'];
                 
-                // Check if job has reached target email count before processing
-                if ($jobId) {
-                    $jobDetails = Job::getById($jobId);
-                    if ($jobDetails) {
-                        $emailsCollected = Job::getEmailCount($jobId);
-                        $maxResults = (int)$jobDetails['max_results'];
-                        
-                        if ($emailsCollected >= $maxResults) {
-                            error_log("processWorkersInBackground: Worker {$workerName} - Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
-                            Worker::checkAndUpdateJobCompletion($jobId);
-                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                            continue;
-                        }
-                    }
-                }
+                // NOTE: Don't check target here - let all workers process their assigned queue items
+                // Target check happens after all workers complete their initial assignments
                 
                 error_log("processWorkersInBackground: Worker {$workerName} processing assigned queue item");
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
@@ -4306,7 +4293,7 @@ class Router {
                     $totalProcessed++;
                     error_log("processWorkersInBackground: Worker {$workerName} completed queue item (total processed: {$totalProcessed})");
                     
-                    // Check if target reached after processing
+                    // After processing, try to get another queue item (only if target not yet reached)
                     if ($jobId) {
                         $jobDetails = Job::getById($jobId);
                         if ($jobDetails) {
@@ -4314,20 +4301,31 @@ class Router {
                             $maxResults = (int)$jobDetails['max_results'];
                             
                             if ($emailsCollected >= $maxResults) {
-                                error_log("processWorkersInBackground: Job {$jobId} reached target after worker {$workerName} completed");
+                                error_log("processWorkersInBackground: Job {$jobId} reached target after worker {$workerName} ({$emailsCollected}/{$maxResults})");
                                 Worker::checkAndUpdateJobCompletion($jobId);
+                                $worker['queue_item'] = null; // Don't get more items
+                            } else {
+                                // Try to get another queue item for this worker
+                                $nextQueueItem = Worker::getNextJob($jobId);
+                                if ($nextQueueItem) {
+                                    $worker['queue_item'] = $nextQueueItem;
+                                    error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
+                                } else {
+                                    $worker['queue_item'] = null;
+                                    error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
+                                }
                             }
                         }
-                    }
-                    
-                    // Try to get another queue item for this worker
-                    $nextQueueItem = Worker::getNextJob($jobId);
-                    if ($nextQueueItem) {
-                        $worker['queue_item'] = $nextQueueItem;
-                        error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
                     } else {
-                        $worker['queue_item'] = null;
-                        error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
+                        // No job ID specified, try to get another queue item
+                        $nextQueueItem = Worker::getNextJob($jobId);
+                        if ($nextQueueItem) {
+                            $worker['queue_item'] = $nextQueueItem;
+                            error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
+                        } else {
+                            $worker['queue_item'] = null;
+                            error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
+                        }
                     }
                     
                 } catch (Exception $e) {
