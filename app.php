@@ -104,6 +104,12 @@ class Database {
                 self::$pdo->exec("ALTER TABLE jobs ADD COLUMN email_filter VARCHAR(50) AFTER country");
             }
             
+            // Migration: Add error_message column to jobs table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'error_message'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN error_message TEXT DEFAULT NULL AFTER progress");
+            }
+            
             // Migration: Create emails table if it doesn't exist (rename from results)
             $stmt = self::$pdo->query("SHOW TABLES LIKE 'emails'");
             if ($stmt->rowCount() === 0) {
@@ -257,6 +263,7 @@ class Database {
                     email_filter VARCHAR(50),
                     status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
                     progress INT DEFAULT 0,
+                    error_message TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -1048,6 +1055,12 @@ class Job {
         $db = Database::connect();
         $stmt = $db->prepare("UPDATE jobs SET status = ?, progress = ? WHERE id = ?");
         $stmt->execute([$status, $progress, $jobId]);
+    }
+    
+    public static function setError(int $jobId, string $errorMessage): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+        $stmt->execute([$errorMessage, $jobId]);
     }
     
     public static function getResults(int $jobId): array {
@@ -2457,11 +2470,24 @@ class Router {
                             break;
                         }
                         
+                        // CHECK: Verify proc_open is available BEFORE creating job
+                        if (!function_exists('proc_open') || in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+                            $errorMsg = 'proc_open is not available on this server. Parallel worker processing requires proc_open to be enabled in PHP configuration. Please contact your hosting provider to enable proc_open function.';
+                            error_log("Job creation failed: {$errorMsg}");
+                            header('Content-Type: application/json');
+                            echo json_encode([
+                                'success' => false, 
+                                'error' => $errorMsg
+                            ]);
+                            break;
+                        }
+                        
                         // Create job - this should be fast (< 100ms)
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
                         // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
                         // This divides the work among workers so they search in parallel without duplication
+                        // NOTE: This will mark job as "running" - we'll update to "failed" if workers don't spawn
                         self::createQueueItems($jobId, $workerCount);
                         
                         // Return success IMMEDIATELY to prevent UI hanging
@@ -3951,20 +3977,39 @@ class Router {
     }
     */
     
-    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
+    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): int {
         error_log("autoSpawnWorkers: Spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
         
         // Use proc_open for parallel processing (compatible with cPanel)
         if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
             error_log("autoSpawnWorkers: Using proc_open for PARALLEL processing");
-            self::spawnWorkersViaProcOpen($workerCount, $jobId);
+            $spawnedCount = self::spawnWorkersViaProcOpen($workerCount, $jobId);
+            
+            if ($spawnedCount === 0 && $jobId) {
+                // No workers spawned - mark job as failed
+                $errorMsg = "Failed to spawn any workers using proc_open. Check server logs for details.";
+                error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
+                Job::updateStatus($jobId, 'failed', 0);
+                Job::setError($jobId, $errorMsg);
+            } elseif ($spawnedCount < $workerCount && $jobId) {
+                // Some workers failed to spawn - log warning but continue
+                error_log("autoSpawnWorkers: WARNING - Only {$spawnedCount}/{$workerCount} workers spawned successfully");
+            }
+            
+            error_log("autoSpawnWorkers: Completed - {$spawnedCount}/{$workerCount} workers spawned");
+            return $spawnedCount;
         } else {
-            error_log("autoSpawnWorkers: ERROR - proc_open is not available");
-            error_log("autoSpawnWorkers: Please enable proc_open in PHP configuration");
-            throw new Exception("proc_open is required for parallel worker processing but is not available");
+            $errorMsg = "proc_open is not available. Please enable proc_open in PHP configuration for parallel worker processing.";
+            error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
+            
+            // Mark job as failed with clear error message
+            if ($jobId) {
+                Job::updateStatus($jobId, 'failed', 0);
+                Job::setError($jobId, $errorMsg);
+            }
+            
+            throw new Exception($errorMsg);
         }
-        
-        error_log("autoSpawnWorkers: Completed - workers are now processing in background");
     }
     
     private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
@@ -4000,7 +4045,7 @@ class Router {
         }
     }
     
-    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): void {
+    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): int {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
@@ -4058,6 +4103,7 @@ class Router {
         }
         
         error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
+        return $spawnedCount;
     }
     
     private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
