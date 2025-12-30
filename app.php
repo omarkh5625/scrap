@@ -3952,43 +3952,17 @@ class Router {
     */
     
     private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
-        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers for job " . ($jobId ?? 'any'));
+        error_log("autoSpawnWorkers: Spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
         
-        // Try methods in order of speed/parallelism:
-        // 1. proc_open (fastest - true parallel separate processes)
-        // 2. exec (fast - background processes)
-        // 3. HTTP workers (good - parallel HTTP requests)
-        // 4. inline processing (slowest - sequential in one process)
-        
-        $successCount = 0;
-        
-        // Method 1: Try proc_open first (best for true parallelism)
+        // Use proc_open for parallel processing (compatible with cPanel)
         if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
             error_log("autoSpawnWorkers: Using proc_open for PARALLEL processing");
             self::spawnWorkersViaProcOpen($workerCount, $jobId);
-            return; // Exit early - workers spawned
+        } else {
+            error_log("autoSpawnWorkers: ERROR - proc_open is not available");
+            error_log("autoSpawnWorkers: Please enable proc_open in PHP configuration");
+            throw new Exception("proc_open is required for parallel worker processing but is not available");
         }
-        
-        // Method 2: Try exec if proc_open not available
-        if (function_exists('exec') && !in_array('exec', explode(',', ini_get('disable_functions')))) {
-            error_log("autoSpawnWorkers: Using exec for PARALLEL processing");
-            self::spawnWorkersViaExec($workerCount, $jobId);
-            return; // Exit early - workers spawned
-        }
-        
-        // Method 3: Try HTTP workers (parallel via async HTTP requests)
-        error_log("autoSpawnWorkers: Attempting HTTP workers for PARALLEL processing");
-        $successCount = self::spawnWorkersViaHttp($workerCount, $jobId);
-        
-        if ($successCount > 0) {
-            error_log("autoSpawnWorkers: Successfully spawned {$successCount} HTTP workers");
-            return; // Exit early - HTTP workers spawned
-        }
-        
-        // Method 4: Fallback to sequential inline processing (SLOW)
-        error_log("autoSpawnWorkers: WARNING - All parallel methods failed, using SEQUENTIAL processing (SLOW)");
-        error_log("autoSpawnWorkers: For maximum speed, enable proc_open, exec, or HTTP loopback");
-        self::processWorkersInBackground($workerCount, $jobId);
         
         error_log("autoSpawnWorkers: Completed - workers are now processing in background");
     }
