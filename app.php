@@ -19,6 +19,58 @@
  * - Efficient parallel worker system
  */
 
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error.log');
+
+// Custom error handler for better debugging
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    $error_message = sprintf(
+        "[%s] Error #%d: %s in %s on line %d",
+        date('Y-m-d H:i:s'),
+        $errno,
+        $errstr,
+        $errfile,
+        $errline
+    );
+    error_log($error_message);
+    
+    // Display error in development mode
+    if (ini_get('display_errors')) {
+        echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
+        echo "<strong>Error:</strong> $errstr<br>";
+        echo "<strong>File:</strong> $errfile<br>";
+        echo "<strong>Line:</strong> $errline<br>";
+        echo "</div>";
+    }
+    return false;
+});
+
+// Exception handler
+set_exception_handler(function($exception) {
+    $error_message = sprintf(
+        "[%s] Exception: %s in %s on line %d\nStack trace:\n%s",
+        date('Y-m-d H:i:s'),
+        $exception->getMessage(),
+        $exception->getFile(),
+        $exception->getLine(),
+        $exception->getTraceAsString()
+    );
+    error_log($error_message);
+    
+    if (ini_get('display_errors')) {
+        echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
+        echo "<strong>Exception:</strong> " . htmlspecialchars($exception->getMessage()) . "<br>";
+        echo "<strong>File:</strong> " . htmlspecialchars($exception->getFile()) . "<br>";
+        echo "<strong>Line:</strong> " . $exception->getLine() . "<br>";
+        echo "<strong>Stack trace:</strong><br><pre>" . htmlspecialchars($exception->getTraceAsString()) . "</pre>";
+        echo "</div>";
+    }
+});
+
 ///////////////////////
 //  LOAD CONFIGURATION
 ///////////////////////
@@ -7176,572 +7228,8 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
 
         <?php } // End job check ?>
         <?php } // End PDO check ?>
-                      <option value="custom" <?php if ($campaign['audience'] === 'custom') echo 'selected'; ?>>Custom segment / manual</option>
-                    </select>
-                    <small class="hint">Choose one of your contact lists. If you need a text/segment, select "Custom" then edit audience in the campaign later.</small>
-                  </div>
 
-                  <div class="form-row">
-                    <div class="form-group">
-                      <label>Sender Name</label>
-                      <input type="text" name="sender_name" value="<?php echo h($campaign['sender_name'] ?? ''); ?>">
-                    </div>
-                    <div class="form-group">
-                      <label>&nbsp;</label>
-                      <div class="checkbox-row">
-                        <input type="checkbox" name="unsubscribe_enabled" id="unsubscribe_enabled" <?php if (!empty($campaign['unsubscribe_enabled'])) echo 'checked'; ?>>
-                        <label for="unsubscribe_enabled">Enable Unsubscribe Link</label>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="form-row">
-                    <div class="form-group">
-                      <label>&nbsp;</label>
-                      <small class="hint">If enabled, an unsubscribe tracking link will be injected into outgoing messages automatically. Recipients who click will be added to the unsubscribes list and blocked from future sends.</small>
-                    </div>
-                  </div>
-
-                </div>
-              </div>
-
-              <!-- RIGHT: Canvas -->
-              <div class="editor-right">
-                <div class="editor-canvas-top">
-                  <div class="canvas-header-left">
-                    <div class="subj">Subject: <?php echo $campaign['subject'] ? h($campaign['subject']) : 'Subject'; ?></div>
-                    <div class="pre">Preheader: <?php echo $campaign['preheader'] ? h($campaign['preheader']) : ''; ?></div>
-                  </div>
-                  <div class="canvas-header-right">
-                    <button class="btn btn-outline" type="button" id="previewBtn">Preview</button>
-                    <button class="btn btn-outline" type="button" id="saveAsTplBtn">Save</button>
-                    <!-- single Review button at top -->
-                  </div>
-                </div>
-
-                <div class="canvas-area" id="canvasArea" data-placeholder="Drag Module Here">
-                  <?php
-                    // initial canvas content will be hydrated by JS from campaign.html
-                    if ($campaign['html']) {
-                        echo '<!-- stored html will be loaded into blocks by JS -->';
-                    } else {
-                        echo '<div class="drag-placeholder">Drag Module Here</div>';
-                    }
-                  ?>
-                </div>
-
-                <div class="canvas-footer">
-                  <div style="max-width:780px; margin:0 auto;">
-                    <?php if (!empty($campaign['sender_name'])): ?>
-                      <?php echo h($campaign['sender_name']); ?>
-                    <?php else: ?>
-                      <!-- no address lines as requested; show nothing if no sender_name -->
-                    <?php endif; ?>
-                    <?php if (!empty($campaign['unsubscribe_enabled'])): ?>
-                      &nbsp;·&nbsp;<a href="#">Unsubscribe</a>
-                    <?php endif; ?>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Hidden html textarea (holds campaign html) -->
-            <textarea name="html" id="htmlField" style="display:none;"><?php echo h($campaign['html']); ?></textarea>
-
-            <!-- hidden bottom buttons kept for compatibility -->
-            <div style="display:none; margin-top:12px; text-align:right;">
-              <button type="submit" class="btn btn-outline">Save</button>
-<!-- continuing from the snippet above -->
-              <button type="submit" name="go_to_review" value="1" class="btn btn-primary">Review Details &amp; Send</button>
-            </div>
-          </form>
-
-          <!-- HTML Editor Modal (for Code module) -->
-          <div class="html-editor-backdrop" id="htmlEditorBackdrop" role="dialog" aria-modal="true">
-            <div class="html-editor-panel" role="document">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <div style="font-weight:600;">HTML Editor</div>
-                <button class="btn btn-outline" id="htmlEditorClose">✕</button>
-              </div>
-              <textarea id="htmlEditorTextarea"><?php echo h($campaign['html']); ?></textarea>
-              <div class="html-editor-actions">
-                <button class="btn btn-outline" id="htmlEditorCancel">Cancel</button>
-                <button class="btn btn-primary" id="htmlEditorSave">Save HTML</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- Include SortableJS for drag & drop -->
-          <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
-
-          <script>
-            (function(){
-              // Helpers
-              function $(sel, root){ return (root || document).querySelector(sel); }
-              function $all(sel, root){ return Array.from((root || document).querySelectorAll(sel)); }
-
-              var reviewTop = document.getElementById('reviewTopBtn');
-              var form = document.getElementById('editorForm');
-              var saveBtnTop = document.getElementById('saveBtnTop');
-
-              // HTML Editor modal elems (declare early so handlers can reference them)
-              var htmlBackdrop = document.getElementById('htmlEditorBackdrop');
-              var htmlTextarea = document.getElementById('htmlEditorTextarea');
-              var htmlClose = document.getElementById('htmlEditorClose');
-              var htmlCancel = document.getElementById('htmlEditorCancel');
-              var htmlSave = document.getElementById('htmlEditorSave');
-
-              // Toast utility
-              function showToast(msg, type){
-                var t = document.getElementById('globalToast');
-                if(!t) return;
-                t.innerText = msg;
-                t.className = 'toast show ' + (type === 'error' ? 'error' : 'success');
-                setTimeout(function(){
-                  t.className = 'toast';
-                }, 2000);
-              }
-
-              // Save behavior (top save) - use AJAX to enable autosave UX
-              function doSaveAjax(callback){
-                syncCanvasToHtmlField();
-                var fd = new FormData(form);
-                // Ensure action=save_campaign present
-                fd.set('action', 'save_campaign');
-
-                fetch(window.location.pathname + window.location.search, {
-                  method: 'POST',
-                  body: fd,
-                  credentials: 'same-origin',
-                  headers: {
-                    'X-Requested-With': 'XMLHttpRequest'
-                  }
-                }).then(function(resp){
-                  if (!resp.ok) throw new Error('Save failed');
-                  return resp.json().catch(function(){ return {ok:1}; });
-                }).then(function(json){
-                  showToast('Saved', 'success');
-                  if (typeof callback === 'function') callback(null, json);
-                }).catch(function(err){
-                  showToast('Save error', 'error');
-                  // fallback to normal submit if desired
-                  if (confirm('Autosave failed, submit full form instead?')) {
-                    form.submit();
-                  }
-                  if (typeof callback === 'function') callback(err);
-                });
-              }
-
-              function doSave() {
-                doSaveAjax();
-              }
-              if (saveBtnTop) saveBtnTop.addEventListener('click', doSave);
-
-              // Autosave every 7 seconds (only on editor page)
-              var autosaveTimer = setInterval(function(){
-                // only run autosave if form exists and page is visible
-                if (document.visibilityState === 'visible') {
-                  doSaveAjax();
-                }
-              }, 7000);
-
-              // When user clicks Review: if HTML modal is open, automatically save modal contents first
-              function doReviewSubmit(){
-                // if modal open, persist modal content programmatically (avoid invoking handlers via click())
-                if (htmlBackdrop && htmlBackdrop.classList.contains('show')) {
-                  try {
-                    // Persist raw HTML into hidden field
-                    if (typeof htmlField !== 'undefined' && htmlField !== null) {
-                      htmlField.value = htmlTextarea.value;
-                    } else {
-                      // htmlField may be defined later; fallback to finding it now
-                      var hf = document.getElementById('htmlField');
-                      if (hf) hf.value = htmlTextarea.value;
-                    }
-                    // Rehydrate canvas from new HTML so syncCanvasToHtmlField picks latest content
-                    if (typeof loadHtmlIntoCanvas === 'function') {
-                      loadHtmlIntoCanvas(htmlTextarea.value);
-                    }
-                    // Close modal visually
-                    if (typeof closeHtmlEditor === 'function') {
-                      closeHtmlEditor();
-                    } else {
-                      htmlBackdrop.classList.remove('show');
-                      htmlBackdrop.style.display = 'none';
-                    }
-                  } catch (e) {
-                    // if anything goes wrong, gracefully continue to submit whatever we have
-                  }
-
-                  var hidden = document.createElement('input');
-                  hidden.type = 'hidden';
-                  hidden.name = 'go_to_review';
-                  hidden.value = '1';
-                  form.appendChild(hidden);
-                  // ensure latest HTML is synced
-                  syncCanvasToHtmlField();
-                  form.submit();
-                  return;
-                }
-                // otherwise normal submit
-                var hidden = document.createElement('input');
-                hidden.type = 'hidden';
-                hidden.name = 'go_to_review';
-                hidden.value = '1';
-                form.appendChild(hidden);
-                // ensure html saved from canvas
-                syncCanvasToHtmlField();
-                form.submit();
-              }
-              if (reviewTop) reviewTop.addEventListener('click', doReviewSubmit);
-
-              // small tab UI (non-functional placeholders)
-              var tabs = document.querySelectorAll('.editor-left .tab');
-              tabs.forEach(function(t){
-                t.addEventListener('click', function(){
-                  tabs.forEach(function(x){ x.classList.remove('active'); });
-                  t.classList.add('active');
-                });
-              });
-
-              var modulesGrid = document.getElementById('modulesGrid');
-              var modulesPane = document.getElementById('modulesPane');
-              var canvas = document.getElementById('canvasArea');
-              var htmlField = document.getElementById('htmlField');
-
-              function openHtmlEditor() {
-                htmlTextarea.value = htmlField.value || '';
-                htmlBackdrop.classList.add('show');
-                htmlBackdrop.style.display = 'flex';
-                htmlTextarea.focus();
-              }
-              function closeHtmlEditor() {
-                htmlBackdrop.classList.remove('show');
-                htmlBackdrop.style.display = 'none';
-              }
-
-              // Build block markup for modules
-              function createBlockHtmlByModule(module) {
-                    switch(module) {
-                      case 'image':
-                        return '<div style="max-width:100%;text-align:center;"><img src="https://via.placeholder.com/600x200" alt="Image" style="max-width:100%;"></div>';
-                      case 'text':
-                        return '<div style="max-width:100%;font-size:15px;line-height:1.5;color:#333;"><p>Edit text by opening the Code module or double-click this block (use Code for advanced changes).</p></div>';
-                      case 'button':
-                        return '<div style="text-align:center;margin:16px;"><a href="#" style="background:var(--sg-blue);color:#fff;padding:10px;"></div>';
-                                                case 'columns':
-                        return '<div style="display:flex;gap:10px;"><div style="flex:1;background:#fafafa;padding:10px;">Column 1</div><div style="flex:1;background:#fafafa;padding:10px;">Column 2</div></div>';
-                      case 'imgtext':
-                        return '<div style="display:flex;gap:12px;align-items:center;"><img src="https://via.placeholder.com/160x100" style="width:160px;height:auto;"><div>Text next to image</div></div>';
-                      case 'code':
-                        // Removed the static "Add Code" placeholder from the default code module body
-                        return '<div class="code-module"><div class="code-module-header"><span></span><span class="tools"><button type="button" data-tool="edit" title="Edit code" style="background:transparent;border:none;color:#fff;cursor:pointer;">&lt;&gt;</button><button type="button" data-tool="delete" title="Delete" style="background:transparent;border:none;color:#fff;cursor:pointer;">🗑</button></span></div><div class="code-module-body"></div></div>';
-                      default:
-                        return '<div>Module: '+module+'</div>';
-                    }
-                  }
-
-                  // Create canvas block element (wrapper with remove button)
-                  // Accepts contentHtml or a module wrapper (like code-module)
-                  function makeCanvasBlock(contentHtml) {
-                    var wrapper = document.createElement('div');
-                    wrapper.className = 'canvas-block';
-                    var removeBtn = document.createElement('div');
-                    removeBtn.className = 'block-remove';
-                    removeBtn.title = 'Remove block';
-                    removeBtn.innerHTML = '✕';
-                    removeBtn.addEventListener('click', function(){
-                      // confirm removal
-                      if (confirm('Remove this block?')) {
-                        wrapper.remove();
-                        updatePlaceholderVisibility();
-                      }
-                    });
-
-                    var content = document.createElement('div');
-                    content.className = 'block-content';
-                    content.innerHTML = contentHtml || '';
-
-                    // If the block contains a code-module, wire up header tools and editing behavior
-                    var codeModuleEl = content.querySelector('.code-module');
-                    if (codeModuleEl) {
-                      // mark dataset for later use
-                      wrapper.dataset.module = 'code';
-
-                      var header = codeModuleEl.querySelector('.code-module-header');
-                      var body = codeModuleEl.querySelector('.code-module-body');
-
-                      // tool handlers
-                      header.addEventListener('click', function(e){
-                        // if clicked on tool buttons handle separately
-                        var t = e.target;
-                        if (t && t.getAttribute && t.getAttribute('data-tool') === 'delete') {
-                          if (confirm('Delete this code block?')) {
-                            wrapper.remove();
-                            updatePlaceholderVisibility();
-                          }
-                          return;
-                        }
-                        // open the block-level HTML editor for this code body
-                        openBlockEditor(body);
-                      });
-
-                      // support double-click edit for code body as well
-                      body.addEventListener('dblclick', function(){
-                        openBlockEditor(body);
-                      });
-                    } else {
-                      // double-click to edit via HTML editor (for general blocks)
-                      content.addEventListener('dblclick', function(){
-                        // open code editor with this block's HTML only
-                        htmlTextarea.value = content.innerHTML;
-                        htmlBackdrop.classList.add('show');
-                        htmlBackdrop.style.display = 'flex';
-                        var oneOff = function(e){
-                          e.preventDefault();
-                          content.innerHTML = htmlTextarea.value;
-                          htmlBackdrop.classList.remove('show');
-                          htmlBackdrop.style.display = 'none';
-                          htmlSave.removeEventListener('click', oneOff);
-                          if (defaultSaveHandler) {
-                            htmlSave.addEventListener('click', defaultSaveHandler);
-                          }
-                          syncCanvasToHtmlField();
-                        };
-                        // replace
-                        // replace handlers for this one-off edit
-                        if (defaultSaveHandler) htmlSave.removeEventListener('click', defaultSaveHandler);
-                        htmlSave.addEventListener('click', oneOff);
-                      });
-                    }
-
-                    wrapper.appendChild(removeBtn);
-                    wrapper.appendChild(content);
-                    return wrapper;
-                  }
-
-                  // Open block-level HTML editor (edits only the body of a code module or a block container)
-                  function openBlockEditor(bodyElement) {
-                    // set the textarea to the current innerHTML of the block body
-                    htmlTextarea.value = bodyElement.innerHTML;
-                    htmlBackdrop.classList.add('show');
-                    htmlBackdrop.style.display = 'flex';
-                    htmlTextarea.focus();
-
-                    // assign a one-off save handler that updates this bodyElement
-                    var oneOff = function(e){
-                      e.preventDefault();
-                      bodyElement.innerHTML = htmlTextarea.value;
-                      htmlBackdrop.classList.remove('show');
-                      htmlBackdrop.style.display = 'none';
-                      // restore global handler
-                      htmlSave.removeEventListener('click', oneOff);
-                      if (defaultSaveHandler) {
-                        htmlSave.addEventListener('click', defaultSaveHandler);
-                      }
-                      syncCanvasToHtmlField();
-                    };
-
-                    // ensure previous onclick is cleared and attach oneOff
-                    if (defaultSaveHandler) htmlSave.removeEventListener('click', defaultSaveHandler);
-                    htmlSave.addEventListener('click', oneOff);
-                  }
-
-                  // Sync: read all canvas blocks and set htmlField
-                  function syncCanvasToHtmlField() {
-                    // take innerHTML of all .block-content inside canvas, concatenate
-                    var blocks = canvas.querySelectorAll('.canvas-block .block-content');
-                    if (blocks.length === 0) {
-                      htmlField.value = '';
-                      return;
-                    }
-                    var html = '';
-                    blocks.forEach(function(b){
-                      // Check if this block contains a code-module
-                      var codeModule = b.querySelector('.code-module');
-                      if (codeModule) {
-                        // For code modules, extract only the body content (skip the header with emoji/buttons)
-                        var codeBody = codeModule.querySelector('.code-module-body');
-                        if (codeBody) {
-                          html += codeBody.innerHTML;
-                        } else {
-                          // Fallback: if body not found, use full block content to avoid data loss
-                          html += b.innerHTML;
-                        }
-                      } else {
-                        // For non-code modules, include the entire block content
-                        html += b.innerHTML;
-                      }
-                    });
-                    htmlField.value = html;
-                  }
-
-                  // Update placeholder if empty
-                  function updatePlaceholderVisibility() {
-                    var hasBlocks = canvas.querySelectorAll('.canvas-block').length > 0;
-                    var placeholder = canvas.querySelector('.drag-placeholder');
-                    if (!hasBlocks) {
-                      if (!placeholder) {
-                        var ph = document.createElement('div');
-                        ph.className = 'drag-placeholder';
-                        ph.innerText = 'Drag Module Here';
-                        canvas.appendChild(ph);
-                      }
-                    } else {
-                      if (placeholder) placeholder.remove();
-                    }
-                  }
-
-                  // Default html save handler for modal (saves entire canvas)
-                  function defaultHtmlSaveHandler(e){
-                    e.preventDefault();
-                    // set hidden field and update canvas preview
-                    htmlField.value = htmlTextarea.value;
-                    // rehydrate canvas blocks from new html (single big block)
-                    loadHtmlIntoCanvas(htmlTextarea.value);
-                    closeHtmlEditor();
-                  }
-                  var defaultSaveHandler = defaultHtmlSaveHandler;
-                  if (htmlSave) htmlSave.addEventListener('click', defaultSaveHandler);
-
-                  if (htmlClose) htmlClose.addEventListener('click', function(){ closeHtmlEditor(); });
-                  if (htmlCancel) htmlCancel.addEventListener('click', function(e){ e.preventDefault(); closeHtmlEditor(); });
-
-                  // Parse existing htmlField value into canvas blocks (split top-level nodes)
-                  function loadHtmlIntoCanvas(rawHtml) {
-                    canvas.innerHTML = ''; // clear
-                    if (!rawHtml || rawHtml.trim() === '') {
-                      updatePlaceholderVisibility();
-                      return;
-                    }
-                    var tmp = document.createElement('div');
-                    tmp.innerHTML = rawHtml;
-                    // if there are multiple top-level nodes, create a block for each
-                    var children = Array.from(tmp.childNodes).filter(function(n){
-                      // ignore empty text nodes
-                      return !(n.nodeType === 3 && !n.textContent.trim());
-                    });
-                    if (children.length === 0) {
-                      updatePlaceholderVisibility();
-                      return;
-                    }
-                    children.forEach(function(node){
-                      var html = (node.outerHTML !== undefined) ? node.outerHTML : node.textContent;
-                      var blockEl = makeCanvasBlock(html);
-                      canvas.appendChild(blockEl);
-                    });
-                    updatePlaceholderVisibility();
-                  }
-
-                  // Initialize Sortable for modules (pull: clone)
-                  var modulesSortable = Sortable.create(document.getElementById('modulesGrid'), {
-                    group: { name: 'modules', pull: 'clone', put: false },
-                    sort: false,
-                    animation: 150,
-                    onEnd: function (evt) {
-                      // modules grid end — clicks are handled separately
-                    }
-                  });
-
-                  // Initialize Sortable on canvas to accept modules and sort existing blocks
-                  var canvasSortable = Sortable.create(canvas, {
-                    group: { name: 'modules', pull: false, put: true },
-                    animation: 150,
-                    ghostClass: 'sortable-ghost',
-                    onAdd: function (evt) {
-                      // when an item is dragged from modules into canvas, evt.item is the clone element (module-tile)
-                      var dragged = evt.item;
-                      var module = dragged.getAttribute('data-module');
-                      // create a real block with contentHtml
-                      var contentHtml = createBlockHtmlByModule(module);
-                      var blockEl = makeCanvasBlock(contentHtml);
-                      // replace the dragged placeholder with the real block
-                      dragged.parentNode.replaceChild(blockEl, dragged);
-                      syncCanvasToHtmlField();
-
-                      // If the inserted module is code, open the block-level editor immediately
-                      if (module === 'code') {
-                        // find the block's body node and open block editor
-                        var body = blockEl.querySelector('.code-module-body');
-                        if (body) {
-                          // small delay to ensure DOM is ready
-                          setTimeout(function(){ openBlockEditor(body); }, 50);
-                        }
-                      }
-                    },
-                    onUpdate: function(evt){
-                      // reorder happened
-                      syncCanvasToHtmlField();
-                    },
-                    onRemove: function(evt){
-                      syncCanvasToHtmlField();
-                    }
-                  });
-
-                  // Also support clicking module tiles to insert at end
-                  $all('.module-tile').forEach(function(t){
-                    t.addEventListener('click', function(){
-                      var module = t.getAttribute('data-module');
-                      if (module === 'code') {
-                        // open full HTML editor (editing whole message)
-                        openHtmlEditor();
-                        // defaultSaveHandler already handles full save
-                        return;
-                      }
-                      var html = createBlockHtmlByModule(module);
-                      var block = makeCanvasBlock(html);
-                      // if placeholder exists, replace it
-                      var placeholder = canvas.querySelector('.drag-placeholder');
-                      if (placeholder) {
-                        placeholder.remove();
-                      }
-                      canvas.appendChild(block);
-                      // ensure block is sortable (Sortable automatically includes it)
-                      syncCanvasToHtmlField();
-                    });
-                  });
-
-                  // Hydrate initial html into canvas
-                  loadHtmlIntoCanvas(htmlField.value);
-
-                  // If no HTML and we want a code module shown by default, create it and open editor
-                  // (This matches the requested UX: when first inserting code or when campaign empty show code editor option)
-                  if ((!htmlField.value || htmlField.value.trim() === '') && canvas.querySelectorAll('.canvas-block').length === 0) {
-                    // leave placeholder visible; user will insert modules intentionally
-                  }
-
-                  // Keep canvas and htmlField in sync on form submit
-                  form.addEventListener('submit', function(){
-                    syncCanvasToHtmlField();
-                  });
-
-                  // Utility: preview and save as template placeholders (not implemented)
-                  var previewBtn = document.getElementById('previewBtn');
-                  var saveAsTplBtn = document.getElementById('saveAsTplBtn');
-                  if (previewBtn) previewBtn.addEventListener('click', function(){ alert('Preview not implemented in this demo.'); });
-                  if (saveAsTplBtn) saveAsTplBtn.addEventListener('click', function(){ alert('Save as template not implemented.'); });
-
-                  // ESC to close html modal
-                  document.addEventListener('keydown', function(e){
-                    if (e.key === 'Escape') {
-                      if (htmlBackdrop && htmlBackdrop.classList.contains('show')) closeHtmlEditor();
-                    }
-                  });
-
-                  // Accessibility: when dragging from modules, set aria-grabbed (basic)
-                                    $all('.module-tile').forEach(function(t){
-                    t.setAttribute('draggable', 'true');
-                  });
-
-                })();
-              </script>
-
-              <!-- Global toast element (used by autosave / success / error messages) -->
-              <div id="globalToast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
-
-            <?php } // End campaign check ?>
-            <?php } // End PDO check ?>
-
+      <?php elseif ($page === 'review'): ?>
           <?php elseif ($page === 'review'): ?>
             <?php
               if ($pdo === null) {
