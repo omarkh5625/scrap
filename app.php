@@ -2260,13 +2260,13 @@ function update_rotation_settings(PDO $pdo, array $data) {
         UPDATE rotation_settings
         SET rotation_enabled = :rotation_enabled,
             workers = :workers,
-            messages_per_worker = :messages_per_worker
+            emails_per_worker = :emails_per_worker
         WHERE id = 1
     ");
     $stmt->execute([
         ':rotation_enabled'      => $data['rotation_enabled'],
         ':workers'               => $data['workers'] ?? 4,
-        ':messages_per_worker'   => $data['messages_per_worker'] ?? 100,
+        ':emails_per_worker'     => $data['emails_per_worker'] ?? $data['messages_per_worker'] ?? 100,
     ]);
 }
 
@@ -5119,20 +5119,12 @@ if ($action === 'save_rotation') {
         error_log("Info: Rotation settings saved with $workers workers (NOT an error)");
     }
     
-    $messages_per_worker   = max(MIN_MESSAGES_PER_WORKER, min(MAX_MESSAGES_PER_WORKER, (int)($_POST['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER)));
+    $emails_per_worker   = max(MIN_EMAILS_PER_WORKER, min(MAX_EMAILS_PER_WORKER, (int)($_POST['emails_per_worker'] ?? $_POST['messages_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER)));
     
-    // Keep default values for backward compatibility (not shown in UI)
-    $rotation_mode         = 'sequential';
-    $batch_size            = 1;
-    $max_sends_per_profile = 0;
-
     update_rotation_settings($pdo, [
         'rotation_enabled'      => $rotation_enabled,
-        'mode'                  => $rotation_mode,
-        'batch_size'            => $batch_size,
-        'max_sends_per_profile' => $max_sends_per_profile,
         'workers'               => $workers,
-        'messages_per_worker'   => $messages_per_worker,
+        'emails_per_worker'     => $emails_per_worker,
     ]);
 
     header("Location: ?page=list&rot_saved=1");
@@ -6730,7 +6722,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
       <div class="topbar-actions">
         <?php if ($page === 'list'): ?>
           <a href="?page=contacts" class="btn btn-outline">Contacts</a>
-          <button class="btn btn-outline" id="spOpenBtn" type="button">Sending Profiles ⚙</button>
+          <button class="btn btn-outline" id="spOpenBtn" type="button">Job Profiles ⚙</button>
         <?php elseif ($page === 'contacts'): ?>
           <a href="?page=list" class="btn btn-outline">Single Sends</a>
         <?php else: ?>
