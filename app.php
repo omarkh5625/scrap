@@ -3947,48 +3947,18 @@ class Router {
     */
     
     private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
-        error_log("autoSpawnWorkers: Attempting to spawn {$workerCount} workers for job " . ($jobId ?? 'any'));
+        error_log("autoSpawnWorkers: Spawning {$workerCount} workers via HTTP for job " . ($jobId ?? 'any'));
         
-        // For restricted hosting environments (exec disabled, no cron), 
-        // process work directly in background after closing connection
-        // This ensures extraction starts immediately without blocking UI
+        // Use HTTP-based spawning for maximum compatibility and reliability
+        // This works across all hosting environments (shared hosting, VPS, cPanel, etc.)
+        $successCount = self::spawnWorkersViaHttp($workerCount, $jobId);
         
-        // Check which spawning methods are available
-        $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
-        $procOpenAvailable = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
-        
-        $workersSpawned = false;
-        
-        if ($execAvailable) {
-            error_log("autoSpawnWorkers: Using exec() method for parallel workers");
-            // Method 1: Spawn background PHP processes using exec (best performance)
-            self::spawnWorkersViaExec($workerCount, $jobId);
-            $workersSpawned = true;
-        } else if ($procOpenAvailable) {
-            error_log("autoSpawnWorkers: exec() not available, using proc_open() for parallel workers");
-            // Method 2: Spawn background PHP processes using proc_open (cPanel compatible)
-            try {
-                self::spawnWorkersViaProcOpen($workerCount, $jobId);
-                $workersSpawned = true;
-            } catch (Exception $e) {
-                error_log("autoSpawnWorkers: proc_open() failed: " . $e->getMessage());
-                $workersSpawned = false;
-            }
-        }
-        
-        // If proc_open or exec didn't work, try HTTP
-        if (!$workersSpawned) {
-            // Method 3: Try HTTP-based spawning for true parallel workers
-            error_log("autoSpawnWorkers: Trying HTTP method for parallel workers");
-            $successCount = self::spawnWorkersViaHttp($workerCount, $jobId);
-            
-            // Method 4: Fallback to direct background processing if HTTP also fails
-            if ($successCount < $workerCount / 2) { // If less than 50% workers spawned via HTTP
-                error_log("autoSpawnWorkers: HTTP method insufficient ({$successCount}/{$workerCount}), using direct background processing");
-                self::processWorkersInBackground($workerCount, $jobId);
-            } else {
-                error_log("autoSpawnWorkers: Successfully spawned {$successCount} workers via HTTP");
-            }
+        if ($successCount < $workerCount / 2) { 
+            // If less than 50% workers spawned via HTTP, try direct background processing as fallback
+            error_log("autoSpawnWorkers: HTTP method insufficient ({$successCount}/{$workerCount}), using direct background processing");
+            self::processWorkersInBackground($workerCount, $jobId);
+        } else {
+            error_log("autoSpawnWorkers: Successfully spawned {$successCount}/{$workerCount} workers via HTTP");
         }
     }
     
@@ -4110,11 +4080,13 @@ class Router {
                 'worker_index' => $i,
                 'job_id' => $jobId // Pass job_id to worker
             ]));
-            curl_setopt($ch, CURLOPT_TIMEOUT_MS, 500); // Very short timeout - just trigger
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, 500);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 3); // 3 seconds timeout
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2); // 2 seconds connection timeout
             curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
             curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
             curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
             
             curl_multi_add_handle($multiHandle, $ch);
             $handles[$i] = $ch;
@@ -4135,8 +4107,9 @@ class Router {
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $error = curl_error($ch);
             
-            if ($httpCode === 200 || $httpCode === 0) { // 0 = timeout (expected for async)
-                error_log("spawnWorkersViaHttp: Worker #{$i} triggered (HTTP {$httpCode})");
+            // Accept HTTP 200 or 0 (timeout is OK for async workers)
+            if ($httpCode === 200 || $httpCode === 0) {
+                error_log("spawnWorkersViaHttp: Worker #{$i} triggered successfully (HTTP {$httpCode})");
                 $successCount++;
             } else {
                 error_log("spawnWorkersViaHttp: Worker #{$i} failed - HTTP {$httpCode}, Error: {$error}");
