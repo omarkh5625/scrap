@@ -1584,16 +1584,28 @@ class Worker {
     
     /**
      * Check if all queue items for a job are complete and update job status accordingly
+     * Also checks if target email count has been reached
      */
     public static function checkAndUpdateJobCompletion(int $jobId): void {
         $db = Database::connect();
+        
+        // Get job details to check email count
+        $job = Job::getById($jobId);
+        if (!$job) {
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} not found");
+            return;
+        }
+        
+        $maxResults = (int)$job['max_results'];
+        $emailsCollected = Job::getEmailCount($jobId);
         
         // Get total and completed queue items for this job
         $stmt = $db->prepare("
             SELECT 
                 COUNT(*) as total,
                 SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending
             FROM job_queue 
             WHERE job_id = ?
         ");
@@ -1603,30 +1615,42 @@ class Worker {
         $total = (int)$counts['total'];
         $completed = (int)$counts['completed'];
         $failed = (int)$counts['failed'];
+        $pending = (int)$counts['pending'];
         
         if ($total == 0) {
             error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
             return;
         }
         
-        // Calculate progress percentage
-        $progress = (int)round(($completed / $total) * 100);
+        // Calculate progress based on email count (more accurate)
+        $progress = min(100, (int)round(($emailsCollected / $maxResults) * 100));
         
-        error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
+        error_log("  checkAndUpdateJobCompletion: Job {$jobId} - emails: {$emailsCollected}/{$maxResults}, queue: {$completed}/{$total} completed");
         
-        // Update job status based on queue completion
-        if ($completed == $total) {
-            // All queue items completed
+        // Check if target email count reached OR all queue items completed
+        if ($emailsCollected >= $maxResults) {
+            // Target reached - mark as completed immediately
             Job::updateStatus($jobId, 'completed', 100);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (target reached: {$emailsCollected}/{$maxResults})");
+            
+            // Cancel any pending queue items since target is reached
+            if ($pending > 0) {
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'completed' WHERE job_id = ? AND status = 'pending'");
+                $stmt->execute([$jobId]);
+                error_log("  checkAndUpdateJobCompletion: Marked {$pending} pending queue items as completed (target reached)");
+            }
+        } elseif ($completed == $total) {
+            // All queue items completed but target not reached
+            Job::updateStatus($jobId, 'completed', $progress);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (all queue items done, {$emailsCollected}/{$maxResults} emails)");
         } elseif ($completed + $failed == $total) {
             // All queue items either completed or failed
             Job::updateStatus($jobId, 'completed', $progress);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed, {$emailsCollected}/{$maxResults} emails)");
         } else {
             // Still processing
             Job::updateStatus($jobId, 'running', $progress);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%, pending = {$pending}");
         }
     }
     
@@ -1775,6 +1799,13 @@ class Worker {
         $page = (int)($startOffset / 10) + 1;
         
         while ($processed < $maxToProcess) {
+            // Check if job has reached target before processing next page
+            $currentEmailCount = Job::getEmailCount($jobId);
+            if ($currentEmailCount >= $maxResults) {
+                error_log("Job {$jobId} reached target ({$currentEmailCount}/{$maxResults}), stopping this worker");
+                break;
+            }
+            
             $data = self::searchSerper($apiKey, $query, $page, $country);
             
             if (!$data || !isset($data['organic'])) {
@@ -1793,6 +1824,13 @@ class Worker {
             
             // Update worker statistics
             self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+            
+            // Check if target reached after each page
+            $currentEmailCount = Job::getEmailCount($jobId);
+            if ($currentEmailCount >= $maxResults) {
+                error_log("Job {$jobId} reached target after page {$page} ({$currentEmailCount}/{$maxResults})");
+                break;
+            }
             
             if ($processed > 0 && $processed % 10 === 0) {
                 echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
@@ -1814,8 +1852,8 @@ class Worker {
             self::markQueueItemComplete($queueId);
         }
         
-        // Update overall job progress
-        self::updateJobProgress($jobId);
+        // Update overall job progress and check for completion
+        self::checkAndUpdateJobCompletion($jobId);
         
         echo "Job chunk completed! Processed {$processed} emails\n";
         
@@ -1916,6 +1954,7 @@ class Worker {
             $query = $job['query'];
             $country = $job['country'];
             $emailFilter = $job['email_filter'];
+            $jobMaxResults = (int)$job['max_results'];
             
             $processed = 0;
             $pagesProcessed = 0;
@@ -1924,6 +1963,13 @@ class Worker {
             error_log("processJobImmediately: Starting from page {$page}, will process max {$maxResults} emails");
             
             while ($processed < $maxResults) {
+                // Check if job has reached target before processing next page
+                $currentEmailCount = Job::getEmailCount($jobId);
+                if ($currentEmailCount >= $jobMaxResults) {
+                    error_log("processJobImmediately: Job {$jobId} reached target ({$currentEmailCount}/{$jobMaxResults}), stopping");
+                    break;
+                }
+                
                 try {
                     error_log("processJobImmediately: Calling searchSerper, page={$page}");
                     $data = self::searchSerper($apiKey, $query, $page, $country);
@@ -1954,6 +2000,13 @@ class Worker {
                     
                     error_log("processJobImmediately: Processed {$processed}/{$maxResults} emails so far");
                     
+                    // Check if target reached after each page
+                    $currentEmailCount = Job::getEmailCount($jobId);
+                    if ($currentEmailCount >= $jobMaxResults) {
+                        error_log("processJobImmediately: Job {$jobId} reached target after page {$page} ({$currentEmailCount}/{$jobMaxResults})");
+                        break;
+                    }
+                    
                     if (!isset($data['organic']) || count($data['organic']) === 0) {
                         break;
                     }
@@ -1976,6 +2029,9 @@ class Worker {
             }
             
             error_log("processJobImmediately: Completed. Processed {$processed} emails from {$pagesProcessed} pages");
+            
+            // Check if job completion should be updated
+            self::checkAndUpdateJobCompletion($jobId);
             
         } catch (Exception $e) {
             error_log("Critical error in processJobImmediately: " . $e->getMessage());
@@ -3947,14 +4003,41 @@ class Router {
     */
     
     private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
-        error_log("autoSpawnWorkers: Force-spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
+        error_log("autoSpawnWorkers: Spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
         
-        // FORCE direct background processing - most reliable method
-        // This always works regardless of hosting environment
-        error_log("autoSpawnWorkers: Using FORCED direct background processing (most reliable)");
-        self::processWorkersInBackground($workerCount, $jobId);
+        // Try methods in order of preference for TRUE parallelism
+        // 1. proc_open (best - truly parallel separate processes)
+        // 2. exec (good - background processes)
+        // 3. HTTP workers (fallback - async HTTP requests)
+        // 4. inline processing (last resort - sequential but reliable)
         
-        error_log("autoSpawnWorkers: Completed - workers are now processing in background");
+        $successCount = 0;
+        
+        // Method 1: Try proc_open first (most reliable for true parallelism)
+        if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+            error_log("autoSpawnWorkers: Using proc_open for TRUE parallel processing");
+            self::spawnWorkersViaProcOpen($workerCount, $jobId);
+            $successCount = $workerCount; // Assume success
+        }
+        // Method 2: Try exec if proc_open not available
+        elseif (function_exists('exec') && !in_array('exec', explode(',', ini_get('disable_functions')))) {
+            error_log("autoSpawnWorkers: Using exec for parallel processing");
+            self::spawnWorkersViaExec($workerCount, $jobId);
+            $successCount = $workerCount; // Assume success
+        }
+        // Method 3: Try HTTP workers
+        else {
+            error_log("autoSpawnWorkers: exec/proc_open not available, trying HTTP workers");
+            $successCount = self::spawnWorkersViaHttp($workerCount, $jobId);
+        }
+        
+        // Method 4: Fallback to inline if nothing else worked
+        if ($successCount === 0) {
+            error_log("autoSpawnWorkers: All async methods failed, falling back to inline processing");
+            self::processWorkersInBackground($workerCount, $jobId);
+        }
+        
+        error_log("autoSpawnWorkers: Completed - {$successCount} workers spawned");
     }
     
     private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
@@ -4238,6 +4321,21 @@ class Router {
             while (!$allWorkersIdle && (time() - $startTime) < $maxRuntime) {
                 $anyWorkerProcessed = false;
                 
+                // Check if job target reached before processing more
+                if ($jobId) {
+                    $job = Job::getById($jobId);
+                    if ($job) {
+                        $emailsCollected = Job::getEmailCount($jobId);
+                        $maxResults = (int)$job['max_results'];
+                        
+                        if ($emailsCollected >= $maxResults) {
+                            error_log("processWorkersInBackground: Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), stopping all workers");
+                            Worker::checkAndUpdateJobCompletion($jobId);
+                            break;
+                        }
+                    }
+                }
+                
                 // Update ALL workers' heartbeats at start of each cycle to prevent stale detection
                 foreach ($workers as $w) {
                     Worker::updateHeartbeat($w['id'], 'running', $jobId, 0, 0);
@@ -4306,6 +4404,16 @@ class Router {
                     $allWorkersIdle = true;
                     error_log("processWorkersInBackground: No more queue items available - all workers idle");
                 }
+                
+                // Check job completion status periodically
+                if ($jobId && $totalProcessed > 0 && $totalProcessed % 5 === 0) {
+                    Worker::checkAndUpdateJobCompletion($jobId);
+                }
+            }
+            
+            // Final check for job completion
+            if ($jobId) {
+                Worker::checkAndUpdateJobCompletion($jobId);
             }
             
             // Mark all workers as idle when done
