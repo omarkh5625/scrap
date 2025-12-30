@@ -4648,7 +4648,12 @@ if ($action === 'save_job' || $action === 'save_campaign') {
         
         // Check if should start immediately
         if (isset($_POST['start_immediately']) && $_POST['start_immediately']) {
-            header("Location: ?page=list&action=start_job&job_id={$id}");
+            // Redirect with POST to start_job action
+            header("Location: ?page=list");
+            echo '<!DOCTYPE html><html><body><form id="startForm" method="POST" action="?page=list">';
+            echo '<input type="hidden" name="action" value="start_job">';
+            echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
+            echo '</form><script>document.getElementById("startForm").submit();</script></body></html>';
             exit;
         }
     } catch (Exception $e) {
@@ -4678,14 +4683,20 @@ if ($action === 'save_job' || $action === 'save_campaign') {
 // Start extraction job action
 if ($action === 'start_job') {
     $job_id = (int)($_POST['job_id'] ?? $_GET['job_id'] ?? 0);
+    error_log("START_JOB ACTION: Received job_id=" . $job_id);
+    
     if ($job_id > 0) {
         $job = get_job($pdo, $job_id);
+        error_log("START_JOB ACTION: Job fetched: " . ($job ? "YES (profile_id=" . ($job['profile_id'] ?? 'NULL') . ")" : "NO"));
+        
         if ($job && !empty($job['profile_id'])) {
             try {
                 // Get profile information
                 $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
                 $profile_stmt->execute([$job['profile_id']]);
                 $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+                
+                error_log("START_JOB ACTION: Profile fetched: " . ($profile ? "YES (id=" . $profile['id'] . ")" : "NO"));
                 
                 if ($profile) {
                     // Use target from job or profile
@@ -4694,6 +4705,7 @@ if ($action === 'start_job') {
                     // Update job status to extracting immediately (like old "sending" status)
                     $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting', progress_total = ?, started_at = NOW() WHERE id = ?");
                     $stmt->execute([$targetCount, $job_id]);
+                    error_log("START_JOB ACTION: Job {$job_id} status updated to 'extracting', progress_total={$targetCount}");
                     
                     $redirect = "?page=list&started_job=" . (int)$job_id;
                     
@@ -4702,6 +4714,7 @@ if ($action === 'start_job') {
                     
                     // Use fastcgi_finish_request if available (like old email sending system)
                     if (function_exists('fastcgi_finish_request')) {
+                        error_log("START_JOB ACTION: Using fastcgi_finish_request method");
                         header("Location: $redirect");
                         echo "<!doctype html><html><body>Extracting emails in background... Redirecting.</body></html>";
                         @ob_end_flush();
@@ -4713,7 +4726,9 @@ if ($action === 'start_job') {
                         
                         // Execute extraction in same process (non-blocking for user)
                         try {
+                            error_log("START_JOB ACTION: Starting perform_extraction for job {$job_id}");
                             perform_extraction($pdo, $job_id, $job, $profile);
+                            error_log("START_JOB ACTION: perform_extraction completed for job {$job_id}");
                         } catch (Throwable $e) {
                             error_log("Job extraction error: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
                             error_log("Stack trace: " . $e->getTraceAsString());
@@ -4722,7 +4737,9 @@ if ($action === 'start_job') {
                     }
                     
                     // Fallback: Try background worker (if fastcgi not available)
+                    error_log("START_JOB ACTION: fastcgi not available, trying background worker");
                     $spawned = spawn_extraction_worker($pdo, $job_id);
+                    error_log("START_JOB ACTION: Worker spawn result: " . ($spawned ? "SUCCESS" : "FAILED"));
                     
                     if ($spawned) {
                         header("Location: $redirect");
@@ -4730,6 +4747,7 @@ if ($action === 'start_job') {
                     }
                     
                     // Last resort: synchronous extraction (blocking but works everywhere)
+                    error_log("START_JOB ACTION: Using synchronous (blocking) method");
                     header("Location: $redirect");
                     echo "<!doctype html><html><body>Extracting emails... Please wait.</body></html>";
                     @ob_end_flush();
@@ -4740,18 +4758,25 @@ if ($action === 'start_job') {
                     
                     try {
                         perform_extraction($pdo, $job_id, $job, $profile);
+                        error_log("START_JOB ACTION: Synchronous extraction completed for job {$job_id}");
                     } catch (Throwable $e) {
                         error_log("Job extraction error (blocking): " . $e->getMessage());
                     }
                     exit;
                 }
+                error_log("START_JOB ACTION: Profile not found for job {$job_id}");
             } catch (Exception $e) {
                 error_log("Failed to start job {$job_id}: " . $e->getMessage());
                 header("Location: ?page=editor&id={$job_id}&error=" . urlencode($e->getMessage()));
                 exit;
             }
+        } else {
+            error_log("START_JOB ACTION: Job check failed - job exists: " . ($job ? "YES" : "NO") . ", has profile_id: " . (!empty($job['profile_id']) ? "YES" : "NO"));
         }
+    } else {
+        error_log("START_JOB ACTION: Invalid job_id: " . $job_id);
     }
+    error_log("START_JOB ACTION: Redirecting to list page (fallback)");
     header("Location: ?page=list");
     exit;
 }
@@ -7167,24 +7192,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                     return;
                   }
                   if (confirm('Start extraction job now?')) {
-                    var form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = '?page=list';  // Submit to list page with action
-                    
-                    var actionInput = document.createElement('input');
-                    actionInput.type = 'hidden';
-                    actionInput.name = 'action';
-                    actionInput.value = 'start_job';
-                    form.appendChild(actionInput);
-                    
-                    var idInput = document.createElement('input');
-                    idInput.type = 'hidden';
-                    idInput.name = 'job_id';
-                    idInput.value = <?php echo (int)$job['id']; ?>;
-                    form.appendChild(idInput);
-                    
-                    document.body.appendChild(form);
-                    form.submit();
+                    // First save the job configuration (profile_id, name, target_count)
+                    // Then start the job
+                    var jobForm = document.getElementById('jobForm');
+                    if (jobForm) {
+                      // Create hidden input to trigger start after save
+                      var startInput = document.createElement('input');
+                      startInput.type = 'hidden';
+                      startInput.name = 'start_immediately';
+                      startInput.value = '1';
+                      jobForm.appendChild(startInput);
+                      
+                      // Submit the form (will save job and redirect to start)
+                      jobForm.submit();
+                    }
                   }
                 });
               }
