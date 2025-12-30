@@ -938,7 +938,8 @@ function extract_emails_serper(string $apiKey, string $query, string $country = 
     
     // Extract emails from search results
     $emails = [];
-    $emailPattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/';
+    // More robust email pattern that prevents multiple consecutive dots
+    $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
     
     // Check organic results
     if (isset($data['organic']) && is_array($data['organic'])) {
@@ -953,11 +954,17 @@ function extract_emails_serper(string $apiKey, string $query, string $country = 
                 foreach ($matches[0] as $email) {
                     $email = strtolower($email);
                     
+                    // Additional validation: check for @ symbol
+                    $atPos = strpos($email, '@');
+                    if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
+                        continue; // Invalid email format
+                    }
+                    
                     // Filter business emails if requested
                     if ($businessOnly) {
                         // Skip common free email providers
                         $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
-                        $domain = substr($email, strpos($email, '@') + 1);
+                        $domain = substr($email, $atPos + 1);
                         if (in_array($domain, $freeProviders)) {
                             continue;
                         }
@@ -4479,7 +4486,7 @@ if ($action === 'save_job' || $action === 'save_campaign') {
         error_log("Failed to save job id {$id}: " . $e->getMessage());
         if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) || strpos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== false) {
             http_response_code(500);
-            echo json_encode(['error' => 'Failed to save campaign']);
+            echo json_encode(['error' => 'Failed to save job']);
             exit;
         }
         header("Location: ?page=editor&id={$id}&save_error=1");
@@ -6708,7 +6715,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
         </form>
       </div>
       <div class="sidebar-foot">
-        <div class="hint">Rotation + profiles apply globally to all Single Sends. Configure bounce mailbox to auto-add bounces to unsubscribes.</div>
+        <div class="hint">Rotation + profiles apply globally to all extraction jobs. Configure worker settings to optimize extraction performance.</div>
       </div>
     </div>
   </div>
@@ -6721,10 +6728,9 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
       </div>
       <div class="topbar-actions">
         <?php if ($page === 'list'): ?>
-          <a href="?page=contacts" class="btn btn-outline">Contacts</a>
           <button class="btn btn-outline" id="spOpenBtn" type="button">Job Profiles ⚙</button>
         <?php elseif ($page === 'contacts'): ?>
-          <a href="?page=list" class="btn btn-outline">Single Sends</a>
+          <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
         <?php else: ?>
           <a href="?page=list" class="btn btn-outline">Single Sends</a>
           <a href="?page=contacts" class="btn btn-outline">Contacts</a>
