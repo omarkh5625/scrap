@@ -3103,7 +3103,7 @@ class Router {
                                 <tr>
                                     <td>#<?php echo $job['id']; ?></td>
                                     <td><?php echo htmlspecialchars($job['query']); ?></td>
-                                    <td><span class="status-badge status-<?php echo $job['status']; ?>"><?php echo ucfirst($job['status']); ?></span></td>
+                                    <td><span class="status-badge status-<?php echo $job['status']; ?> job-status-badge-<?php echo $job['id']; ?>"><?php echo ucfirst($job['status']); ?></span></td>
                                     <td>
                                         <div class="progress-bar">
                                             <div class="progress-fill job-progress-fill-<?php echo $job['id']; ?>" style="width: <?php echo $job['progress']; ?>%"></div>
@@ -3241,6 +3241,17 @@ class Router {
                                 const emailCount = document.querySelector('.job-email-count-' + jobId);
                                 if (emailCount) {
                                     emailCount.textContent = emailsCollected;
+                                }
+                                
+                                // Update status badge
+                                const statusBadge = document.querySelector('.job-status-badge-' + jobId);
+                                if (statusBadge && job.status) {
+                                    // Remove old status class
+                                    statusBadge.className = statusBadge.className.replace(/status-\w+/g, '').trim();
+                                    // Add new status class
+                                    statusBadge.className = 'status-badge status-' + job.status + ' job-status-badge-' + jobId;
+                                    // Update status text
+                                    statusBadge.textContent = job.status.charAt(0).toUpperCase() + job.status.slice(1);
                                 }
                                 
                                 // Show and update live progress details
