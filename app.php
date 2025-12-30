@@ -859,13 +859,21 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
         $result = extract_emails_serper($apiKey, $searchQuery, $country, $businessOnly, $targetCount);
         error_log("PERFORM_EXTRACTION: extract_emails_serper() returned: success=" . ($result['success'] ? 'YES' : 'NO'));
         
+        if (isset($result['log']) && is_array($result['log'])) {
+            foreach ($result['log'] as $logEntry) {
+                error_log("PERFORM_EXTRACTION: API LOG: " . $logEntry);
+            }
+        }
+        
         if (!$result['success']) {
             // Mark job as failed
-            error_log("PERFORM_EXTRACTION: Extraction failed, marking job as error");
+            $errorMsg = $result['error'] ?? 'Unknown error';
+            error_log("PERFORM_EXTRACTION: Extraction failed: {$errorMsg}");
+            error_log("PERFORM_EXTRACTION: Full error details: " . json_encode($result));
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', progress_extracted = 0 WHERE id = ?");
             $stmt->execute([$jobId]);
-            error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log']));
-            return;
+            error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log'] ?? []));
+            throw new Exception("API extraction failed: {$errorMsg}");
         }
         
         $extractedEmails = $result['emails'] ?? [];
@@ -1175,8 +1183,20 @@ function extract_emails_serper(string $apiKey, string $query, string $country = 
                         }
                     }
                     
-                    if (!in_array($email, $emails)) {
-                        $emails[] = $email;
+                    // Check if email already added
+                    $emailExists = false;
+                    foreach ($emails as $existingEmail) {
+                        if ($existingEmail['email'] === $email) {
+                            $emailExists = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!$emailExists) {
+                        $emails[] = [
+                            'email' => $email,
+                            'source' => $result['link'] ?? $query
+                        ];
                     }
                 }
             }
@@ -4682,21 +4702,17 @@ if ($action === 'save_job' || $action === 'save_campaign') {
         // Check if should start immediately
         if ($start_immediately) {
             error_log("SAVE_JOB ACTION: start_immediately flag detected, auto-submitting to start_job action");
-            // Auto-submit form to start_job action (DO NOT redirect before form submission!)
-            echo '<!DOCTYPE html><html><head><title>Starting Extraction...</title></head><body>';
-            echo '<div style="text-align:center; padding:50px; font-family:sans-serif;">';
-            echo '<h2>⏳ Starting Extraction...</h2>';
-            echo '<p>Please wait while we start the extraction job...</p>';
-            echo '</div>';
-            echo '<form id="startForm" method="POST" action="?page=list">';
+            // Auto-submit form to start_job action in hidden iframe (no visible intermediate page)
+            echo '<iframe name="hiddenFrame" style="display:none;"></iframe>';
+            echo '<form id="startForm" method="POST" action="?page=list" target="hiddenFrame">';
             echo '<input type="hidden" name="action" value="start_job">';
             echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
             echo '</form>';
             echo '<script>';
             echo 'console.log("SAVE_JOB: Auto-submitting start_job form for job_id=' . (int)$id . '");';
             echo 'document.getElementById("startForm").submit();';
+            echo 'setTimeout(function() { window.location.href = "?page=list"; }, 500);';
             echo '</script>';
-            echo '</body></html>';
             exit;
         } else {
             error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
