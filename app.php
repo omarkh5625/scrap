@@ -4447,37 +4447,36 @@ if ($action === 'delete_job' || $action === 'delete_campaign') {
     exit;
 }
 
-if ($action === 'save_campaign' || $action === 'save_job') {
+if ($action === 'save_job' || $action === 'save_campaign') {
     $id        = (int)($_POST['id'] ?? 0);
-    $subject   = trim($_POST['subject'] ?? '');
-    $preheader = trim($_POST['preheader'] ?? '');
-    $audience  = trim($_POST['audience'] ?? '');
-    $html      = $_POST['html'] ?? '';
-
-    $rot       = get_rotation_settings($pdo);
-    $rotOn     = (int)$rot['rotation_enabled'] === 1;
-
-    if ($rotOn) {
-        $existing   = get_campaign($pdo, $id);
-        $fromEmail  = $existing ? $existing['from_email'] : '';
-    } else {
-        $fromEmail  = trim($_POST['from_email'] ?? '');
-    }
-
-    $unsubscribe_enabled = isset($_POST['unsubscribe_enabled']) ? 1 : 0;
-    $sender_name = trim($_POST['sender_name'] ?? '');
-
-    $htmlToStore = 'BASE64:' . base64_encode($html);
+    $name      = trim($_POST['name'] ?? '');
+    $profile_id = (int)($_POST['profile_id'] ?? 0);
+    $target_count = (int)($_POST['target_count'] ?? 0);
 
     try {
-        $stmt = $pdo->prepare("
-            UPDATE campaigns
-            SET subject = ?, preheader = ?, from_email = ?, html = ?, unsubscribe_enabled = ?, sender_name = ?
-            WHERE id = ?
-        ");
-        $stmt->execute([$subject, $preheader, $fromEmail, $htmlToStore, $unsubscribe_enabled, $sender_name, $id]);
+        if ($target_count > 0) {
+            $stmt = $pdo->prepare("
+                UPDATE jobs
+                SET name = ?, profile_id = ?, target_count = ?
+                WHERE id = ?
+            ");
+            $stmt->execute([$name, $profile_id, $target_count, $id]);
+        } else {
+            $stmt = $pdo->prepare("
+                UPDATE jobs
+                SET name = ?, profile_id = ?
+                WHERE id = ?
+            ");
+            $stmt->execute([$name, $profile_id, $id]);
+        }
+        
+        // Check if should start immediately
+        if (isset($_POST['start_immediately']) && $_POST['start_immediately']) {
+            header("Location: ?page=list&action=start_job&job_id={$id}");
+            exit;
+        }
     } catch (Exception $e) {
-        error_log("Failed to save campaign id {$id}: " . $e->getMessage());
+        error_log("Failed to save job id {$id}: " . $e->getMessage());
         if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) || strpos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== false) {
             http_response_code(500);
             echo json_encode(['error' => 'Failed to save campaign']);
@@ -4497,6 +4496,88 @@ if ($action === 'save_campaign' || $action === 'save_job') {
         }
         header("Location: ?page=editor&id={$id}&saved=1");
     }
+    exit;
+}
+
+// Start extraction job action
+if ($action === 'start_job') {
+    $job_id = (int)($_POST['job_id'] ?? $_GET['job_id'] ?? 0);
+    if ($job_id > 0) {
+        $job = get_job($pdo, $job_id);
+        if ($job && !empty($job['profile_id'])) {
+            try {
+                // Update job status to queued
+                $stmt = $pdo->prepare("UPDATE jobs SET status = 'queued', started_at = NOW() WHERE id = ?");
+                $stmt->execute([$job_id]);
+                
+                // Get profile information
+                $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
+                $profile_stmt->execute([$job['profile_id']]);
+                $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($profile) {
+                    // Use target from job or profile
+                    $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)$profile['target_count'];
+                    
+                    // Update progress tracking
+                    $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, progress_status = 'queued' WHERE id = ?");
+                    $stmt->execute([$targetCount, $job_id]);
+                    
+                    // Call serper.dev API to extract emails
+                    $result = extract_emails_serper(
+                        $profile['api_key'],
+                        $profile['search_query'],
+                        $profile['country'] ?? '',
+                        (bool)($profile['filter_business_only'] ?? true),
+                        $targetCount
+                    );
+                    
+                    if ($result['success']) {
+                        // Update status to extracting
+                        $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
+                        $stmt->execute([$job_id]);
+                        
+                        // Store extracted emails
+                        $extractedCount = 0;
+                        foreach ($result['emails'] as $email) {
+                            try {
+                                $stmt = $pdo->prepare("INSERT INTO extracted_emails (job_id, email, source) VALUES (?, ?, ?)");
+                                $stmt->execute([$job_id, $email, $profile['search_query']]);
+                                $extractedCount++;
+                                
+                                // Update progress periodically
+                                if ($extractedCount % PROGRESS_UPDATE_FREQUENCY === 0) {
+                                    $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
+                                    $stmt->execute([$extractedCount, $job_id]);
+                                }
+                            } catch (Exception $e) {
+                                error_log("Failed to store email: " . $e->getMessage());
+                            }
+                        }
+                        
+                        // Mark as completed
+                        $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW() WHERE id = ?");
+                        $stmt->execute([$extractedCount, $job_id]);
+                        
+                        header("Location: ?page=stats&id={$job_id}&started_job=1");
+                        exit;
+                    } else {
+                        // API call failed
+                        $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'failed' WHERE id = ?");
+                        $stmt->execute([$job_id]);
+                        error_log("Extraction failed for job {$job_id}: " . ($result['error'] ?? 'Unknown error'));
+                        header("Location: ?page=editor&id={$job_id}&error=" . urlencode($result['error'] ?? 'Extraction failed'));
+                        exit;
+                    }
+                }
+            } catch (Exception $e) {
+                error_log("Failed to start job {$job_id}: " . $e->getMessage());
+                header("Location: ?page=editor&id={$job_id}&error=" . urlencode($e->getMessage()));
+                exit;
+            }
+        }
+    }
+    header("Location: ?page=list");
     exit;
 }
 
@@ -6964,110 +7045,139 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
           } else {
               $id = (int)($_GET['id'] ?? 0);
-              $campaign = get_campaign($pdo, $id);
-              if (!$campaign) {
-                echo "<p>Campaign not found.</p>";
+              $job = get_job($pdo, $id);
+              if (!$job) {
+                echo "<p>Job not found.</p>";
               } else {
-                $rotOnEditor = (int)$rotationSettings['rotation_enabled'] === 1;
         ?>
-          <div class="page-title">Editor — <?php echo h($campaign['name']); ?></div>
-          <div class="page-subtitle">Define subject, from, preheader and design your email content.</div>
+          <div class="page-title">Job Configuration — <?php echo h($job['name']); ?></div>
+          <div class="page-subtitle">Configure your email extraction job and select profiles to execute.</div>
 
-          <!-- Editor shell: left modules + envelope, right canvas -->
-          <form method="post" id="editorForm">
-            <input type="hidden" name="action" value="save_campaign">
-            <input type="hidden" name="id" value="<?php echo (int)$campaign['id']; ?>">
+          <form method="post" id="jobForm">
+            <input type="hidden" name="action" value="save_job">
+            <input type="hidden" name="id" value="<?php echo (int)$job['id']; ?>">
 
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
               <div style="display:flex; gap:12px; align-items:center;">
-                <button class="btn btn-outline" type="button" id="saveBtnTop">Save</button>
-                <button class="btn btn-outline" type="button" id="undoBtn" disabled>Undo</button>
-                <button class="btn btn-outline" type="button" id="redoBtn" disabled>Redo</button>
+                <button class="btn btn-outline" type="submit">Save Configuration</button>
               </div>
               <div>
-                <!-- single Review button -->
-                <button class="btn btn-primary" type="button" id="reviewTopBtn">Review Details and Send →</button>
+                <a href="?page=list" class="btn btn-outline">Cancel</a>
+                <button class="btn btn-primary" type="button" id="startJobBtn">Start Extraction →</button>
               </div>
             </div>
 
-            <div class="editor-shell">
-              <!-- LEFT: Modules + Envelope -->
-              <div class="editor-left" role="region" aria-label="Design left sidebar">
-                <div class="editor-tabs">
-                  <div class="tab active" data-tab="build">Build</div>
-                  <div class="tab" data-tab="settings">Settings</div>
-                  <div class="tab" data-tab="tags">Tags</div>
-                  <div class="tab" data-tab="ab">A/B Testing</div>
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">Job Settings</div>
+                  <div class="card-subtitle">Configure extraction parameters for this job.</div>
                 </div>
+              </div>
 
-                <div class="modules-pane" id="modulesPane">
-                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                    <div style="font-weight:600; color:var(--sg-muted);">Add Modules</div>
-                    <div style="color:var(--sg-muted); font-size:13px;">Drag or click → drop into the canvas</div>
-                  </div>
-                  <div class="modules-grid" id="modulesGrid">
-                    <div class="module-tile" data-module="image"><div class="icon">🖼️</div>Image</div>
-                    <div class="module-tile" data-module="text"><div class="icon">✏️</div>Text</div>
-                    <div class="module-tile" data-module="columns"><div class="icon">▦</div>Columns</div>
-                    <div class="module-tile" data-module="imgtext"><div class="icon">🧩</div>Image &amp; Text</div>
-                    <div class="module-tile" data-module="button"><div class="icon">🔘</div>Button</div>
-                    <div class="module-tile" data-module="code"><div class="icon">&lt;&gt;</div>Code</div>
-                    <div class="module-tile" data-module="divider"><div class="icon">─</div>Divider</div>
-                    <div class="module-tile" data-module="spacer"><div class="icon">↕️</div>Spacer</div>
-                    <div class="module-tile" data-module="social"><div class="icon">⚑</div>Social</div>
-                    <div class="module-tile" data-module="unsubscribe"><div class="icon">✖</div>Unsubscribe</div>
-                  </div>
+              <div class="form-group">
+                <label>Job Name</label>
+                <input type="text" name="name" value="<?php echo h($job['name']); ?>" required>
+              </div>
 
-                </div>
+              <div class="form-group">
+                <label>Select Extraction Profile</label>
+                <select name="profile_id" id="profileSelect" required>
+                  <option value="">Select a profile...</option>
+                  <?php foreach ($profiles as $p): ?>
+                    <option value="<?php echo (int)$p['id']; ?>" 
+                      <?php if ($job['profile_id'] == $p['id']) echo 'selected'; ?>
+                      data-query="<?php echo h($p['search_query']); ?>"
+                      data-target="<?php echo (int)$p['target_count']; ?>">
+                      <?php echo h($p['profile_name']); ?> — Target: <?php echo (int)$p['target_count']; ?> emails
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+                <small class="hint">Choose a profile with serper.dev API configuration</small>
+              </div>
 
-                <div class="envelope">
-                  <div style="font-weight:600; margin-bottom:8px;">Envelope</div>
-                  <div class="form-group">
-                    <label>Subject</label>
-                    <input type="text" name="subject" value="<?php echo h($campaign['subject']); ?>" required>
-                  </div>
-                  <div class="form-group">
-                    <label>Preheader</label>
-                    <input type="text" name="preheader" value="<?php echo h($campaign['preheader']); ?>">
-                  </div>
+              <div id="profileDetails" style="display: none; margin-top: 12px; padding: 12px; background: #f8f9fa; border-radius: 4px;">
+                <div style="font-weight: 600; margin-bottom: 8px;">Profile Details:</div>
+                <div id="profileQuery" style="color: var(--sg-muted);"></div>
+                <div id="profileTarget" style="color: var(--sg-muted); margin-top: 4px;"></div>
+              </div>
 
-                  <div class="form-group">
-                    <label>
-                      From
-                      <?php if ($rotOnEditor): ?>
-                        <span style="font-weight:400; color:var(--sg-muted);">(taken from each active profile while rotation is ON)</span>
-                      <?php endif; ?>
-                    </label>
-                    <?php if ($rotOnEditor): ?>
-                      <select disabled>
-                        <option>Rotation enabled — using each profile's From</option>
-                      </select>
-                    <?php else: ?>
-                      <select name="from_email" required>
-                        <option value="">Select from Sending Profiles</option>
-                        <?php foreach ($profiles as $p): ?>
-                          <option value="<?php echo h($p['from_email']); ?>"
-                            <?php if ($campaign['from_email'] === $p['from_email']) echo 'selected'; ?>>
-                            <?php echo h($p['from_email'].' — '.$p['profile_name']); ?>
-                          </option>
-                        <?php endforeach; ?>
-                      </select>
-                    <?php endif; ?>
-                  </div>
+              <div class="form-group">
+                <label>Target Email Count (Optional Override)</label>
+                <input type="number" name="target_count" min="1" max="10000" 
+                  value="<?php echo (int)($job['target_count'] ?? 0); ?>" 
+                  placeholder="Leave empty to use profile default">
+                <small class="hint">Override the target count for this specific job</small>
+              </div>
 
-                  <div class="form-group">
-                    <label>Audience (List / segment)</label>
-                    <!-- audience now shows contact lists for selection -->
-                    <select name="audience">
-                      <option value="">Select a contact list or keep free text</option>
-                      <?php foreach ($contactLists as $cl):
-                        $val = 'list:'.$cl['id'];
-                        $selected = ($campaign['audience'] === $val) ? 'selected' : '';
-                      ?>
-                        <option value="<?php echo h($val); ?>" <?php echo $selected; ?>>
-                          <?php echo h($cl['name']).' — '.(int)$cl['contact_count'].' contacts'; ?>
-                        </option>
-                      <?php endforeach; ?>
+              <div class="checkbox-row">
+                <input type="checkbox" name="start_immediately" id="startImmediately">
+                <label for="startImmediately">Start extraction immediately after saving</label>
+              </div>
+            </div>
+          </form>
+
+          <script>
+            (function(){
+              var profileSelect = document.getElementById('profileSelect');
+              var profileDetails = document.getElementById('profileDetails');
+              var profileQuery = document.getElementById('profileQuery');
+              var profileTarget = document.getElementById('profileTarget');
+              var startJobBtn = document.getElementById('startJobBtn');
+
+              function updateProfileDetails() {
+                var selectedOption = profileSelect.options[profileSelect.selectedIndex];
+                if (selectedOption.value) {
+                  var query = selectedOption.getAttribute('data-query');
+                  var target = selectedOption.getAttribute('data-target');
+                  profileQuery.innerText = 'Query: ' + query;
+                  profileTarget.innerText = 'Target: ' + target + ' emails';
+                  profileDetails.style.display = '';
+                } else {
+                  profileDetails.style.display = 'none';
+                }
+              }
+
+              if (profileSelect) {
+                profileSelect.addEventListener('change', updateProfileDetails);
+                updateProfileDetails(); // Initial update
+              }
+
+              // Start job button handler
+              if (startJobBtn) {
+                startJobBtn.addEventListener('click', function(e) {
+                  e.preventDefault();
+                  if (!profileSelect.value) {
+                    alert('Please select a profile first');
+                    return;
+                  }
+                  if (confirm('Start extraction job now?')) {
+                    var form = document.createElement('form');
+                    form.method = 'POST';
+                    form.action = window.location.href;
+                    
+                    var actionInput = document.createElement('input');
+                    actionInput.type = 'hidden';
+                    actionInput.name = 'action';
+                    actionInput.value = 'start_job';
+                    form.appendChild(actionInput);
+                    
+                    var idInput = document.createElement('input');
+                    idInput.type = 'hidden';
+                    idInput.name = 'job_id';
+                    idInput.value = <?php echo (int)$job['id']; ?>;
+                    form.appendChild(idInput);
+                    
+                    document.body.appendChild(form);
+                    form.submit();
+                  }
+                });
+              }
+            })();
+          </script>
+
+        <?php } // End job check ?>
+        <?php } // End PDO check ?>
                       <option value="custom" <?php if ($campaign['audience'] === 'custom') echo 'selected'; ?>>Custom segment / manual</option>
                     </select>
                     <small class="hint">Choose one of your contact lists. If you need a text/segment, select "Custom" then edit audience in the campaign later.</small>
