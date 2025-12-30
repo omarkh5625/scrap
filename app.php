@@ -104,6 +104,13 @@ class Database {
                 self::$pdo->exec("ALTER TABLE jobs ADD COLUMN email_filter VARCHAR(50) AFTER country");
             }
             
+            // Migration: Add worker_count column to jobs table
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'worker_count'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN worker_count INT DEFAULT NULL AFTER max_results");
+                error_log("Migration: Added worker_count column to jobs table");
+            }
+            
             // Migration: Create emails table if it doesn't exist (rename from results)
             $stmt = self::$pdo->query("SHOW TABLES LIKE 'emails'");
             if ($stmt->rowCount() === 0) {
@@ -1012,13 +1019,15 @@ class Job {
     // Configuration constants
     private const BULK_INSERT_BATCH_SIZE = 1000;
     
-    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
+    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null, ?int $workerCount = null): int {
         try {
             $db = Database::connect();
-            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
-            $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
+            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, worker_count, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')");
+            $stmt->execute([$userId, $query, $apiKey, $maxResults, $workerCount, $country, $emailFilter]);
             
             $jobId = (int)$db->lastInsertId();
+            
+            error_log("Job created: ID={$jobId}, worker_count={$workerCount}");
             
             return $jobId;
         } catch (PDOException $e) {
@@ -2232,7 +2241,7 @@ class Router {
                         }
                         
                         // Create job - this should be fast (< 100ms)
-                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter, $workerCount);
                         
                         // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
                         // This divides the work among workers so they search in parallel without duplication
@@ -2293,7 +2302,13 @@ class Router {
                         // Get job to determine worker count
                         $job = Job::getById($jobId);
                         if ($job) {
-                            $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            // Use stored worker count from job, or calculate if not set
+                            $workerCount = isset($job['worker_count']) && $job['worker_count'] > 0 
+                                ? (int)$job['worker_count'] 
+                                : Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            
+                            error_log("trigger-workers: Job {$jobId} - Using worker_count={$workerCount} from " . 
+                                      (isset($job['worker_count']) && $job['worker_count'] > 0 ? 'stored value' : 'auto-calculation'));
                             
                             // Prepare response
                             $response = json_encode([
@@ -2852,7 +2867,7 @@ class Router {
                         $error = 'Query and API Key are required';
                     } else {
                         // Create job for immediate processing
-                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter, $workerCount);
                         
                         // Prepare queue items with specified worker count
                         // This divides the work among workers so they search in parallel without duplication
