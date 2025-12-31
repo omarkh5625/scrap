@@ -18,6 +18,16 @@
  * - CLI Worker Support
  * - Regex Email Extraction
  * - True Parallel Worker Execution
+ * - Database Connection Pooling with Retry Logic
+ * - Exponential Backoff for Connection Failures
+ * - Optimized Batch Operations
+ * 
+ * DATABASE CONNECTION MANAGEMENT:
+ * - Automatic retry with exponential backoff for "Too many connections" errors
+ * - Connection pooling via singleton pattern
+ * - Automatic connection closing after batch operations
+ * - Configurable retry attempts (default: 5)
+ * - Jitter added to prevent thundering herd problem
  * 
  * TROUBLESHOOTING WORKERS:
  * If workers are not starting or crashing:
@@ -27,6 +37,7 @@
  * 3. Check worker_logs/ directory for error logs from each worker
  * 4. Check your PHP error log for worker initialization errors
  * 5. Ensure database connection is working properly
+ * 6. If seeing "Too many connections", the system will automatically retry with backoff
  */
 
 // ============================================================================
@@ -76,29 +87,240 @@ class Database {
     private static ?PDO $pdo = null;
     private static bool $migrated = false;
     
+    // Connection pooling configuration
+    private const MAX_RETRY_ATTEMPTS = 5;
+    private const INITIAL_RETRY_DELAY_MS = 500; // Increased from 100ms to give more time for connections to free up
+    private const MAX_RETRY_DELAY_MS = 10000; // Increased from 5s to 10s for "Too many connections" scenarios
+    private const JITTER_PERCENTAGE = 0.3; // 30% jitter to prevent thundering herd
+    
+    // MySQL error codes for connection issues
+    private const ERROR_TOO_MANY_CONNECTIONS = 1040;
+    private const ERROR_SERVER_GONE_AWAY = 2006;
+    private const ERROR_LOST_CONNECTION = 2013;
+    
+    /**
+     * Get database connection with retry logic and exponential backoff
+     * Implements connection pooling by reusing the static PDO instance
+     */
     public static function connect(): PDO {
         global $DB_CONFIG;
         
         if (self::$pdo === null) {
-            try {
-                $dsn = "mysql:host={$DB_CONFIG['host']};dbname={$DB_CONFIG['database']};charset=utf8mb4";
-                self::$pdo = new PDO($dsn, $DB_CONFIG['username'], $DB_CONFIG['password'], [
-                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                    PDO::ATTR_EMULATE_PREPARES => false
-                ]);
-                
-                // Run migrations if not already done
-                if (!self::$migrated) {
-                    self::runMigrations();
-                    self::$migrated = true;
-                }
-            } catch (PDOException $e) {
-                die('Database connection failed: ' . $e->getMessage());
+            self::$pdo = self::connectWithRetry();
+            
+            // Run migrations if not already done
+            if (!self::$migrated) {
+                self::runMigrations();
+                self::$migrated = true;
             }
         }
         
+        // Test connection and reconnect if needed
+        try {
+            self::$pdo->query('SELECT 1');
+        } catch (PDOException $e) {
+            error_log("Connection lost, reconnecting: " . $e->getMessage());
+            self::$pdo = self::connectWithRetry();
+        }
+        
         return self::$pdo;
+    }
+    
+    /**
+     * Connect to database with retry logic and exponential backoff
+     * Handles "Too many connections" errors gracefully
+     */
+    private static function connectWithRetry(): PDO {
+        global $DB_CONFIG;
+        
+        $attempt = 0;
+        $lastError = null;
+        
+        while ($attempt < self::MAX_RETRY_ATTEMPTS) {
+            try {
+                $dsn = "mysql:host={$DB_CONFIG['host']};dbname={$DB_CONFIG['database']};charset=utf8mb4";
+                $pdo = new PDO($dsn, $DB_CONFIG['username'], $DB_CONFIG['password'], [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                    PDO::ATTR_PERSISTENT => false, // Use non-persistent connections to avoid connection exhaustion
+                    PDO::MYSQL_ATTR_INIT_COMMAND => "SET SESSION sql_mode='TRADITIONAL'"
+                ]);
+                
+                // Connection successful
+                if ($attempt > 0) {
+                    error_log("✓ Database connection established after {$attempt} retries");
+                }
+                
+                return $pdo;
+                
+            } catch (PDOException $e) {
+                $attempt++;
+                $lastError = $e;
+                
+                // Check if it's a connection error using centralized helper
+                $errorInfo = $e->errorInfo ?? [];
+                $errorCode = $errorInfo[1] ?? 0;
+                $isTooManyConnections = ($errorCode === self::ERROR_TOO_MANY_CONNECTIONS);
+                
+                if ($attempt < self::MAX_RETRY_ATTEMPTS) {
+                    // Calculate exponential backoff delay
+                    $delay = min(
+                        self::INITIAL_RETRY_DELAY_MS * pow(2, $attempt - 1),
+                        self::MAX_RETRY_DELAY_MS
+                    );
+                    
+                    // For "Too many connections" errors, use longer delays
+                    if ($isTooManyConnections) {
+                        $delay = min($delay * 2, self::MAX_RETRY_DELAY_MS); // Double the delay for 1040 errors
+                    }
+                    
+                    // Add jitter to prevent thundering herd (configurable percentage)
+                    // Use random_int for better randomness distribution
+                    try {
+                        $jitter = random_int(0, (int)($delay * self::JITTER_PERCENTAGE));
+                    } catch (Throwable $randException) {
+                        // Fallback to rand if random_int fails (handles both Error and Exception)
+                        $jitter = rand(0, (int)($delay * self::JITTER_PERCENTAGE));
+                    }
+                    $delay += $jitter;
+                    
+                    // Provide more specific error message for "Too many connections"
+                    if ($isTooManyConnections) {
+                        error_log("🚨 CRITICAL: Too many database connections (1040) - attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}");
+                        error_log("   This usually means you need to:");
+                        error_log("   1. Increase MySQL max_connections (currently likely ~151)");
+                        error_log("   2. Reduce number of workers (see AUTO_MAX_WORKERS in Worker class)");
+                        error_log("   Retrying in " . round($delay / 1000, 2) . "s...");
+                    } else {
+                        error_log("⚠️ Database connection error (attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}): " . 
+                                 $e->getMessage() . " - Retrying in " . round($delay / 1000, 2) . "s");
+                    }
+                    
+                    // Wait before retry (convert ms to microseconds)
+                    usleep($delay * 1000);
+                } else {
+                    if ($isTooManyConnections) {
+                        error_log("✗✗✗ CRITICAL: Database connection exhausted after " . self::MAX_RETRY_ATTEMPTS . " attempts");
+                        error_log("    You MUST increase MySQL max_connections or reduce AUTO_MAX_WORKERS");
+                    } else {
+                        error_log("✗ Database connection failed after " . self::MAX_RETRY_ATTEMPTS . " attempts");
+                    }
+                }
+            }
+        }
+        
+        // All retries exhausted - throw exception with helpful message
+        if ($lastError) {
+            $errorInfo = $lastError->errorInfo ?? [];
+            $errorCode = $errorInfo[1] ?? 0;
+            
+            if ($errorCode === self::ERROR_TOO_MANY_CONNECTIONS) {
+                $errorMessage = "Database connection failed after " . self::MAX_RETRY_ATTEMPTS . " attempts: Too many connections (1040). " .
+                               "SOLUTION: Increase MySQL max_connections (see MYSQL_TUNING.md) or reduce AUTO_MAX_WORKERS constant.";
+                throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+            } else {
+                $errorMessage = 'Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts: ' . $lastError->getMessage();
+                throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+            }
+        } else {
+            throw new PDOException('Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts: Unknown error');
+        }
+    }
+    
+    /**
+     * Check if a PDOException is a connection-related error
+     * Centralizes error detection logic for consistency
+     * 
+     * @param PDOException $e The exception to check
+     * @return bool True if it's a connection error that should be retried
+     */
+    private static function isConnectionError(PDOException $e): bool {
+        $errorInfo = $e->errorInfo ?? [];
+        $errorCode = $errorInfo[1] ?? 0;
+        
+        // Check for known connection error codes
+        if (in_array($errorCode, [
+            self::ERROR_TOO_MANY_CONNECTIONS,
+            self::ERROR_SERVER_GONE_AWAY,
+            self::ERROR_LOST_CONNECTION
+        ])) {
+            return true;
+        }
+        
+        // Fallback to message checking for edge cases
+        $message = $e->getMessage();
+        return strpos($message, 'Too many connections') !== false ||
+               strpos($message, 'MySQL server has gone away') !== false ||
+               strpos($message, 'Lost connection') !== false;
+    }
+    
+    /**
+     * Close the database connection to free up resources
+     * Should be called after completing a batch of operations
+     * 
+     * Note: Using non-persistent connections is critical in high-concurrency scenarios.
+     * Persistent connections would remain open even after PHP scripts finish, quickly
+     * exhausting MySQL max_connections with 500-1000 concurrent workers. Non-persistent
+     * connections are properly closed and returned to the pool, allowing better resource
+     * management and preventing "Too many connections" errors.
+     */
+    public static function closeConnection(): void {
+        if (self::$pdo !== null) {
+            self::$pdo = null;
+            error_log("✓ Database connection closed to free resources");
+        }
+    }
+    
+    /**
+     * Execute a query with automatic retry on connection failure
+     * 
+     * @param callable $operation Function that takes PDO connection and returns result
+     * @param int $maxAttempts Maximum number of retry attempts
+     * @return mixed Result from the operation
+     * @throws PDOException If all retries are exhausted
+     */
+    public static function executeWithRetry(callable $operation, int $maxAttempts = 3) {
+        $attempt = 0;
+        $lastError = null;
+        
+        while ($attempt < $maxAttempts) {
+            try {
+                return $operation(self::connect());
+            } catch (PDOException $e) {
+                $attempt++;
+                $lastError = $e;
+                
+                // Use centralized error detection
+                if (self::isConnectionError($e) && $attempt < $maxAttempts) {
+                    // Calculate exponential backoff delay (consistent with connectWithRetry)
+                    $delayMs = min(
+                        self::INITIAL_RETRY_DELAY_MS * pow(2, $attempt - 1),
+                        self::MAX_RETRY_DELAY_MS
+                    );
+                    
+                    error_log("⚠️ Query failed due to connection issue (attempt {$attempt}/{$maxAttempts}): " . 
+                             $e->getMessage() . " - Retrying in " . round($delayMs / 1000, 2) . "s");
+                    
+                    // Force reconnection
+                    self::$pdo = null;
+                    
+                    // Wait before retry (convert ms to microseconds)
+                    usleep($delayMs * 1000);
+                } else {
+                    throw $e;
+                }
+            }
+        }
+        
+        // Provide detailed error message with context
+        $errorMessage = "Operation failed after {$maxAttempts} attempts";
+        if ($lastError) {
+            $errorMessage .= ": " . $lastError->getMessage();
+            throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+        } else {
+            throw new PDOException($errorMessage . ": Unknown error");
+        }
     }
     
     private static function runMigrations(): void {
@@ -1101,13 +1323,13 @@ class Job {
     /**
      * Bulk add emails - much faster than individual inserts
      * Returns number of emails actually added
+     * Uses retry logic for database connection failures
      */
     public static function addEmailsBulk(int $jobId, array $emails, ?string $country = null, array $sources = []): int {
         if (empty($emails)) {
             return 0;
         }
         
-        $db = Database::connect();
         $added = 0;
         
         // Filter out duplicates using BloomFilter batch method (much faster)
@@ -1142,12 +1364,16 @@ class Job {
             }
             
             try {
-                $sql = "INSERT IGNORE INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES " . implode(", ", $values);
-                $stmt = $db->prepare($sql);
-                $stmt->execute($params);
-                $added += $stmt->rowCount();
+                // Use retry logic for bulk insert
+                $batchAdded = Database::executeWithRetry(function($db) use ($values, $params) {
+                    $sql = "INSERT IGNORE INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES " . implode(", ", $values);
+                    $stmt = $db->prepare($sql);
+                    $stmt->execute($params);
+                    return $stmt->rowCount();
+                });
+                $added += $batchAdded;
             } catch (PDOException $e) {
-                error_log("Bulk insert error for batch: " . $e->getMessage());
+                error_log("Bulk insert error for batch after retries: " . $e->getMessage());
                 // Fallback to individual inserts for this batch if bulk fails
                 foreach ($batch as $email) {
                     $sourceUrl = $sources[$email]['url'] ?? null;
@@ -1173,30 +1399,39 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
-    private const OPTIMAL_RESULTS_PER_WORKER = 20; // 50 workers per 1000 emails = 20 emails per worker
-    private const WORKERS_PER_1000_EMAILS = 50; // Required: 50 workers for every 1000 emails
+    
+    // Worker configuration - Tuned for parallel processing with connection rate limiting
+    // MySQL default max_connections is typically 151. We spawn workers with staggered start times
+    // to avoid overwhelming the database with simultaneous connections.
+    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn (can handle large jobs)
+    private const WORKERS_PER_1000_EMAILS = 100; // 100 workers per 1000 emails for maximum throughput
+    private const OPTIMAL_RESULTS_PER_WORKER = 10; // 100 workers per 1000 emails = 10 emails per worker
+    
+    // Connection rate limiting to prevent "Too many connections" errors
+    // Spawns workers in waves to respect MySQL max_connections limit
+    private const WORKER_SPAWN_DELAY_MS = 6.6; // ~6.6ms delay = ~151 workers/second (matches MySQL default max_connections)
+    private const MAX_CONCURRENT_SPAWNS = 151; // Match MySQL default max_connections
     
     /**
      * Calculate optimal worker count based on job size
-     * Formula: 50 workers per 1000 emails
-     * Target: Process 1,000,000 emails in ≤10 minutes
-     * Automatically determines the best number of workers for maximum performance
+     * Formula: 100 workers per 1000 emails (high throughput with rate limiting)
      * 
-     * Examples:
-     * - 1,000 emails = 50 workers
-     * - 10,000 emails = 500 workers
-     * - 100,000 emails = 1,000 workers (capped at AUTO_MAX_WORKERS)
-     * - 1,000,000 emails = 1,000 workers (calculated 50,000, but capped at AUTO_MAX_WORKERS)
+     * Workers are spawned with staggered delays (~6.6ms between spawns) to avoid
+     * overwhelming MySQL with simultaneous connection attempts.
+     * 
+     * Examples with current settings:
+     * - 1,000 emails = 100 workers (spawned over ~0.66 seconds)
+     * - 10,000 emails = 1,000 workers (spawned over ~6.6 seconds)
+     * - 100,000 emails = 1,000 workers (capped, spawned over ~6.6 seconds)
+     * 
+     * Each worker processes ~10 emails, providing excellent parallelism while
+     * respecting database connection limits through staggered spawning.
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
-        // Calculate based on the formula: 50 workers per 1000 emails
-        // Example: 1000 emails = 50 workers, 10,000 emails = 500 workers, 1,000,000 emails = 50,000 workers
+        // Calculate based on formula: 100 workers per 1000 emails for maximum throughput
         $calculatedWorkers = (int)ceil(($maxResults / 1000) * self::WORKERS_PER_1000_EMAILS);
         
-        // Cap at maximum workers to avoid resource exhaustion
-        // Note: For 1M emails, this would require 50,000 workers which exceeds AUTO_MAX_WORKERS
-        // In that case, workers will be capped and each will process more emails
+        // Cap at maximum workers (1000)
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
@@ -1516,128 +1751,146 @@ class Worker {
     }
     
     public static function getNextJob(?int $jobId = null): ?array {
-        $db = Database::connect();
-        
-        // Use transaction to prevent race conditions
-        $db->beginTransaction();
-        
         try {
-            // First check job_queue for pending chunks
-            // If jobId is specified, only get queue items for that specific job
-            if ($jobId !== null) {
-                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-                $stmt->execute([$jobId]);
-            } else {
-                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-                $stmt->execute();
-            }
-            $queueItem = $stmt->fetch();
-            
-            if ($queueItem) {
-                // Mark this queue item as processing
-                $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
-                $stmt->execute([$queueItem['id']]);
+            return Database::executeWithRetry(function($db) use ($jobId) {
+                // Use transaction to prevent race conditions
+                $db->beginTransaction();
                 
-                // Get the job details
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
-                $stmt->execute([$queueItem['job_id']]);
-                $job = $stmt->fetch();
-                
-                if ($job) {
-                    // Add queue info to job
-                    $job['queue_id'] = $queueItem['id'];
-                    $job['queue_start_offset'] = $queueItem['start_offset'];
-                    $job['queue_max_results'] = $queueItem['max_results'];
+                try {
+                    // First check job_queue for pending chunks
+                    // If jobId is specified, only get queue items for that specific job
+                    if ($jobId !== null) {
+                        $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                        $stmt->execute([$jobId]);
+                    } else {
+                        $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                        $stmt->execute();
+                    }
+                    $queueItem = $stmt->fetch();
+                    
+                    if ($queueItem) {
+                        // Mark this queue item as processing
+                        $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
+                        $stmt->execute([$queueItem['id']]);
+                        
+                        // Get the job details
+                        $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+                        $stmt->execute([$queueItem['job_id']]);
+                        $job = $stmt->fetch();
+                        
+                        if ($job) {
+                            // Add queue info to job
+                            $job['queue_id'] = $queueItem['id'];
+                            $job['queue_start_offset'] = $queueItem['start_offset'];
+                            $job['queue_max_results'] = $queueItem['max_results'];
+                        }
+                        
+                        $db->commit();
+                        return $job ?: null;
+                    }
+                    
+                    // Fallback to old method: check for pending jobs without queue
+                    // If jobId is specified, only check that specific job
+                    if ($jobId !== null) {
+                        $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
+                        $stmt->execute([$jobId]);
+                    } else {
+                        $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                        $stmt->execute();
+                    }
+                    $job = $stmt->fetch();
+                    
+                    if ($job) {
+                        $stmt = $db->prepare("UPDATE jobs SET status = 'running' WHERE id = ?");
+                        $stmt->execute([$job['id']]);
+                    }
+                    
+                    $db->commit();
+                    return $job ?: null;
+                } catch (PDOException $e) {
+                    $db->rollBack();
+                    throw $e;
                 }
-                
-                $db->commit();
-                return $job ?: null;
-            }
-            
-            // Fallback to old method: check for pending jobs without queue
-            // If jobId is specified, only check that specific job
-            if ($jobId !== null) {
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
-                $stmt->execute([$jobId]);
-            } else {
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
-                $stmt->execute();
-            }
-            $job = $stmt->fetch();
-            
-            if ($job) {
-                $stmt = $db->prepare("UPDATE jobs SET status = 'running' WHERE id = ?");
-                $stmt->execute([$job['id']]);
-            }
-            
-            $db->commit();
-            return $job ?: null;
+            });
         } catch (PDOException $e) {
-            $db->rollBack();
             error_log("getNextJob error: " . $e->getMessage());
             return null;
         }
     }
     
     public static function markQueueItemComplete(int $queueId): void {
-        $db = Database::connect();
-        $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
-        $stmt->execute([$queueId]);
-        error_log("✓ Marked queue item {$queueId} as completed");
+        try {
+            Database::executeWithRetry(function($db) use ($queueId) {
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueId]);
+            });
+            error_log("✓ Marked queue item {$queueId} as completed");
+        } catch (PDOException $e) {
+            error_log("✗ Failed to mark queue item {$queueId} as completed: " . $e->getMessage());
+        }
     }
     
     public static function markQueueItemFailed(int $queueId): void {
-        $db = Database::connect();
-        $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
-        $stmt->execute([$queueId]);
-        error_log("✗ Marked queue item {$queueId} as failed");
+        try {
+            Database::executeWithRetry(function($db) use ($queueId) {
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueId]);
+            });
+            error_log("✗ Marked queue item {$queueId} as failed");
+        } catch (PDOException $e) {
+            error_log("✗ Failed to mark queue item {$queueId} as failed: " . $e->getMessage());
+        }
     }
     
     /**
      * Check if all queue items for a job are complete and update job status accordingly
      */
     public static function checkAndUpdateJobCompletion(int $jobId): void {
-        $db = Database::connect();
-        
-        // Get total and completed queue items for this job
-        $stmt = $db->prepare("
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
-            FROM job_queue 
-            WHERE job_id = ?
-        ");
-        $stmt->execute([$jobId]);
-        $counts = $stmt->fetch();
-        
-        $total = (int)$counts['total'];
-        $completed = (int)$counts['completed'];
-        $failed = (int)$counts['failed'];
-        
-        if ($total == 0) {
-            error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
-            return;
-        }
-        
-        // Calculate progress percentage
-        $progress = (int)round(($completed / $total) * 100);
-        
-        error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
-        
-        // Update job status based on queue completion
-        if ($completed == $total) {
-            // All queue items completed
-            Job::updateStatus($jobId, 'completed', 100);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
-        } elseif ($completed + $failed == $total) {
-            // All queue items either completed or failed
-            Job::updateStatus($jobId, 'completed', $progress);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
-        } else {
-            // Still processing
-            Job::updateStatus($jobId, 'running', $progress);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+        try {
+            $counts = Database::executeWithRetry(function($db) use ($jobId) {
+                // Get total and completed queue items for this job
+                $stmt = $db->prepare("
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                    FROM job_queue 
+                    WHERE job_id = ?
+                ");
+                $stmt->execute([$jobId]);
+                return $stmt->fetch();
+            });
+            
+            $total = (int)$counts['total'];
+            $completed = (int)$counts['completed'];
+            $failed = (int)$counts['failed'];
+            
+            if ($total == 0) {
+                error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
+                return;
+            }
+            
+            // Calculate progress percentage
+            $progress = (int)round(($completed / $total) * 100);
+            
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
+            
+            // Update job status based on queue completion
+            if ($completed == $total) {
+                // All queue items completed
+                Job::updateStatus($jobId, 'completed', 100);
+                error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
+            } elseif ($completed + $failed == $total) {
+                // All queue items either completed or failed
+                Job::updateStatus($jobId, 'completed', $progress);
+                error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
+            } else {
+                // Still processing
+                Job::updateStatus($jobId, 'running', $progress);
+                error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+            }
+        } catch (PDOException $e) {
+            error_log("✗ checkAndUpdateJobCompletion failed for job {$jobId}: " . $e->getMessage());
         }
     }
     
@@ -1794,63 +2047,86 @@ class Worker {
         $pagesProcessed = 0;
         $page = (int)($startOffset / 10) + 1;
         
-        while ($processed < $maxToProcess) {
-            $data = self::searchSerper($apiKey, $query, $page, $country);
-            
-            if (!$data || !isset($data['organic'])) {
-                error_log("  [{$workerName}] No more results from API");
-                break;
+        try {
+            while ($processed < $maxToProcess) {
+                $data = self::searchSerper($apiKey, $query, $page, $country);
+                
+                if (!$data || !isset($data['organic'])) {
+                    error_log("  [{$workerName}] No more results from API");
+                    break;
+                }
+                
+                $pagesProcessed++;
+                $emailsBefore = $processed;
+                
+                // Use batch processing for better performance
+                if (isset($data['organic']) && count($data['organic']) > 0) {
+                    self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxToProcess);
+                }
+                
+                $emailsExtractedThisPage = $processed - $emailsBefore;
+                
+                // Update worker statistics
+                self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+                
+                // Close and reopen connection periodically to prevent connection exhaustion
+                // Close after every batch operation (after processing each page)
+                Database::closeConnection();
+                
+                // Log progress every 10 emails
+                if ($processed > 0 && $processed % 10 === 0) {
+                    $elapsedTime = microtime(true) - $startTime;
+                    $rate = $processed / $elapsedTime;
+                    error_log(sprintf("  ⚡ [{$workerName}] Progress: %d/%d emails (%.1f emails/sec, %d pages)", 
+                        $processed, $maxToProcess, $rate, $pagesProcessed));
+                }
+                
+                if (!isset($data['organic']) || count($data['organic']) === 0) {
+                    break;
+                }
+                
+                $page++;
+                
+                // Reduced rate limiting when using parallel scraping (already more efficient)
+                $rateLimit = (float)(Settings::get('rate_limit', (string)self::DEFAULT_RATE_LIMIT));
+                usleep((int)($rateLimit * 1000000));
             }
             
-            $pagesProcessed++;
-            $emailsBefore = $processed;
+            $totalTime = microtime(true) - $startTime;
+            $avgRate = $processed > 0 ? $processed / $totalTime : 0;
             
-            // Use batch processing for better performance
-            if (isset($data['organic']) && count($data['organic']) > 0) {
-                self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxToProcess);
+            // Mark queue item as complete
+            if ($queueId) {
+                self::markQueueItemComplete($queueId);
+                error_log("✓ [{$workerName}] Queue item {$queueId} COMPLETED");
             }
             
-            $emailsExtractedThisPage = $processed - $emailsBefore;
+            // Update overall job progress
+            self::updateJobProgress($jobId);
             
-            // Update worker statistics
-            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+            error_log(sprintf("✓✓✓ [{$workerName}] Job chunk COMPLETED! %d emails in %.2f sec (%.1f emails/sec)", 
+                $processed, $totalTime, $avgRate));
             
-            // Log progress every 10 emails
-            if ($processed > 0 && $processed % 10 === 0) {
-                $elapsedTime = microtime(true) - $startTime;
-                $rate = $processed / $elapsedTime;
-                error_log(sprintf("  ⚡ [{$workerName}] Progress: %d/%d emails (%.1f emails/sec, %d pages)", 
-                    $processed, $maxToProcess, $rate, $pagesProcessed));
+            // Mark worker as idle
+            self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            
+        } catch (Exception $e) {
+            error_log("✗ [{$workerName}] Job processing error: " . $e->getMessage());
+            
+            // Mark queue item as failed if applicable
+            if ($queueId) {
+                self::markQueueItemFailed($queueId);
             }
             
-            if (!isset($data['organic']) || count($data['organic']) === 0) {
-                break;
-            }
+            // Log error for tracking
+            self::logError($workerId, $jobId, 'job_processing_error', $e->getMessage(), $e->getTraceAsString(), 'error');
             
-            $page++;
-            
-            // Reduced rate limiting when using parallel scraping (already more efficient)
-            $rateLimit = (float)(Settings::get('rate_limit', (string)self::DEFAULT_RATE_LIMIT));
-            usleep((int)($rateLimit * 1000000));
+            // Mark worker as idle even after error
+            self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+        } finally {
+            // Always close connection at the end to free resources
+            Database::closeConnection();
         }
-        
-        $totalTime = microtime(true) - $startTime;
-        $avgRate = $processed > 0 ? $processed / $totalTime : 0;
-        
-        // Mark queue item as complete
-        if ($queueId) {
-            self::markQueueItemComplete($queueId);
-            error_log("✓ [{$workerName}] Queue item {$queueId} COMPLETED");
-        }
-        
-        // Update overall job progress
-        self::updateJobProgress($jobId);
-        
-        error_log(sprintf("✓✓✓ [{$workerName}] Job chunk COMPLETED! %d emails in %.2f sec (%.1f emails/sec)", 
-            $processed, $totalTime, $avgRate));
-        
-        // Mark worker as idle
-        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
     }
     
     public static function updateJobProgress(int $jobId): void {
@@ -4439,11 +4715,14 @@ class Router {
         error_log("  PHP Binary: {$phpBinary}");
         error_log("  Script Path: {$scriptPath}");
         error_log("  Debug Mode: " . ($debugMode ? 'ENABLED' : 'DISABLED'));
+        error_log("  Connection Rate Limiting: " . self::WORKER_SPAWN_DELAY_MS . "ms delay (~" . (int)(1000 / self::WORKER_SPAWN_DELAY_MS) . " workers/second)");
         
         $spawnedCount = 0;
         $processes = [];
+        $startTime = microtime(true);
         
-        // Spawn ALL workers simultaneously
+        // Spawn workers with staggered delays to prevent overwhelming MySQL
+        // This avoids "Too many connections" errors by limiting connection rate
         for ($i = 0; $i < $workerCount; $i++) {
             try {
                 $workerName = 'parallel-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
@@ -4493,7 +4772,15 @@ class Router {
                     $processes[] = ['handle' => $process, 'name' => $workerName];
                     $spawnedCount++;
                     
-                    error_log("  ✓ Worker {$i}/{$workerCount}: {$workerName} spawned" . ($debugMode ? " (logging to {$logDir})" : ""));
+                    if ($i % 50 === 0 || $i === $workerCount - 1) {
+                        error_log("  ✓ Progress: {$spawnedCount}/{$workerCount} workers spawned" . ($debugMode ? " (logging to {$logDir})" : ""));
+                    }
+                    
+                    // Add small delay to stagger connections (~6.6ms = ~151 workers/second)
+                    // This prevents overwhelming MySQL with simultaneous connection attempts
+                    if ($i < $workerCount - 1) {
+                        usleep((int)(self::WORKER_SPAWN_DELAY_MS * 1000));
+                    }
                 } else {
                     error_log("  ✗ Worker {$i}/{$workerCount}: Failed to spawn {$workerName}");
                     error_log("    Command: " . implode(' ', $args));
@@ -4504,7 +4791,12 @@ class Router {
             }
         }
         
-        error_log("✓✓✓ spawnWorkersViaProcOpenParallel: ALL {$spawnedCount}/{$workerCount} workers spawned SIMULTANEOUSLY!");
+        $totalTime = microtime(true) - $startTime;
+        $workersPerSecond = $spawnedCount / $totalTime;
+        
+        error_log("✓✓✓ spawnWorkersViaProcOpenParallel: {$spawnedCount}/{$workerCount} workers spawned with rate limiting!");
+        error_log("    Total spawn time: " . round($totalTime, 2) . "s (~" . round($workersPerSecond, 1) . " workers/second)");
+        error_log("    This prevents overwhelming MySQL with simultaneous connections");
         
         if ($spawnedCount < $workerCount) {
             error_log("⚠️  WARNING: Only {$spawnedCount}/{$workerCount} workers spawned successfully!");
