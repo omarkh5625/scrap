@@ -97,9 +97,30 @@ try {
     $db = Database::connect();
     
     // Check connection attributes
-    echo "✓ Error mode: " . $db->getAttribute(PDO::ATTR_ERRMODE) . " (should be " . PDO::ERRMODE_EXCEPTION . ")\n";
-    echo "✓ Fetch mode: " . $db->getAttribute(PDO::ATTR_DEFAULT_FETCH_MODE) . " (should be " . PDO::FETCH_ASSOC . ")\n";
-    echo "✓ Emulate prepares: " . ($db->getAttribute(PDO::ATTR_EMULATE_PREPARES) ? 'Yes' : 'No') . " (should be No)\n";
+    $errorMode = $db->getAttribute(PDO::ATTR_ERRMODE);
+    $fetchMode = $db->getAttribute(PDO::ATTR_DEFAULT_FETCH_MODE);
+    $emulatePrepares = $db->getAttribute(PDO::ATTR_EMULATE_PREPARES);
+    
+    echo "✓ Error mode: " . $errorMode . " (expected: " . PDO::ERRMODE_EXCEPTION . ")";
+    if ($errorMode !== PDO::ERRMODE_EXCEPTION) {
+        echo " ⚠️ Warning: Error mode not set to ERRMODE_EXCEPTION!\n";
+    } else {
+        echo "\n";
+    }
+    
+    echo "✓ Fetch mode: " . $fetchMode . " (expected: " . PDO::FETCH_ASSOC . ")";
+    if ($fetchMode !== PDO::FETCH_ASSOC) {
+        echo " ⚠️ Warning: Fetch mode not set to FETCH_ASSOC!\n";
+    } else {
+        echo "\n";
+    }
+    
+    echo "✓ Emulate prepares: " . ($emulatePrepares ? 'Yes' : 'No') . " (expected: No)";
+    if ($emulatePrepares) {
+        echo " ⚠️ Warning: Emulate prepares should be disabled for better performance!\n";
+    } else {
+        echo "\n";
+    }
     
     // Check MySQL specific settings
     $result = $db->query("SELECT @@sql_mode as mode");

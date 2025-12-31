@@ -171,13 +171,15 @@ class Database {
                     // Use random_int for better randomness distribution
                     try {
                         $jitter = random_int(0, (int)($delay * 0.3));
-                    } catch (Exception $randException) {
-                        // Fallback to rand if random_int fails
+                    } catch (Throwable $randException) {
+                        // Fallback to rand if random_int fails (handles both Error and Exception)
                         $jitter = rand(0, (int)($delay * 0.3));
                     }
                     $delay += $jitter;
                     
-                    error_log("⚠️ Database connection failed (attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}): " . 
+                    // Provide more specific error message for "Too many connections"
+                    $errorType = $isTooManyConnections ? "Too many connections (1040)" : "Connection error";
+                    error_log("⚠️ Database {$errorType} (attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}): " . 
                              $e->getMessage() . " - Retrying in " . round($delay / 1000, 2) . "s");
                     
                     // Wait before retry (convert ms to microseconds)
@@ -238,14 +240,17 @@ class Database {
                                     strpos($e->getMessage(), 'Lost connection') !== false;
                 
                 if ($isConnectionError && $attempt < $maxAttempts) {
+                    // Calculate exponential backoff delay (consistent with connectWithRetry)
+                    $delayMs = min(100 * pow(2, $attempt - 1), 5000); // 100ms, 200ms, 400ms (capped at 5s)
+                    
                     error_log("⚠️ Query failed due to connection issue (attempt {$attempt}/{$maxAttempts}): " . 
-                             $e->getMessage());
+                             $e->getMessage() . " - Retrying in " . round($delayMs / 1000, 2) . "s");
                     
                     // Force reconnection
                     self::$pdo = null;
                     
-                    // Wait before retry with increasing delay
-                    usleep(100000 * $attempt); // 100ms, 200ms, 300ms
+                    // Wait before retry (convert ms to microseconds)
+                    usleep($delayMs * 1000);
                 } else {
                     throw $e;
                 }
