@@ -19,7 +19,7 @@
  */
 
 // Prevent direct execution in production without proper setup
-error_reporting(E_ALL);
+error_reporting(0); // Disable in production
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 ini_set('max_execution_time', 0);
@@ -473,12 +473,13 @@ class WorkerGovernor {
     }
     
     private function generateWorkerScript($workerId, $config) {
-        $configJson = json_encode($config);
+        $configJson = base64_encode(json_encode($config));
+        $workerIdSafe = preg_replace('/[^a-zA-Z0-9_-]/', '', $workerId);
         
         return <<<'PHP'
 <?php
 // Worker Process
-$config = json_decode('{CONFIG}', true);
+$config = json_decode(base64_decode('{CONFIG_B64}'), true);
 $workerId = '{WORKER_ID}';
 
 // Simulate worker doing work
@@ -509,8 +510,8 @@ while ((time() - $startTime) < $maxRunTime) {
 echo json_encode(['type' => 'completed', 'worker_id' => $workerId]) . "\n";
 PHP;
         
-        $script = str_replace('{CONFIG}', addslashes($configJson), $script);
-        $script = str_replace('{WORKER_ID}', $workerId, $script);
+        $script = str_replace('{CONFIG_B64}', $configJson, $script);
+        $script = str_replace('{WORKER_ID}', $workerIdSafe, $script);
         
         return $script;
     }
@@ -1079,7 +1080,7 @@ class Application {
         $this->renderUI();
     }
     
-    private function runCron() {
+    public function runBackgroundTasks() {
         // Check all jobs and maintain workers
         $this->jobManager->checkAllJobs();
         
@@ -1088,7 +1089,10 @@ class Application {
         if ($memoryUsage > Config::MEMORY_LIMIT_MB) {
             Utils::logMessage('WARNING', "High memory usage: " . round($memoryUsage, 2) . " MB");
         }
-        
+    }
+    
+    private function runCron() {
+        $this->runBackgroundTasks();
         echo "OK";
         exit;
     }
@@ -1105,7 +1109,7 @@ class Application {
         
         return [
             'total_jobs' => count($jobs),
-            'running_jobs' => count(array_filter($jobs, fn($j) => $j['status'] === 'running')),
+            'running_jobs' => count(array_filter($jobs, function($j) { return $j['status'] === 'running'; })),
             'total_emails' => array_sum(array_column($jobs, 'emails_found')),
             'memory_usage' => Utils::formatBytes(memory_get_usage(true)),
             'peak_memory' => Utils::formatBytes(memory_get_peak_usage(true))
@@ -1557,7 +1561,7 @@ class Application {
                     formData.append(key, value);
                 }
                 
-                const response = await fetch('app.php', {
+                const response = await fetch(window.location.pathname, {
                     method: 'POST',
                     body: formData
                 });
@@ -1567,7 +1571,7 @@ class Application {
             
             async get(action, params = {}) {
                 const queryString = new URLSearchParams({action, ...params}).toString();
-                const response = await fetch(`app.php?${queryString}`);
+                const response = await fetch(`${window.location.pathname}?${queryString}`);
                 return await response.json();
             }
         };
@@ -1788,7 +1792,7 @@ if (php_sapi_name() === 'cli') {
     
     while (true) {
         try {
-            $app->run();
+            $app->runBackgroundTasks();
             sleep(5); // Check every 5 seconds
         } catch (Exception $e) {
             Utils::logMessage('ERROR', "Application error: {$e->getMessage()}");
