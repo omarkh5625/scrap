@@ -128,6 +128,13 @@ define('DEFAULT_CYCLE_DELAY_MS', 0);
 define('MIN_CYCLE_DELAY_MS', 0);
 define('MAX_CYCLE_DELAY_MS', 10000); // Max 10 seconds
 
+// Free email providers list for business_only filtering mode
+// These domains are excluded when "Business Only" filter is enabled
+define('FREE_EMAIL_PROVIDERS', [
+    'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 
+    'icloud.com', 'att.net', 'live.com', 'msn.com', 'comcast.net', 'verizon.net'
+]);
+
 ///////////////////////
 //  DATABASE CONNECTION
 ///////////////////////
@@ -1308,14 +1315,15 @@ function extract_emails_from_results(array $results, bool $businessOnly = true, 
     $emailSet = []; // Use associative array for O(1) duplicate checking
     $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
     
-    // Default free providers for business_only mode
-    $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com', 'att.net', 'live.com', 'msn.com', 'comcast.net', 'verizon.net'];
-    
-    // Normalize target domains to lowercase for comparison
-    $targetDomains = array_map('strtolower', array_map('trim', $targetDomains));
+    // Normalize target domains to lowercase for case-insensitive comparison
+    // Email domains are case-insensitive, so we normalize everything to lowercase
+    $normalizedDomains = [];
+    foreach ($targetDomains as $domain) {
+        $normalizedDomains[] = strtolower(trim($domain));
+    }
     
     // Legacy support: if businessOnly is explicitly set, use it
-    if ($businessOnly && $filterMode === 'business_only' && empty($targetDomains)) {
+    if ($businessOnly && $filterMode === 'business_only' && empty($normalizedDomains)) {
         $filterMode = 'business_only';
     }
     
@@ -1327,13 +1335,14 @@ function extract_emails_from_results(array $results, bool $businessOnly = true, 
         
         if (preg_match_all($emailPattern, $text, $matches)) {
             foreach ($matches[0] as $email) {
-                $email = strtolower($email);
+                $email = strtolower($email); // Normalize email to lowercase
                 
                 $atPos = strpos($email, '@');
                 if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
                     continue;
                 }
                 
+                // Extract domain (already lowercase since email is lowercase)
                 $domain = substr($email, $atPos + 1);
                 
                 // Apply filtering based on mode
@@ -1341,23 +1350,23 @@ function extract_emails_from_results(array $results, bool $businessOnly = true, 
                 
                 switch ($filterMode) {
                     case 'business_only':
-                        // Exclude free email providers
-                        if (in_array($domain, $freeProviders)) {
+                        // Exclude free email providers (using constant)
+                        if (in_array($domain, FREE_EMAIL_PROVIDERS)) {
                             $shouldInclude = false;
                         }
                         break;
                         
                     case 'include':
                         // Include ONLY specified domains
-                        if (!empty($targetDomains)) {
-                            $shouldInclude = in_array($domain, $targetDomains);
+                        if (!empty($normalizedDomains)) {
+                            $shouldInclude = in_array($domain, $normalizedDomains);
                         }
                         break;
                         
                     case 'exclude':
                         // Exclude specified domains
-                        if (!empty($targetDomains)) {
-                            $shouldInclude = !in_array($domain, $targetDomains);
+                        if (!empty($normalizedDomains)) {
+                            $shouldInclude = !in_array($domain, $normalizedDomains);
                         }
                         break;
                         
@@ -1368,7 +1377,7 @@ function extract_emails_from_results(array $results, bool $businessOnly = true, 
                         
                     default:
                         // Default to business_only for safety
-                        if (in_array($domain, $freeProviders)) {
+                        if (in_array($domain, FREE_EMAIL_PROVIDERS)) {
                             $shouldInclude = false;
                         }
                         break;
