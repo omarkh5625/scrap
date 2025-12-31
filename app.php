@@ -113,12 +113,17 @@ class ConnectionPoolManager {
         
         // Initialize lock file if it doesn't exist
         if (!file_exists($this->lockFile)) {
-            file_put_contents($this->lockFile, json_encode([
+            $result = @file_put_contents($this->lockFile, json_encode([
                 'active' => 0,
                 'waiting' => 0,
                 'peak' => 0,
                 'last_update' => time()
             ]));
+            
+            if ($result === false) {
+                error_log("⚠️ Warning: Could not create connection pool lock file at {$this->lockFile}");
+                error_log("⚠️ Connection pooling will be disabled. Check temp directory permissions.");
+            }
         }
     }
     
@@ -132,8 +137,15 @@ class ConnectionPoolManager {
     /**
      * Acquire a connection slot - blocks until a slot is available
      * Implements connection throttling to prevent "Too many connections" errors
+     * Gracefully degrades if file locking is not available
      */
     public function acquireConnection(): bool {
+        // If lock file doesn't exist and can't be created, allow connection without throttling
+        if (!file_exists($this->lockFile)) {
+            error_log("⚠️ Connection pool lock file not available - proceeding without throttling");
+            return true;
+        }
+        
         $maxWaitTime = 30; // Maximum wait time in seconds
         $startTime = time();
         $attemptNumber = 0;
@@ -142,10 +154,11 @@ class ConnectionPoolManager {
             $attemptNumber++;
             
             // Try to acquire a lock on the pool file
-            $fp = fopen($this->lockFile, 'c+');
+            $fp = @fopen($this->lockFile, 'c+');
             if (!$fp) {
-                error_log("⚠️ Failed to open connection pool lock file");
-                return false;
+                // If we can't open the lock file, log warning and allow connection
+                error_log("⚠️ Failed to open connection pool lock file - proceeding without throttling");
+                return true;
             }
             
             if (flock($fp, LOCK_EX)) {
@@ -221,9 +234,15 @@ class ConnectionPoolManager {
     
     /**
      * Release a connection slot back to the pool
+     * Gracefully handles cases where lock file is not available
      */
     public function releaseConnection(): void {
-        $fp = fopen($this->lockFile, 'c+');
+        // If lock file doesn't exist, nothing to release
+        if (!file_exists($this->lockFile)) {
+            return;
+        }
+        
+        $fp = @fopen($this->lockFile, 'c+');
         if (!$fp) {
             error_log("⚠️ Failed to open connection pool lock file for release");
             return;
