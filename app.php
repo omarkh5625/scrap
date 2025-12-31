@@ -1028,6 +1028,9 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $maxAttempts = $workers * 5; // Allow multiple rounds per worker
         $pageOffset = 0;
         $allApiErrors = []; // Track all API errors across all rounds
+        $apiCallsMade = 0; // Actual count of API calls made
+        $zeroRounds = 0; // Count consecutive rounds with no emails
+        $maxZeroRounds = 3; // Allow up to 3 empty rounds before stopping
         
         // Store diagnostic info in database (fallback when error_log not available)
         $diagMsg = "DIAGNOSTIC: Loop vars: extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}\n";
@@ -1040,6 +1043,8 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
         // Parallel extraction loop - all workers work simultaneously
         while ($extractedCount < $targetCount && $attempts < $maxAttempts) {
+            $attempts++; // Increment round counter at the start
+            
             // Update diagnostic in database
             $diagMsg .= "\nDIAGNOSTIC: Round {$attempts} started";
             $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
@@ -1055,6 +1060,11 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                     'page' => $pageOffset + $workerNum
                 ];
             }
+            
+            // Count actual API calls being made this round
+            $apiCallsThisRound = count($workerResults);
+            $apiCallsMade += $apiCallsThisRound;
+            error_log("PARALLEL_EXTRACTION: Round {$attempts} - spawning {$apiCallsThisRound} workers (total API calls so far: {$apiCallsMade})");
             
             // Execute all API calls in parallel
             $multiHandle = curl_multi_init();
@@ -1127,8 +1137,19 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                         $organicCount = count($data['organic']);
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - Found {$organicCount} organic results");
                         
-                        $emails = extract_emails_from_results($data['organic'], $businessOnly, $filterMode, $emailDomains);
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results (mode={$filterMode})");
+                        // Extract emails with detailed logging
+                        $emailsBeforeFilter = extract_emails_from_results($data['organic'], false, 'all', []);
+                        $emailsAfterFilter = extract_emails_from_results($data['organic'], $businessOnly, $filterMode, $emailDomains);
+                        
+                        $rawCount = count($emailsBeforeFilter);
+                        $filteredCount = count($emailsAfterFilter);
+                        $removedByFilter = $rawCount - $filteredCount;
+                        
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Email extraction: raw={$rawCount}, filtered={$filteredCount}, removed_by_filter={$removedByFilter} (mode={$filterMode})");
+                        
+                        $emails = $emailsAfterFilter;
+                        $duplicatesSkipped = 0;
+                        $savedCount = 0;
                         
                         // Insert emails into database
                         foreach ($emails as $emailData) {
@@ -1145,6 +1166,7 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                                 if ($stmt->rowCount() > 0) {
                                     $extractedCount++;
                                     $roundEmails++;
+                                    $savedCount++;
                                     
                                     // Update progress every 5 emails for responsiveness
                                     if ($extractedCount % 5 === 0) {
@@ -1154,10 +1176,13 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                                 }
                             } catch (Exception $e) {
                                 // Skip duplicates
-                                error_log("PARALLEL_EXTRACTION: Worker {$idx} - Duplicate email: " . $emailData['email']);
+                                $duplicatesSkipped++;
                                 continue;
                             }
                         }
+                        
+                        // Log summary for this worker
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Summary: saved={$savedCount}, duplicates_skipped={$duplicatesSkipped}");
                     }
                 } else {
                     // Non-200 HTTP response
@@ -1196,13 +1221,20 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             
             error_log("PARALLEL_EXTRACTION: Round {$attempts} - extracted {$roundEmails} emails (total: {$extractedCount}/{$targetCount})");
             
-            // If no emails extracted in this round, stop
+            // Allow multiple empty rounds before stopping (SERP pages may not always have emails)
             if ($roundEmails === 0) {
-                error_log("PARALLEL_EXTRACTION: No new emails found, stopping");
-                break;
+                $zeroRounds++;
+                error_log("PARALLEL_EXTRACTION: Round {$attempts} had zero emails - consecutive zero rounds: {$zeroRounds}/{$maxZeroRounds}");
+                
+                if ($zeroRounds >= $maxZeroRounds) {
+                    error_log("PARALLEL_EXTRACTION: Stopping after {$maxZeroRounds} consecutive rounds with no emails");
+                    break;
+                }
+            } else {
+                // Reset zero rounds counter when we find emails
+                $zeroRounds = 0;
             }
             
-            $attempts++;
             $pageOffset += $workers;
         }
         
@@ -1212,9 +1244,9 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
         // Check if we extracted any emails
         if ($extractedCount === 0) {
-            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$attempts} attempts with {$workers} workers");
+            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$apiCallsMade} API calls in {$attempts} rounds");
             
-            $errorMsg = "No emails found in search results after {$attempts} API calls.\n\n";
+            $errorMsg = "No emails found in search results after {$apiCallsMade} API calls ({$attempts} rounds).\n\n";
             $errorMsg .= "=== JOB CONFIGURATION ===\n";
             $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
             $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
@@ -1223,52 +1255,65 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             if (!empty($emailDomains)) {
                 $errorMsg .= "Target Domains: " . implode(', ', $emailDomains) . "\n";
             }
-            $errorMsg .= "Workers Used: {$workers}\n";
-            if (isset($rawWorkers) && $rawWorkers > $maxWorkersPerBatch) {
-                $errorMsg .= "  (Note: Requested {$rawWorkers} workers, limited to {$workers} per batch)\n";
+            $errorMsg .= "Workers Per Round: {$workers}\n";
+            $errorMsg .= "Rounds Attempted: {$attempts}\n";
+            $errorMsg .= "Total API Calls: {$apiCallsMade}\n";
+            if ($zeroRounds > 0) {
+                $errorMsg .= "Consecutive Empty Rounds: {$zeroRounds}\n";
             }
-            $errorMsg .= "API Calls Made: {$attempts}\n\n";
+            $errorMsg .= "\n";
             
-            // Special case: if attempts is 0, provide specific guidance
-            if ($attempts === 0) {
+            // Special case: if no API calls made, provide specific guidance
+            if ($apiCallsMade === 0) {
                 $errorMsg .= "⚠️ CRITICAL: No API calls were made! This means the extraction loop never started.\n\n";
                 $errorMsg .= "=== MOST LIKELY CAUSE ===\n";
                 if ($rawTargetCount <= 0) {
                     $errorMsg .= "✗ Profile 'Target Email Count' was {$rawTargetCount} (invalid - must be at least 1)\n";
                     $errorMsg .= "  → The system adjusted it to {$targetCount}, but the profile should be updated\n";
                     $errorMsg .= "  → Edit the profile and set 'Target Email Count' to a valid number (e.g., 100)\n\n";
-                } elseif (isset($rawWorkers) && $rawWorkers > $maxWorkersPerBatch) {
-                    $errorMsg .= "✗ Too many workers requested: {$rawWorkers}\n";
-                    $errorMsg .= "  → System limit is {$maxWorkersPerBatch} parallel workers per batch\n";
-                    $errorMsg .= "  → Creating {$rawWorkers} parallel curl handles likely caused a resource exhaustion error\n";
-                    $errorMsg .= "  → The script probably crashed before the loop could start\n\n";
-                    $errorMsg .= "SOLUTION:\n";
-                    $errorMsg .= "  1. Edit your profile and reduce 'Workers' to 50 or less\n";
-                    $errorMsg .= "  2. Recommended: 4-10 workers for optimal performance\n";
-                    $errorMsg .= "  3. More workers doesn't always mean faster - it can cause resource issues\n\n";
                 } else {
                     $errorMsg .= "The extraction loop failed to start. This is unusual.\n";
                     $errorMsg .= "Check the server error.log for messages starting with 'PARALLEL_EXTRACTION:'\n\n";
                 }
+            } else {
+                // API calls were made but no emails found
+                $errorMsg .= "=== EXTRACTION SUMMARY ===\n";
+                $errorMsg .= "✓ API calls were successfully made to serper.dev\n";
+                $errorMsg .= "✓ Search results were retrieved from {$attempts} rounds\n";
+                $errorMsg .= "✗ No emails were found that matched your criteria\n\n";
             }
             
             $errorMsg .= "=== POSSIBLE REASONS ===\n";
-            $errorMsg .= "1. The search query returns no results with email addresses\n";
-            if ($filterMode === 'business_only') {
-                $errorMsg .= "2. Business Only filter is excluding all found emails (excludes gmail.com, yahoo.com, etc.)\n";
-            } elseif ($filterMode === 'include' && !empty($emailDomains)) {
-                $errorMsg .= "2. Include filter is too restrictive - no emails found from: " . implode(', ', $emailDomains) . "\n";
-            } elseif ($filterMode === 'exclude' && !empty($emailDomains)) {
-                $errorMsg .= "2. Exclude filter removed all emails (excluding: " . implode(', ', $emailDomains) . ")\n";
+            if ($apiCallsMade > 0) {
+                $errorMsg .= "1. SERP pages don't contain visible email addresses for this query\n";
+                $errorMsg .= "2. Emails exist but were removed by your filter settings:\n";
+            } else {
+                $errorMsg .= "1. The search query returns no results with email addresses\n";
             }
-            $errorMsg .= "3. API key may be invalid or rate limited (check HTTP codes in API Log below)\n";
-            $errorMsg .= "4. Network connectivity issues to serper.dev\n";
-            $errorMsg .= "5. Search query is too specific or targets wrong audience\n\n";
+            if ($filterMode === 'business_only') {
+                $errorMsg .= "   - Business Only filter excludes: gmail.com, yahoo.com, hotmail.com, outlook.com, etc.\n";
+            } elseif ($filterMode === 'include' && !empty($emailDomains)) {
+                $errorMsg .= "   - Include filter only allows: " . implode(', ', $emailDomains) . "\n";
+            } elseif ($filterMode === 'exclude' && !empty($emailDomains)) {
+                $errorMsg .= "   - Exclude filter removes: " . implode(', ', $emailDomains) . "\n";
+            }
+            if ($apiCallsMade > 0) {
+                $errorMsg .= "3. Search results exist but don't contain email addresses in visible text\n";
+                $errorMsg .= "4. Try different search terms or add keywords like 'contact', 'email'\n\n";
+            } else {
+                $errorMsg .= "3. API key may be invalid or rate limited (check HTTP codes in API Log below)\n";
+                $errorMsg .= "4. Network connectivity issues to serper.dev\n";
+                $errorMsg .= "5. Search query is too specific or targets wrong audience\n\n";
+            }
             
             $errorMsg .= "=== TROUBLESHOOTING STEPS ===\n";
             $errorMsg .= "1. Test API Connection: Use the 'Test Connection' button in the profile\n";
-            $errorMsg .= "2. Verify API Key: Check at https://serper.dev/dashboard\n";
-            $errorMsg .= "3. Adjust Filter Mode:\n";
+            if ($apiCallsMade > 0) {
+                $errorMsg .= "2. Adjust Filter Mode:\n";
+            } else {
+                $errorMsg .= "2. Verify API Key: Check at https://serper.dev/dashboard\n";
+                $errorMsg .= "3. Adjust Filter Mode:\n";
+            }
             if ($filterMode === 'business_only') {
                 $errorMsg .= "   - Try 'All Emails' mode to see if any emails are found\n";
                 $errorMsg .= "   - Or use 'Include Only' with specific domains like gmail.com, yahoo.com\n";
