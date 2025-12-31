@@ -7673,19 +7673,6 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                 </div>
               </div>
               <?php endif; ?>
-                  </div>
-                  <div style="margin:12px 0;">
-                    <strong style="color:#721c24;">Next steps:</strong>
-                    <ul style="margin:8px 0; padding-left:20px; color:#721c24;">
-                      <li>Verify your serper.dev API key in Job Profiles settings</li>
-                      <li>Check <code style="background:#fff;padding:2px 6px;border:1px solid #f5c6cb;border-radius:3px;">error.log</code> file for full technical stack trace</li>
-                      <li>Test your API key at <a href="https://serper.dev/playground" target="_blank" style="color:#0056b3;">serper.dev/playground</a></li>
-                      <li>Try running the extraction again after fixing the issue</li>
-                    </ul>
-                  </div>
-                </div>
-              </div>
-              <?php endif; ?>
 
               <div class="card" style="margin-bottom:18px;">
                 <div class="card-header">
