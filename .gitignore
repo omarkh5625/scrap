@@ -1,0 +1,21 @@
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
