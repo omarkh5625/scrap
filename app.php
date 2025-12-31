@@ -1131,6 +1131,7 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
  */
 function extract_emails_from_results(array $results, bool $businessOnly = true): array {
     $emails = [];
+    $emailSet = []; // Use associative array for O(1) duplicate checking
     $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
     
     foreach ($results as $result) {
@@ -1156,16 +1157,9 @@ function extract_emails_from_results(array $results, bool $businessOnly = true):
                     }
                 }
                 
-                // Check if email already in array
-                $exists = false;
-                foreach ($emails as $existing) {
-                    if ($existing['email'] === $email) {
-                        $exists = true;
-                        break;
-                    }
-                }
-                
-                if (!$exists) {
+                // Check if email already in set (O(1) lookup)
+                if (!isset($emailSet[$email])) {
+                    $emailSet[$email] = true;
                     $emails[] = [
                         'email' => $email,
                         'source' => $result['link'] ?? ''
