@@ -38,8 +38,8 @@ set_error_handler(function($errno, $errstr, $errfile, $errline) {
     );
     error_log($error_message);
     
-    // Display error in development mode
-    if (ini_get('display_errors')) {
+    // Display error in development mode ONLY if not an AJAX request
+    if (ini_get('display_errors') && !isset($_POST['action']) && !isset($_GET['action'])) {
         echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
         echo "<strong>Error:</strong> $errstr<br>";
         echo "<strong>File:</strong> $errfile<br>";
@@ -61,7 +61,8 @@ set_exception_handler(function($exception) {
     );
     error_log($error_message);
     
-    if (ini_get('display_errors')) {
+    // Display exception in development mode ONLY if not an AJAX request
+    if (ini_get('display_errors') && !isset($_POST['action']) && !isset($_GET['action'])) {
         echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
         echo "<strong>Exception:</strong> " . htmlspecialchars($exception->getMessage()) . "<br>";
         echo "<strong>File:</strong> " . htmlspecialchars($exception->getFile()) . "<br>";
@@ -5430,6 +5431,9 @@ if ($action === 'save_rotation') {
 
 // Test API Connection Action
 if ($action === 'test_connection') {
+    // Disable HTML error output for this AJAX request
+    ini_set('display_errors', 0);
+    
     // Prevent any output before JSON
     if (ob_get_level()) ob_clean();
     header('Content-Type: application/json; charset=utf-8');
