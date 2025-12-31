@@ -77,48 +77,117 @@ class EmailValidator {
         'mailinator.com', 'maildrop.cc', 'trashmail.com', 'yopmail.com'
     ];
     
-    public static function validate($email) {
+    // File extensions to reject
+    private static $fileExtensions = [
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.webp', '.ico',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        '.zip', '.rar', '.tar', '.gz', '.7z',
+        '.mp3', '.mp4', '.avi', '.mov', '.wmv',
+        '.exe', '.dll', '.bin'
+    ];
+    
+    // Banks and major corporations to filter
+    private static $corporateDomains = [
+        'google.com', 'amazon.com', 'paypal.com', 'ebay.com', 'apple.com',
+        'microsoft.com', 'facebook.com', 'twitter.com', 'instagram.com',
+        'bankofamerica.com', 'chase.com', 'wellsfargo.com', 'citibank.com',
+        'hsbc.com', 'barclays.com', 'jpmorgan.com'
+    ];
+    
+    // System/automatic email patterns
+    private static $systemEmailPatterns = [
+        'noreply', 'no-reply', 'no_reply', 'donotreply', 'do-not-reply',
+        'admin', 'administrator', 'support', 'info', 'notification',
+        'alerts', 'notifications', 'automated', 'automatic', 'system',
+        'webmaster', 'postmaster', 'mailer-daemon'
+    ];
+    
+    public static function validate($email, $checkStrict = true) {
         // Basic format validation
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            return false;
+            return ['valid' => false, 'reason' => 'Invalid email format'];
         }
         
-        // Extract domain
+        // Extract domain and local part
         $parts = explode('@', $email);
         if (count($parts) !== 2) {
-            return false;
+            return ['valid' => false, 'reason' => 'Invalid email structure'];
         }
         
+        $localPart = strtolower($parts[0]);
         $domain = strtolower($parts[1]);
+        
+        if ($checkStrict) {
+            // Check for file extensions in email
+            foreach (self::$fileExtensions as $ext) {
+                if (strpos($email, $ext) !== false) {
+                    return ['valid' => false, 'reason' => 'Contains file extension'];
+                }
+            }
+            
+            // Check against corporate/bank domains
+            if (in_array($domain, self::$corporateDomains)) {
+                return ['valid' => false, 'reason' => 'Corporate/bank domain'];
+            }
+            
+            // Check against system email patterns
+            foreach (self::$systemEmailPatterns as $pattern) {
+                if (stripos($localPart, $pattern) !== false) {
+                    return ['valid' => false, 'reason' => 'System/automated email'];
+                }
+            }
+            
+            // Check email length (too short or too long)
+            if (strlen($localPart) < 3 || strlen($localPart) > 64) {
+                return ['valid' => false, 'reason' => 'Invalid email length'];
+            }
+            
+            // Check if looks human (at least some variety in characters)
+            if (!preg_match('/[a-z]/i', $localPart) || !preg_match('/[a-z].*[a-z]/i', $localPart)) {
+                return ['valid' => false, 'reason' => 'Does not look human'];
+            }
+        }
         
         // Check against disposable domains
         if (in_array($domain, self::$disposableDomains)) {
-            return false;
+            return ['valid' => false, 'reason' => 'Disposable email domain'];
         }
         
         // Validate domain format
         if (!self::isValidDomain($domain)) {
-            return false;
+            return ['valid' => false, 'reason' => 'Invalid domain format'];
         }
         
-        return true;
+        return ['valid' => true, 'reason' => 'Valid'];
     }
     
     public static function validateWithMX($email) {
-        if (!self::validate($email)) {
-            return false;
+        $validation = self::validate($email);
+        if (!$validation['valid']) {
+            return $validation;
         }
         
         $parts = explode('@', $email);
         $domain = $parts[1];
         
         // MX record check
-        return checkdnsrr($domain, 'MX') || checkdnsrr($domain, 'A');
+        $hasMX = checkdnsrr($domain, 'MX') || checkdnsrr($domain, 'A');
+        if (!$hasMX) {
+            return ['valid' => false, 'reason' => 'No MX records found'];
+        }
+        
+        return ['valid' => true, 'reason' => 'Valid with MX'];
     }
     
     private static function isValidDomain($domain) {
         // Basic domain validation
         return preg_match('/^[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,}$/i', $domain);
+    }
+    
+    public static function getQualityLabel($score) {
+        if ($score >= 0.8) return 'High';
+        if ($score >= 0.5) return 'Medium';
+        return 'Low';
     }
 }
 
@@ -269,26 +338,62 @@ class DomainLimiter {
 
 // URL Filter - Validates and filters URLs
 class URLFilter {
+    // Block media files, documents, and resources
+    private static $blockedExtensions = [
+        '/\.(pdf|doc|docx|xls|xlsx|ppt|pptx)$/i',  // Documents
+        '/\.(jpg|jpeg|png|gif|bmp|svg|webp|ico)$/i', // Images
+        '/\.(mp3|mp4|avi|mov|wmv|flv|webm)$/i',     // Media
+        '/\.(zip|rar|tar|gz|7z)$/i',                 // Archives
+        '/\.(css|js|json|xml)$/i',                   // Resources
+    ];
+    
+    // Block specific page types
     private static $blockedPatterns = [
-        '/\.(pdf|jpg|jpeg|png|gif|css|js|ico|svg)$/i',
-        '/\/(login|signin|signup|register|logout)/',
-        '/\/(cart|checkout|payment)/',
+        '/\/(login|signin|signup|register|logout)/',       // Auth pages
+        '/\/(cart|checkout|payment|billing)/',             // Commerce pages
+        '/\/(ad|ads|advertise|advertisement)/',            // Ad pages
+        '/\/(shop|store|product|item|buy)[\/-]/i',         // Product pages
+        '/^https?:\/\/[^\/]+\/?$/i',                       // Homepage only (root with no path)
+    ];
+    
+    // Patterns that indicate good pages (forums, text content, documents)
+    private static $goodPatterns = [
+        '/\/(forum|discussion|thread|topic|post)/',
+        '/\/(article|blog|news|press)/',
+        '/\/(about|contact|team|staff)/',
+        '/\/(directory|list|member)/',
     ];
     
     public static function isValid($url) {
         // Basic URL validation
         if (!filter_var($url, FILTER_VALIDATE_URL)) {
-            return false;
+            return ['valid' => false, 'reason' => 'Invalid URL format'];
+        }
+        
+        // Check blocked extensions
+        foreach (self::$blockedExtensions as $pattern) {
+            if (preg_match($pattern, $url)) {
+                return ['valid' => false, 'reason' => 'Media/document file'];
+            }
         }
         
         // Check blocked patterns
         foreach (self::$blockedPatterns as $pattern) {
             if (preg_match($pattern, $url)) {
-                return false;
+                return ['valid' => false, 'reason' => 'Blocked page type'];
             }
         }
         
-        return true;
+        // Bonus: Check for good patterns (increase confidence)
+        $hasGoodPattern = false;
+        foreach (self::$goodPatterns as $pattern) {
+            if (preg_match($pattern, $url)) {
+                $hasGoodPattern = true;
+                break;
+            }
+        }
+        
+        return ['valid' => true, 'reason' => 'Valid URL', 'has_good_pattern' => $hasGoodPattern];
     }
     
     public static function normalize($url) {
@@ -316,7 +421,8 @@ class ContentFilter {
         foreach ($matches[0] as $email) {
             // Clean up the email
             $email = trim($email, '.,;:()[]{}"\' ');
-            if (EmailValidator::validate($email)) {
+            $validation = EmailValidator::validate($email, true);
+            if ($validation['valid']) {
                 $emails[] = $email;
             }
         }
@@ -698,9 +804,12 @@ class JobManager {
             'created_at' => time(),
             'started_at' => null,
             'emails_found' => 0,
+            'emails_accepted' => 0,
+            'emails_rejected' => 0,
             'urls_processed' => 0,
             'errors' => 0,
-            'worker_governor' => null
+            'worker_governor' => null,
+            'hourly_stats' => [] // Track emails per hour
         ];
         
         $this->jobs[$jobId] = $job;
@@ -915,6 +1024,9 @@ class APIHandler {
                 case 'scale_workers':
                     return $this->scaleWorkers();
                     
+                case 'test_connection':
+                    return $this->testConnection();
+                    
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
@@ -930,14 +1042,28 @@ class APIHandler {
         $name = $_POST['name'] ?? 'Unnamed Job';
         $apiKey = $_POST['api_key'] ?? '';
         $query = $_POST['query'] ?? '';
+        $keywords = $_POST['keywords'] ?? ''; // Multiple keywords, one per line
+        $country = $_POST['country'] ?? 'us';
+        $language = $_POST['language'] ?? 'en';
+        $emailTypes = $_POST['email_types'] ?? 'all'; // Gmail, Yahoo, Business, All
         
-        if (empty($apiKey) || empty($query)) {
-            throw new Exception("API key and query are required");
+        if (empty($apiKey) || (empty($query) && empty($keywords))) {
+            throw new Exception("API key and query/keywords are required");
+        }
+        
+        // Parse keywords if provided
+        $keywordList = [];
+        if (!empty($keywords)) {
+            $keywordList = array_filter(array_map('trim', explode("\n", $keywords)));
         }
         
         $options = [
             'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
-            'max_emails' => (int)($_POST['max_emails'] ?? 10000)
+            'max_emails' => (int)($_POST['max_emails'] ?? 10000),
+            'keywords' => $keywordList,
+            'country' => $country,
+            'language' => $language,
+            'email_types' => $emailTypes
         ];
         
         $jobId = $this->jobManager->createJob($name, $apiKey, $query, $options);
@@ -1071,6 +1197,31 @@ class APIHandler {
             'success' => true,
             'message' => "Worker scaling requested: {$direction} by {$count}"
         ]);
+    }
+    
+    private function testConnection() {
+        $apiKey = $_POST['api_key'] ?? $_GET['api_key'] ?? '';
+        
+        if (empty($apiKey)) {
+            throw new Exception("API key is required");
+        }
+        
+        try {
+            // Test connection with a simple query
+            $scheduler = new SearchScheduler($apiKey);
+            $results = $scheduler->search('test', ['num' => 1]);
+            
+            return $this->jsonResponse([
+                'success' => true,
+                'message' => 'Connection successful',
+                'results_count' => count($results)
+            ]);
+        } catch (Exception $e) {
+            return $this->jsonResponse([
+                'success' => false,
+                'message' => 'Connection failed: ' . $e->getMessage()
+            ], 400);
+        }
     }
     
     private function jsonResponse($data, $statusCode = 200) {
@@ -1217,7 +1368,8 @@ class Application {
         }
         
         .form-group input,
-        .form-group textarea {
+        .form-group textarea,
+        .form-group select {
             width: 100%;
             padding: 10px;
             border: 1px solid #d1d5da;
@@ -1228,7 +1380,8 @@ class Application {
         }
         
         .form-group input:focus,
-        .form-group textarea:focus {
+        .form-group textarea:focus,
+        .form-group select:focus {
             outline: none;
             border-color: #0066ff;
             box-shadow: 0 0 0 3px rgba(0, 102, 255, 0.1);
@@ -1237,6 +1390,12 @@ class Application {
         .form-group textarea {
             resize: vertical;
             min-height: 80px;
+        }
+        
+        .form-group small {
+            display: block;
+            margin-top: 5px;
+            font-size: 12px;
         }
         
         .btn {
@@ -1259,6 +1418,14 @@ class Application {
         .btn:disabled {
             background: #ccc;
             cursor: not-allowed;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+        }
+        
+        .btn-secondary:hover {
+            background: #5a6268;
         }
         
         .stats {
@@ -1534,6 +1701,16 @@ class Application {
             </div>
             
             <div class="sidebar-section">
+                <h3>API Settings</h3>
+                <div class="form-group">
+                    <label for="apiKey">Serper API Key</label>
+                    <input type="password" id="apiKey" name="api_key" placeholder="Enter your API key">
+                </div>
+                <button id="testConnectionBtn" class="btn btn-secondary">Test Connection</button>
+                <div id="connectionStatus" style="margin-top: 10px; display: none;"></div>
+            </div>
+            
+            <div class="sidebar-section">
                 <h3>Create New Job</h3>
                 <form id="createJobForm">
                     <div class="form-group">
@@ -1542,13 +1719,50 @@ class Application {
                     </div>
                     
                     <div class="form-group">
-                        <label for="apiKey">Serper API Key</label>
-                        <input type="password" id="apiKey" name="api_key" placeholder="Enter your API key" required>
+                        <label for="query">Main Search Query</label>
+                        <input type="text" id="query" name="query" placeholder="e.g., real estate agents" required>
                     </div>
                     
                     <div class="form-group">
-                        <label for="query">Search Query</label>
-                        <textarea id="query" name="query" placeholder="e.g., real estate agents in California" required></textarea>
+                        <label for="keywords">Additional Keywords (one per line)</label>
+                        <textarea id="keywords" name="keywords" placeholder="california&#10;los angeles&#10;san francisco" rows="4"></textarea>
+                        <small style="color: #666;">Each keyword will be combined with the main query</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="country">Country</label>
+                        <select id="country" name="country">
+                            <option value="us">United States</option>
+                            <option value="uk">United Kingdom</option>
+                            <option value="ca">Canada</option>
+                            <option value="au">Australia</option>
+                            <option value="de">Germany</option>
+                            <option value="fr">France</option>
+                            <option value="es">Spain</option>
+                            <option value="it">Italy</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="language">Language</label>
+                        <select id="language" name="language">
+                            <option value="en">English</option>
+                            <option value="es">Spanish</option>
+                            <option value="fr">French</option>
+                            <option value="de">German</option>
+                            <option value="it">Italian</option>
+                            <option value="pt">Portuguese</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="emailTypes">Email Types</label>
+                        <select id="emailTypes" name="email_types">
+                            <option value="all">All Types</option>
+                            <option value="gmail">Gmail Only</option>
+                            <option value="yahoo">Yahoo Only</option>
+                            <option value="business">Business Only</option>
+                        </select>
                     </div>
                     
                     <div class="form-group">
@@ -1642,6 +1856,14 @@ class Application {
             renderJob(job) {
                 const statusClass = job.status;
                 const workerStats = job.worker_stats || {total: 0, running: 0};
+                const acceptedEmails = job.emails_accepted || 0;
+                const rejectedEmails = job.emails_rejected || 0;
+                const totalFound = acceptedEmails + rejectedEmails;
+                const acceptRate = totalFound > 0 ? ((acceptedEmails / totalFound) * 100).toFixed(1) : 0;
+                
+                // Calculate emails per hour
+                const runtime = job.started_at ? ((Date.now() / 1000) - job.started_at) / 3600 : 0;
+                const emailsPerHour = runtime > 0 ? Math.round(acceptedEmails / runtime) : 0;
                 
                 return `
                     <div class="job-card" data-job-id="${job.id}">
@@ -1654,6 +1876,11 @@ class Application {
                             <div class="job-info-item">
                                 <strong>Query:</strong> ${this.escapeHtml(job.query)}
                             </div>
+                            ${job.options && job.options.country ? `
+                                <div class="job-info-item">
+                                    <strong>Target:</strong> ${job.options.country.toUpperCase()} / ${job.options.language.toUpperCase()}
+                                </div>
+                            ` : ''}
                             <div class="job-info-item">
                                 <strong>Created:</strong> ${new Date(job.created_at * 1000).toLocaleString()}
                             </div>
@@ -1661,14 +1888,28 @@ class Application {
                                 <div class="job-info-item">
                                     <strong>Workers:</strong> ${workerStats.running} running / ${workerStats.total} total
                                 </div>
+                                <div class="job-info-item">
+                                    <strong>Rate:</strong> ${emailsPerHour} emails/hour
+                                </div>
                             ` : ''}
                         </div>
                         
                         <div class="job-metrics">
                             <div class="metric">
-                                <div class="metric-value">${job.emails_found.toLocaleString()}</div>
-                                <div class="metric-label">Emails</div>
+                                <div class="metric-value" style="color: #28a745;">${acceptedEmails.toLocaleString()}</div>
+                                <div class="metric-label">✓ Accepted</div>
                             </div>
+                            <div class="metric">
+                                <div class="metric-value" style="color: #dc3545;">${rejectedEmails.toLocaleString()}</div>
+                                <div class="metric-label">✗ Rejected</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">${acceptRate}%</div>
+                                <div class="metric-label">Accept Rate</div>
+                            </div>
+                        </div>
+                        
+                        <div class="job-metrics" style="margin-top: 10px;">
                             <div class="metric">
                                 <div class="metric-value">${job.urls_processed.toLocaleString()}</div>
                                 <div class="metric-label">URLs</div>
@@ -1676,6 +1917,10 @@ class Application {
                             <div class="metric">
                                 <div class="metric-value">${job.errors}</div>
                                 <div class="metric-label">Errors</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">${emailsPerHour}</div>
+                                <div class="metric-label">Per Hour</div>
                             </div>
                         </div>
                         
@@ -1786,6 +2031,46 @@ class Application {
         };
         
         // Initialize
+        // Test Connection Button
+        document.getElementById('testConnectionBtn').addEventListener('click', async () => {
+            const apiKey = document.getElementById('apiKey').value;
+            if (!apiKey) {
+                UI.showAlert('Please enter an API key first', 'error');
+                return;
+            }
+            
+            const btn = document.getElementById('testConnectionBtn');
+            const status = document.getElementById('connectionStatus');
+            
+            btn.disabled = true;
+            btn.textContent = 'Testing...';
+            
+            try {
+                const result = await API.call('test_connection', { api_key: apiKey });
+                
+                if (result.success) {
+                    status.style.display = 'block';
+                    status.style.color = '#28a745';
+                    status.innerHTML = '✓ Connection successful!';
+                    UI.showAlert('API connection successful!', 'success');
+                } else {
+                    status.style.display = 'block';
+                    status.style.color = '#dc3545';
+                    status.innerHTML = '✗ Connection failed: ' + result.message;
+                    UI.showAlert('API connection failed', 'error');
+                }
+            } catch (error) {
+                status.style.display = 'block';
+                status.style.color = '#dc3545';
+                status.innerHTML = '✗ Connection failed: ' + error.message;
+                UI.showAlert('Error testing connection', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Test Connection';
+            }
+        });
+        
+        // Create Job Form
         document.getElementById('createJobForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
@@ -1793,6 +2078,10 @@ class Application {
                 name: document.getElementById('jobName').value,
                 api_key: document.getElementById('apiKey').value,
                 query: document.getElementById('query').value,
+                keywords: document.getElementById('keywords').value,
+                country: document.getElementById('country').value,
+                language: document.getElementById('language').value,
+                email_types: document.getElementById('emailTypes').value,
                 max_workers: document.getElementById('maxWorkers').value
             };
             
