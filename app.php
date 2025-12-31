@@ -79,8 +79,8 @@ set_exception_handler(function($exception) {
 $configFile = __DIR__ . '/config.php';
 $configExists = file_exists($configFile);
 
-// If config doesn't exist and not installing, show installation wizard
-if (!$configExists && (!isset($_GET['action']) || $_GET['action'] !== 'install')) {
+// If config doesn't exist and not installing or testing connection, show installation wizard
+if (!$configExists && (!isset($_GET['action']) || ($_GET['action'] !== 'install' && $_GET['action'] !== 'test_connection'))) {
     // Show installation wizard
     include_once 'install_wizard.php';
     exit;

@@ -1,0 +1,16 @@
+[31-Dec-2025 07:48:24 UTC] [2025-12-31 07:48:24] Error #2: include_once(install_wizard.php): Failed to open stream: No such file or directory in /home/runner/work/scrap/scrap/app.php on line 85
+[31-Dec-2025 07:48:24 UTC] PHP Warning:  include_once(install_wizard.php): Failed to open stream: No such file or directory in /home/runner/work/scrap/scrap/app.php on line 85
+[31-Dec-2025 07:48:24 UTC] PHP Stack trace:
+[31-Dec-2025 07:48:24 UTC] PHP   1. {main}() /tmp/test_connection.php:0
+[31-Dec-2025 07:48:24 UTC] PHP   2. include() /tmp/test_connection.php:18
+[31-Dec-2025 07:48:24 UTC] [2025-12-31 07:48:24] Error #2: include_once(): Failed opening 'install_wizard.php' for inclusion (include_path='.:/usr/share/php') in /home/runner/work/scrap/scrap/app.php on line 85
+[31-Dec-2025 07:48:24 UTC] PHP Warning:  include_once(): Failed opening 'install_wizard.php' for inclusion (include_path='.:/usr/share/php') in /home/runner/work/scrap/scrap/app.php on line 85
+[31-Dec-2025 07:48:24 UTC] PHP Stack trace:
+[31-Dec-2025 07:48:24 UTC] PHP   1. {main}() /tmp/test_connection.php:0
+[31-Dec-2025 07:48:24 UTC] PHP   2. include() /tmp/test_connection.php:18
+[31-Dec-2025 07:50:18 UTC] [2025-12-31 07:50:18] Error #2: Cannot modify header information - headers already sent by (output started at /tmp/test_connection_v2.php:7) in /home/runner/work/scrap/scrap/app.php on line 272
+[31-Dec-2025 07:50:18 UTC] PHP Warning:  Cannot modify header information - headers already sent by (output started at /tmp/test_connection_v2.php:7) in /home/runner/work/scrap/scrap/app.php on line 272
+[31-Dec-2025 07:50:18 UTC] PHP Stack trace:
+[31-Dec-2025 07:50:18 UTC] PHP   1. {main}() /tmp/test_connection_v2.php:0
+[31-Dec-2025 07:50:18 UTC] PHP   2. include() /tmp/test_connection_v2.php:16
+[31-Dec-2025 07:50:18 UTC] PHP   3. header($header = 'Content-Type: application/json; charset=utf-8') /home/runner/work/scrap/scrap/app.php:272
