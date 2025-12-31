@@ -1749,64 +1749,78 @@ class Worker {
     }
     
     public static function markQueueItemComplete(int $queueId): void {
-        $db = Database::connect();
-        $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
-        $stmt->execute([$queueId]);
-        error_log("✓ Marked queue item {$queueId} as completed");
+        try {
+            Database::executeWithRetry(function($db) use ($queueId) {
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueId]);
+            });
+            error_log("✓ Marked queue item {$queueId} as completed");
+        } catch (PDOException $e) {
+            error_log("✗ Failed to mark queue item {$queueId} as completed: " . $e->getMessage());
+        }
     }
     
     public static function markQueueItemFailed(int $queueId): void {
-        $db = Database::connect();
-        $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
-        $stmt->execute([$queueId]);
-        error_log("✗ Marked queue item {$queueId} as failed");
+        try {
+            Database::executeWithRetry(function($db) use ($queueId) {
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueId]);
+            });
+            error_log("✗ Marked queue item {$queueId} as failed");
+        } catch (PDOException $e) {
+            error_log("✗ Failed to mark queue item {$queueId} as failed: " . $e->getMessage());
+        }
     }
     
     /**
      * Check if all queue items for a job are complete and update job status accordingly
      */
     public static function checkAndUpdateJobCompletion(int $jobId): void {
-        $db = Database::connect();
-        
-        // Get total and completed queue items for this job
-        $stmt = $db->prepare("
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
-            FROM job_queue 
-            WHERE job_id = ?
-        ");
-        $stmt->execute([$jobId]);
-        $counts = $stmt->fetch();
-        
-        $total = (int)$counts['total'];
-        $completed = (int)$counts['completed'];
-        $failed = (int)$counts['failed'];
-        
-        if ($total == 0) {
-            error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
-            return;
-        }
-        
-        // Calculate progress percentage
-        $progress = (int)round(($completed / $total) * 100);
-        
-        error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
-        
-        // Update job status based on queue completion
-        if ($completed == $total) {
-            // All queue items completed
-            Job::updateStatus($jobId, 'completed', 100);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
-        } elseif ($completed + $failed == $total) {
-            // All queue items either completed or failed
-            Job::updateStatus($jobId, 'completed', $progress);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
-        } else {
-            // Still processing
-            Job::updateStatus($jobId, 'running', $progress);
-            error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+        try {
+            $counts = Database::executeWithRetry(function($db) use ($jobId) {
+                // Get total and completed queue items for this job
+                $stmt = $db->prepare("
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                    FROM job_queue 
+                    WHERE job_id = ?
+                ");
+                $stmt->execute([$jobId]);
+                return $stmt->fetch();
+            });
+            
+            $total = (int)$counts['total'];
+            $completed = (int)$counts['completed'];
+            $failed = (int)$counts['failed'];
+            
+            if ($total == 0) {
+                error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
+                return;
+            }
+            
+            // Calculate progress percentage
+            $progress = (int)round(($completed / $total) * 100);
+            
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
+            
+            // Update job status based on queue completion
+            if ($completed == $total) {
+                // All queue items completed
+                Job::updateStatus($jobId, 'completed', 100);
+                error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
+            } elseif ($completed + $failed == $total) {
+                // All queue items either completed or failed
+                Job::updateStatus($jobId, 'completed', $progress);
+                error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
+            } else {
+                // Still processing
+                Job::updateStatus($jobId, 'running', $progress);
+                error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+            }
+        } catch (PDOException $e) {
+            error_log("✗ checkAndUpdateJobCompletion failed for job {$jobId}: " . $e->getMessage());
         }
     }
     
