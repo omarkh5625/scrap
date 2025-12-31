@@ -1145,7 +1145,8 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
             $stmt->execute([$errorMsg, $jobId]);
-            throw new Exception("No emails found");
+            error_log("PARALLEL_EXTRACTION: Job {$jobId} failed with 0 emails - detailed error message stored in database");
+            return; // Exit gracefully without throwing exception (detailed error already stored in DB)
         }
         
         // Mark job as completed
@@ -1156,11 +1157,24 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
     } catch (Throwable $e) {
         error_log("PARALLEL_EXTRACTION: EXCEPTION - " . $e->getMessage());
+        error_log("PARALLEL_EXTRACTION: Stack trace - " . $e->getTraceAsString());
         try {
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ?, active_workers = 0 WHERE id = ?");
-            $stmt->execute([$e->getMessage(), $jobId]);
-        } catch (Exception $e2) {}
-        throw $e;
+            // Store the detailed exception message with context
+            $errorDetails = "System Exception: " . $e->getMessage() . "\n\n";
+            $errorDetails .= "Location: " . $e->getFile() . " (Line " . $e->getLine() . ")\n\n";
+            $errorDetails .= "This is a system-level error. Common causes:\n";
+            $errorDetails .= "1. Invalid or expired API key\n";
+            $errorDetails .= "2. No internet connectivity from server\n";
+            $errorDetails .= "3. Database connection issue\n";
+            $errorDetails .= "4. Missing required profile fields\n\n";
+            $errorDetails .= "Check server error.log for full stack trace and details.\n";
+            
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
+            $stmt->execute([$errorDetails, $jobId]);
+        } catch (Exception $e2) {
+            error_log("PARALLEL_EXTRACTION: Failed to save error message - " . $e2->getMessage());
+        }
+        // Don't re-throw - allow graceful exit so error message stays in DB
     }
 }
 
