@@ -31,7 +31,7 @@ session_start();
 // Configuration
 class Config {
     const VERSION = '1.0.0';
-    const MAX_WORKERS_PER_JOB = 10;
+    const MAX_WORKERS_PER_JOB = 1000; // Increased for 32GB RAM server
     const MIN_WORKERS_PER_JOB = 1;
     const WORKER_TIMEOUT = 300; // 5 minutes
     const ZOMBIE_CHECK_INTERVAL = 60; // 1 minute
@@ -812,7 +812,8 @@ class JobManager {
             'worker_governor' => null,
             'hourly_stats' => [], // Track emails per hour
             'worker_count' => 0, // Persistent worker count
-            'workers_running' => 0 // Persistent running worker count
+            'workers_running' => 0, // Persistent running worker count
+            'target_emails' => $options['target_emails'] ?? 10000 // Target email count for progress tracking
         ];
         
         $this->jobs[$jobId] = $job;
@@ -1218,6 +1219,7 @@ class APIHandler {
         $options = [
             'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
             'max_emails' => (int)($_POST['max_emails'] ?? 10000),
+            'target_emails' => (int)($_POST['target_emails'] ?? 10000), // Target for progress tracking
             'keywords' => $keywordList,
             'country' => $country,
             'language' => $language,
@@ -1732,6 +1734,84 @@ class Application {
             flex: 1;
         }
         
+        .progress-section {
+            margin: 15px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .progress-item {
+            margin-bottom: 8px;
+        }
+        
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .progress-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #24292e;
+        }
+        
+        .progress-percentage {
+            font-size: 13px;
+            font-weight: 700;
+            color: #0066ff;
+        }
+        
+        .progress-bar-container {
+            width: 100%;
+            height: 24px;
+            background: #e9ecef;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .progress-bar {
+            height: 100%;
+            transition: width 0.3s ease;
+            border-radius: 12px;
+            position: relative;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .progress-bar::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, 
+                rgba(255,255,255,0.2) 0%, 
+                rgba(255,255,255,0.1) 50%, 
+                rgba(255,255,255,0.2) 100%);
+            animation: shimmer 2s infinite;
+        }
+        
+        @keyframes shimmer {
+            0% {
+                transform: translateX(-100%);
+            }
+            100% {
+                transform: translateX(100%);
+            }
+        }
+        
+        .progress-details {
+            font-size: 12px;
+            color: #666;
+            margin-top: 6px;
+            text-align: center;
+        }
+        
         .job-info {
             margin-bottom: 15px;
             font-size: 13px;
@@ -1969,8 +2049,15 @@ class Application {
                     </div>
                     
                     <div class="form-group">
+                        <label for="targetEmails">Target Emails</label>
+                        <input type="number" id="targetEmails" name="target_emails" value="10000" min="100" max="1000000" step="100">
+                        <small style="color: #666;">Goal for completion progress (100 - 1,000,000)</small>
+                    </div>
+                    
+                    <div class="form-group">
                         <label for="maxWorkers">Max Workers</label>
-                        <input type="number" id="maxWorkers" name="max_workers" value="5" min="1" max="10">
+                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="1000">
+                        <small style="color: #666;">Parallel workers (1-1000, server has 32GB RAM)</small>
                     </div>
                     
                     <button type="submit" class="btn">Create Job</button>
@@ -2068,6 +2155,12 @@ class Application {
                 const runtime = job.started_at ? ((Date.now() / 1000) - job.started_at) / 3600 : 0;
                 const emailsPerHour = runtime > 0 ? Math.round(acceptedEmails / runtime) : 0;
                 
+                // Calculate progress percentages
+                const targetEmails = job.target_emails || job.options?.target_emails || 10000;
+                const emailProgress = Math.min(100, (acceptedEmails / targetEmails) * 100).toFixed(1);
+                const maxWorkers = job.options?.max_workers || 10;
+                const workerProgress = Math.min(100, (workerStats.running / maxWorkers) * 100).toFixed(1);
+                
                 // Get recent errors
                 const errorMessages = job.error_messages || [];
                 const recentErrors = errorMessages.slice(-3); // Show last 3 errors
@@ -2091,6 +2184,32 @@ class Application {
                             </div>
                         ` : ''}
                         
+                        ${job.status === 'running' ? `
+                            <div class="progress-section">
+                                <div class="progress-item">
+                                    <div class="progress-header">
+                                        <span class="progress-label">📊 Email Collection Progress</span>
+                                        <span class="progress-percentage">${emailProgress}%</span>
+                                    </div>
+                                    <div class="progress-bar-container">
+                                        <div class="progress-bar" style="width: ${emailProgress}%; background: linear-gradient(90deg, #28a745, #20c997);"></div>
+                                    </div>
+                                    <div class="progress-details">${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails</div>
+                                </div>
+                                
+                                <div class="progress-item" style="margin-top: 12px;">
+                                    <div class="progress-header">
+                                        <span class="progress-label">👷 Active Workers</span>
+                                        <span class="progress-percentage">${workerProgress}%</span>
+                                    </div>
+                                    <div class="progress-bar-container">
+                                        <div class="progress-bar" style="width: ${workerProgress}%; background: linear-gradient(90deg, #007bff, #0056b3);"></div>
+                                    </div>
+                                    <div class="progress-details">${workerStats.running} / ${maxWorkers} workers active</div>
+                                </div>
+                            </div>
+                        ` : ''}
+                        
                         <div class="job-info">
                             <div class="job-info-item">
                                 <strong>Query:</strong> ${this.escapeHtml(job.query)}
@@ -2104,9 +2223,6 @@ class Application {
                                 <strong>Created:</strong> ${new Date(job.created_at * 1000).toLocaleString()}
                             </div>
                             ${job.status === 'running' ? `
-                                <div class="job-info-item">
-                                    <strong>Workers:</strong> ${workerStats.running} running / ${workerStats.total} total
-                                </div>
                                 <div class="job-info-item">
                                     <strong>Rate:</strong> ${emailsPerHour} emails/hour
                                 </div>
@@ -2303,6 +2419,7 @@ class Application {
                 country: document.getElementById('country').value,
                 language: document.getElementById('language').value,
                 email_types: document.getElementById('emailTypes').value,
+                target_emails: document.getElementById('targetEmails').value,
                 max_workers: document.getElementById('maxWorkers').value
             };
             
