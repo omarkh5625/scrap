@@ -127,15 +127,17 @@ Check logs in `/php_errors.log` for:
 
 ### Connection Retry Strategy
 
+Exponential backoff with 30% random jitter:
+
 ```
-Attempt 1: Wait 100ms
-Attempt 2: Wait 200ms (with 0-60ms jitter)
-Attempt 3: Wait 400ms (with 0-120ms jitter)
-Attempt 4: Wait 800ms (with 0-240ms jitter)
-Attempt 5: Wait 1600ms (with 0-480ms jitter)
+Attempt 1: Wait 100ms + jitter (0-30ms)     = 100-130ms
+Attempt 2: Wait 200ms + jitter (0-60ms)     = 200-260ms
+Attempt 3: Wait 400ms + jitter (0-120ms)    = 400-520ms
+Attempt 4: Wait 800ms + jitter (0-240ms)    = 800-1040ms
+Attempt 5: Wait 1600ms + jitter (0-480ms)   = 1600-2080ms
 ```
 
-Maximum retry delay is capped at 5 seconds.
+Maximum retry delay is capped at 5 seconds. The 30% jitter prevents thundering herd problem where all workers retry simultaneously.
 
 ### Batch Processing
 

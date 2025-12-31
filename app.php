@@ -91,6 +91,12 @@ class Database {
     private const MAX_RETRY_ATTEMPTS = 5;
     private const INITIAL_RETRY_DELAY_MS = 100;
     private const MAX_RETRY_DELAY_MS = 5000;
+    private const JITTER_PERCENTAGE = 0.3; // 30% jitter to prevent thundering herd
+    
+    // MySQL error codes for connection issues
+    private const ERROR_TOO_MANY_CONNECTIONS = 1040;
+    private const ERROR_SERVER_GONE_AWAY = 2006;
+    private const ERROR_LOST_CONNECTION = 2013;
     
     /**
      * Get database connection with retry logic and exponential backoff
@@ -152,13 +158,10 @@ class Database {
                 $attempt++;
                 $lastError = $e;
                 
-                // Check if it's a "Too many connections" error (SQLSTATE HY000, error code 1040)
-                // Use more robust error checking via SQLSTATE and error code
+                // Check if it's a connection error using centralized helper
                 $errorInfo = $e->errorInfo ?? [];
-                $sqlState = $errorInfo[0] ?? '';
                 $errorCode = $errorInfo[1] ?? 0;
-                $isTooManyConnections = ($errorCode === 1040) || 
-                                       ($sqlState === 'HY000' && strpos($e->getMessage(), 'Too many connections') !== false);
+                $isTooManyConnections = ($errorCode === self::ERROR_TOO_MANY_CONNECTIONS);
                 
                 if ($attempt < self::MAX_RETRY_ATTEMPTS) {
                     // Calculate exponential backoff delay
@@ -167,13 +170,13 @@ class Database {
                         self::MAX_RETRY_DELAY_MS
                     );
                     
-                    // Add jitter to prevent thundering herd
+                    // Add jitter to prevent thundering herd (configurable percentage)
                     // Use random_int for better randomness distribution
                     try {
-                        $jitter = random_int(0, (int)($delay * 0.3));
+                        $jitter = random_int(0, (int)($delay * self::JITTER_PERCENTAGE));
                     } catch (Throwable $randException) {
                         // Fallback to rand if random_int fails (handles both Error and Exception)
-                        $jitter = rand(0, (int)($delay * 0.3));
+                        $jitter = rand(0, (int)($delay * self::JITTER_PERCENTAGE));
                     }
                     $delay += $jitter;
                     
@@ -201,8 +204,41 @@ class Database {
     }
     
     /**
+     * Check if a PDOException is a connection-related error
+     * Centralizes error detection logic for consistency
+     * 
+     * @param PDOException $e The exception to check
+     * @return bool True if it's a connection error that should be retried
+     */
+    private static function isConnectionError(PDOException $e): bool {
+        $errorInfo = $e->errorInfo ?? [];
+        $errorCode = $errorInfo[1] ?? 0;
+        
+        // Check for known connection error codes
+        if (in_array($errorCode, [
+            self::ERROR_TOO_MANY_CONNECTIONS,
+            self::ERROR_SERVER_GONE_AWAY,
+            self::ERROR_LOST_CONNECTION
+        ])) {
+            return true;
+        }
+        
+        // Fallback to message checking for edge cases
+        $message = $e->getMessage();
+        return strpos($message, 'Too many connections') !== false ||
+               strpos($message, 'MySQL server has gone away') !== false ||
+               strpos($message, 'Lost connection') !== false;
+    }
+    
+    /**
      * Close the database connection to free up resources
      * Should be called after completing a batch of operations
+     * 
+     * Note: Using non-persistent connections is critical in high-concurrency scenarios.
+     * Persistent connections would remain open even after PHP scripts finish, quickly
+     * exhausting MySQL max_connections with 500-1000 concurrent workers. Non-persistent
+     * connections are properly closed and returned to the pool, allowing better resource
+     * management and preventing "Too many connections" errors.
      */
     public static function closeConnection(): void {
         if (self::$pdo !== null) {
@@ -230,18 +266,13 @@ class Database {
                 $attempt++;
                 $lastError = $e;
                 
-                // Check if it's a connection-related error using more robust checking
-                $errorInfo = $e->errorInfo ?? [];
-                $errorCode = $errorInfo[1] ?? 0;
-                $isConnectionError = ($errorCode === 2006) || // MySQL server has gone away
-                                    ($errorCode === 2013) || // Lost connection during query
-                                    ($errorCode === 1040) || // Too many connections
-                                    strpos($e->getMessage(), 'MySQL server has gone away') !== false ||
-                                    strpos($e->getMessage(), 'Lost connection') !== false;
-                
-                if ($isConnectionError && $attempt < $maxAttempts) {
+                // Use centralized error detection
+                if (self::isConnectionError($e) && $attempt < $maxAttempts) {
                     // Calculate exponential backoff delay (consistent with connectWithRetry)
-                    $delayMs = min(100 * pow(2, $attempt - 1), 5000); // 100ms, 200ms, 400ms (capped at 5s)
+                    $delayMs = min(
+                        self::INITIAL_RETRY_DELAY_MS * pow(2, $attempt - 1),
+                        self::MAX_RETRY_DELAY_MS
+                    );
                     
                     error_log("⚠️ Query failed due to connection issue (attempt {$attempt}/{$maxAttempts}): " . 
                              $e->getMessage() . " - Retrying in " . round($delayMs / 1000, 2) . "s");
