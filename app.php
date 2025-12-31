@@ -1520,23 +1520,25 @@ class Worker {
     public static function getNextJob(?int $jobId = null): ?array {
         $db = Database::connect();
         
-        // Use transaction to prevent race conditions
+        // OPTIMIZATION: Use short-lived transaction to minimize lock time for parallel workers
+        // Transaction ensures atomic claim of queue item by worker
         $db->beginTransaction();
         
         try {
             // First check job_queue for pending chunks
             // If jobId is specified, only get queue items for that specific job
+            // SKIP LOCKED ensures parallel workers don't wait for each other
             if ($jobId !== null) {
-                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute([$jobId]);
             } else {
-                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute();
             }
             $queueItem = $stmt->fetch();
             
             if ($queueItem) {
-                // Mark this queue item as processing
+                // Mark this queue item as processing IMMEDIATELY to release lock
                 $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
                 $stmt->execute([$queueItem['id']]);
                 
@@ -1552,6 +1554,7 @@ class Worker {
                     $job['queue_max_results'] = $queueItem['max_results'];
                 }
                 
+                // COMMIT FAST - other workers can immediately grab next item
                 $db->commit();
                 return $job ?: null;
             }
@@ -1559,10 +1562,10 @@ class Worker {
             // Fallback to old method: check for pending jobs without queue
             // If jobId is specified, only check that specific job
             if ($jobId !== null) {
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute([$jobId]);
             } else {
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute();
             }
             $job = $stmt->fetch();
