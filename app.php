@@ -100,8 +100,17 @@ class ConnectionPoolManager {
     private int $waitingWorkers = 0;
     private string $lockFile;
     
+    // Wait timing constants for exponential backoff
+    private const INITIAL_WAIT_MICROSECONDS = 100000; // 100ms
+    private const MAX_BACKOFF_POWER = 4;
+    private const MAX_WAIT_MICROSECONDS = 1000000; // 1 second
+    
     private function __construct() {
-        $this->lockFile = sys_get_temp_dir() . '/scrap_connection_pool.lock';
+        // Use a unique lock file path based on the script location to avoid conflicts
+        // between multiple application instances on the same server
+        $scriptHash = substr(md5(__FILE__), 0, 8);
+        $this->lockFile = sys_get_temp_dir() . "/scrap_connection_pool_{$scriptHash}.lock";
+        
         // Initialize lock file if it doesn't exist
         if (!file_exists($this->lockFile)) {
             file_put_contents($this->lockFile, json_encode([
@@ -188,7 +197,10 @@ class ConnectionPoolManager {
                 
                 // Check if we've exceeded max wait time
                 if (time() - $startTime > $maxWaitTime) {
+                    // Include diagnostic information in timeout error
                     error_log("✗ Connection slot acquisition timeout after {$maxWaitTime}s (attempt {$attemptNumber})");
+                    error_log("  Pool status at timeout: {$currentActive}/{$this->maxConnections} active, {$waiting} waiting");
+                    error_log("  Consider increasing maxConnections or reducing worker count");
                     return false;
                 }
                 
@@ -198,7 +210,7 @@ class ConnectionPoolManager {
                 }
                 
                 // Wait with exponential backoff before retry
-                $waitTime = min(100000 * pow(2, min($attemptNumber - 1, 4)), 1000000); // Max 1s
+                $waitTime = min(self::INITIAL_WAIT_MICROSECONDS * pow(2, min($attemptNumber - 1, self::MAX_BACKOFF_POWER)), self::MAX_WAIT_MICROSECONDS);
                 usleep($waitTime);
             } else {
                 fclose($fp);
@@ -246,9 +258,10 @@ class ConnectionPoolManager {
      * Get current pool statistics
      */
     public function getStats(): array {
-        $fp = @fopen($this->lockFile, 'r');
+        $fp = fopen($this->lockFile, 'r');
         if (!$fp) {
-            return ['active' => 0, 'waiting' => 0, 'peak' => 0, 'max' => $this->maxConnections];
+            error_log("⚠️ Failed to open lock file for reading stats: {$this->lockFile}");
+            return ['active' => 0, 'waiting' => 0, 'peak' => 0, 'max' => $this->maxConnections, 'error' => 'Cannot open lock file'];
         }
         
         if (flock($fp, LOCK_SH)) {
@@ -268,7 +281,8 @@ class ConnectionPoolManager {
         }
         
         fclose($fp);
-        return ['active' => 0, 'waiting' => 0, 'peak' => 0, 'max' => $this->maxConnections];
+        error_log("⚠️ Failed to acquire lock for reading stats");
+        return ['active' => 0, 'waiting' => 0, 'peak' => 0, 'max' => $this->maxConnections, 'error' => 'Cannot acquire lock'];
     }
 }
 
