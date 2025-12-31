@@ -1042,11 +1042,29 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             foreach ($curlHandles as $idx => $ch) {
                 $response = curl_multi_getcontent($ch);
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError = curl_error($ch);
+                
+                error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode}, Response length: " . strlen($response));
+                
+                if ($curlError) {
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - CURL ERROR: {$curlError}");
+                }
                 
                 if ($httpCode === 200 && $response) {
                     $data = json_decode($response, true);
-                    if (is_array($data) && isset($data['organic'])) {
+                    if ($data === null) {
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - JSON decode failed! Response: " . substr($response, 0, 500));
+                    } elseif (!isset($data['organic'])) {
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - No 'organic' field in response. Keys: " . implode(', ', array_keys($data)));
+                        if (isset($data['error'])) {
+                            error_log("PARALLEL_EXTRACTION: Worker {$idx} - API ERROR: " . json_encode($data['error']));
+                        }
+                    } else {
+                        $organicCount = count($data['organic']);
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Found {$organicCount} organic results");
+                        
                         $emails = extract_emails_from_results($data['organic'], $businessOnly);
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results");
                         
                         // Insert emails into database
                         foreach ($emails as $emailData) {
@@ -1072,10 +1090,13 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                                 }
                             } catch (Exception $e) {
                                 // Skip duplicates
+                                error_log("PARALLEL_EXTRACTION: Worker {$idx} - Duplicate email: " . $emailData['email']);
                                 continue;
                             }
                         }
                     }
+                } else {
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode} or empty response");
                 }
                 
                 curl_multi_remove_handle($multiHandle, $ch);
@@ -1102,10 +1123,25 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
         // Check if we extracted any emails
         if ($extractedCount === 0) {
-            $errorMsg = "No emails found in search results. Try:\n";
-            $errorMsg .= "- A more specific search query\n";
-            $errorMsg .= "- Different location or industry\n";
-            $errorMsg .= "- Disable 'Business Only' filter\n";
+            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$attempts} attempts with {$workers} workers");
+            
+            $errorMsg = "No emails found in search results after {$attempts} API calls.\n\n";
+            $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
+            $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
+            $errorMsg .= "Business Only Filter: " . ($businessOnly ? "Enabled" : "Disabled") . "\n";
+            $errorMsg .= "Workers Used: {$workers}\n";
+            $errorMsg .= "API Calls Made: {$attempts}\n\n";
+            $errorMsg .= "Possible reasons:\n";
+            $errorMsg .= "1. The search query returns no results with email addresses\n";
+            $errorMsg .= "2. All emails filtered out (Business Only excludes gmail.com, yahoo.com, etc.)\n";
+            $errorMsg .= "3. API key may be invalid or rate limited\n";
+            $errorMsg .= "4. Network connectivity issues\n\n";
+            $errorMsg .= "Suggestions:\n";
+            $errorMsg .= "- Try a more specific search query (e.g., 'company contact email')\n";
+            $errorMsg .= "- Try a different location or industry\n";
+            $errorMsg .= "- Disable 'Business Only' filter to include all emails\n";
+            $errorMsg .= "- Check server error.log for API response details\n";
+            $errorMsg .= "- Verify API key at serper.dev/dashboard\n";
             
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
             $stmt->execute([$errorMsg, $jobId]);
