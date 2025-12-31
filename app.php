@@ -810,7 +810,9 @@ class JobManager {
             'errors' => 0,
             'error_messages' => [], // Store error messages for UI display
             'worker_governor' => null,
-            'hourly_stats' => [] // Track emails per hour
+            'hourly_stats' => [], // Track emails per hour
+            'worker_count' => 0, // Persistent worker count
+            'workers_running' => 0 // Persistent running worker count
         ];
         
         $this->jobs[$jobId] = $job;
@@ -943,6 +945,10 @@ class JobManager {
                 throw new Exception("Failed to spawn any workers. Check system requirements.");
             }
             
+            // Update persistent worker counts
+            $job['worker_count'] = $workersSpawned;
+            $job['workers_running'] = $workersSpawned;
+            
             $this->saveJob($jobId);
             Utils::logMessage('INFO', "Job started: {$jobId} with {$workersSpawned} workers");
             
@@ -1002,10 +1008,19 @@ class JobManager {
         
         $job = $this->jobs[$jobId];
         
-        // Get worker stats if running
-        if ($job['status'] === 'running' && $job['worker_governor']) {
-            $job['worker_stats'] = $job['worker_governor']->getStats();
-            $job['workers'] = $job['worker_governor']->getWorkers();
+        // Get worker stats if running (prefer live stats, fall back to persistent)
+        if ($job['status'] === 'running') {
+            if ($job['worker_governor']) {
+                $job['worker_stats'] = $job['worker_governor']->getStats();
+                $job['workers'] = $job['worker_governor']->getWorkers();
+            } else {
+                // Use persistent counts if governor doesn't exist yet
+                $job['worker_stats'] = [
+                    'total' => $job['worker_count'] ?? 0,
+                    'running' => $job['workers_running'] ?? 0,
+                    'completed' => 0
+                ];
+            }
         }
         
         // Remove sensitive data
@@ -1042,8 +1057,57 @@ class JobManager {
     
     public function checkAllJobs() {
         foreach ($this->jobs as $jobId => $job) {
-            if ($job['status'] === 'running' && $job['worker_governor']) {
-                $job['worker_governor']->checkWorkers();
+            if ($job['status'] === 'running') {
+                // Restore worker governor if it doesn't exist
+                if (!$job['worker_governor']) {
+                    try {
+                        $governor = new WorkerGovernor($jobId);
+                        $this->jobs[$jobId]['worker_governor'] = $governor;
+                        
+                        // Respawn minimum workers with full configuration
+                        $workerConfig = [
+                            'job_id' => $jobId,
+                            'api_key' => $job['api_key'],
+                            'query' => $job['query'],
+                            'max_emails' => $job['options']['max_emails'] ?? 10000,
+                            'max_run_time' => 300
+                        ];
+                        
+                        $currentWorkers = count($governor->getWorkers());
+                        $neededWorkers = Config::MIN_WORKERS_PER_JOB - $currentWorkers;
+                        
+                        for ($i = 0; $i < $neededWorkers; $i++) {
+                            $workerId = Utils::generateId('worker_');
+                            try {
+                                $governor->spawnWorker($workerId, $workerConfig);
+                                Utils::logMessage('INFO', "Respawned worker {$workerId} for job {$jobId}");
+                                
+                                // Update persistent worker count
+                                if (!isset($this->jobs[$jobId]['worker_count'])) {
+                                    $this->jobs[$jobId]['worker_count'] = 0;
+                                }
+                                $this->jobs[$jobId]['worker_count']++;
+                                $this->saveJob($jobId);
+                            } catch (Exception $e) {
+                                Utils::logMessage('ERROR', "Failed to respawn worker: {$e->getMessage()}");
+                                $this->addJobError($jobId, "Failed to respawn worker: {$e->getMessage()}");
+                            }
+                        }
+                    } catch (Exception $e) {
+                        Utils::logMessage('ERROR', "Failed to restore worker governor for job {$jobId}: {$e->getMessage()}");
+                        $this->addJobError($jobId, "Worker restoration failed: {$e->getMessage()}");
+                    }
+                }
+                
+                // Check existing workers
+                if ($this->jobs[$jobId]['worker_governor']) {
+                    $this->jobs[$jobId]['worker_governor']->checkWorkers();
+                    
+                    // Update persistent worker stats
+                    $stats = $this->jobs[$jobId]['worker_governor']->getStats();
+                    $this->jobs[$jobId]['worker_count'] = $stats['total'];
+                    $this->jobs[$jobId]['workers_running'] = $stats['running'];
+                }
             }
         }
     }
