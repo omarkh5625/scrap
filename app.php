@@ -1760,6 +1760,10 @@ class Worker {
     }
     
     public static function processJob(int $jobId, ?int $existingWorkerId = null, ?string $existingWorkerName = null): void {
+        $workerStartTime = microtime(true);
+        $processId = getmypid();
+        error_log("✓ Worker processJob STARTED in parallel: jobId={$jobId}, PID={$processId} at " . date('H:i:s.') . substr((string)microtime(true), -3));
+        
         $job = Job::getById($jobId);
         if (!$job) {
             return;
@@ -1919,7 +1923,8 @@ class Worker {
     }
     
     public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
-        error_log("processJobImmediately called: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults}");
+        $workerStartTime = microtime(true);
+        error_log("✓ processJobImmediately STARTED in parallel: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults} at " . date('H:i:s.') . substr((string)microtime(true), -3));
         
         try {
             $job = Job::getById($jobId);
@@ -2148,9 +2153,15 @@ class Router {
         echo "Worker ID: {$workerId}\n";
         echo "Waiting for jobs...\n\n";
         
-        // Get polling interval from settings or use default 5 seconds
-        $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
+        // OPTIMIZATION: Use much shorter polling interval for near-instant job pickup
+        // Changed from 5 seconds to 0.1 seconds for maximum parallel performance
+        $pollingInterval = 0.1; // 100ms - fast enough for real-time, efficient on CPU
         
+        // Track consecutive empty polls to implement adaptive backoff
+        $emptyPollCount = 0;
+        $maxEmptyPolls = 50; // After 50 empty polls (5 seconds), increase interval
+        
+        // NO INITIAL SLEEP - start checking for work immediately for parallel execution
         while (true) {
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
             
@@ -2158,9 +2169,14 @@ class Router {
             $job = Worker::getNextJob($jobId);
             
             if ($job) {
+                // Reset empty poll counter when work is found
+                $emptyPollCount = 0;
+                
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                error_log("Worker {$workerName} starting job #{$job['id']} in parallel mode");
                 Worker::processJob($job['id']);
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                error_log("Worker {$workerName} completed job #{$job['id']}");
             } else if ($jobId !== null) {
                 // If dedicated to a specific job and no work found, check if job is complete
                 $jobDetails = Job::getById($jobId);
@@ -2168,9 +2184,19 @@ class Router {
                     echo "Job {$jobId} is complete or not found. Exiting.\n";
                     break;
                 }
+                $emptyPollCount++;
+            } else {
+                $emptyPollCount++;
             }
             
-            sleep($pollingInterval);
+            // Adaptive polling: use short interval when active, longer when idle
+            if ($emptyPollCount > $maxEmptyPolls) {
+                // After extended idle time, use 1 second interval to save CPU
+                usleep(1000000); // 1 second
+            } else {
+                // Active processing: use 100ms for near-instant parallel pickup
+                usleep(100000); // 0.1 seconds = 100ms
+            }
         }
     }
     
@@ -4049,10 +4075,14 @@ class Router {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
-        error_log("spawnWorkersViaProcOpen: Spawning {$workerCount} workers using proc_open()" . ($jobId ? " for job {$jobId}" : ""));
+        $startTime = microtime(true);
+        error_log("spawnWorkersViaProcOpen: Starting PARALLEL spawn of {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
         
         $spawnedCount = 0;
+        $processes = []; // Store process handles to ensure they stay detached
         
+        // OPTIMIZATION: Spawn all workers as fast as possible for true parallel execution
+        // No delays between spawns - let OS handle scheduling
         for ($i = 0; $i < $workerCount; $i++) {
             try {
                 // Build command to run worker in queue mode
@@ -4090,10 +4120,16 @@ class Router {
                         fclose($pipes[0]);
                     }
                     
-                    // Don't call proc_close - let it run in background
-                    // The process will continue running even after parent terminates
+                    // Store process handle to keep it alive (don't call proc_close yet)
+                    // This ensures the process continues running in the background
+                    $processes[] = $process;
+                    
                     $spawnedCount++;
-                    error_log("spawnWorkersViaProcOpen: Spawned worker {$spawnedCount}/{$workerCount}: {$workerName}");
+                    
+                    // Log every 100 workers to avoid log spam
+                    if ($spawnedCount % 100 === 0 || $spawnedCount === $workerCount) {
+                        error_log("spawnWorkersViaProcOpen: Spawned {$spawnedCount}/{$workerCount} workers in parallel");
+                    }
                 } else {
                     error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
                 }
@@ -4102,7 +4138,13 @@ class Router {
             }
         }
         
-        error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
+        $elapsedTime = round(microtime(true) - $startTime, 3);
+        $workersPerSecond = $spawnedCount > 0 ? round($spawnedCount / max($elapsedTime, 0.001), 1) : 0;
+        
+        error_log("spawnWorkersViaProcOpen: ✓ Successfully spawned {$spawnedCount}/{$workerCount} workers in {$elapsedTime}s ({$workersPerSecond} workers/sec) - ALL RUNNING IN PARALLEL");
+        
+        // All workers are now running independently in the background
+        // They will start processing queue items immediately with 100ms polling
         return $spawnedCount;
     }
     
@@ -5055,6 +5097,8 @@ class Router {
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum parallel performance</li>
                     <li>✅ <strong>Target:</strong> Process 1,000,000 emails in ≤10 minutes</li>
+                    <li>✅ <strong>NEW: Instant Job Pickup</strong> - Workers poll every 100ms (vs 5s)</li>
+                    <li>✅ <strong>NEW: True Parallel Execution</strong> - All workers start simultaneously</li>
                 </ul>
                 <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
@@ -5066,6 +5110,8 @@ class Router {
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
                     <li>✅ <strong>Real-time ETA</strong> calculation based on processing rate</li>
                     <li>✅ Automatic performance tracking and error logging</li>
+                    <li>✅ <strong>NEW: 0.1s polling interval</strong> for near-instant queue processing</li>
+                    <li>✅ <strong>NEW: Adaptive backoff</strong> - reduces CPU when idle</li>
                 </ul>
             </div>
             
