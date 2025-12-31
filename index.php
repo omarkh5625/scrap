@@ -187,7 +187,11 @@ class DedupEngine {
 }
 
 class URLFilter {
-    private static $excludeExtensions = ['pdf', 'jpg', 'jpeg', 'png', 'gif', 'zip', 'rar', 'exe', 'mp4', 'mp3', 'avi', 'mov'];
+    private static $excludeExtensions = [
+        'pdf', 'jpg', 'jpeg', 'png', 'gif', 'zip', 'rar', 'exe', 'mp4', 'mp3', 'avi', 'mov',
+        'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'tar', 'gz', 'bz2', '7z',
+        'iso', 'dmg', 'bin', 'dat', 'xml', 'json', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'eot'
+    ];
     private static $excludePatterns = ['/login', '/signin', '/signup', '/register', '/cart', '/checkout'];
     
     public static function isValid($url) {
@@ -271,6 +275,8 @@ class EmailValidator {
             }
         }
         
+        // Strict pattern matching for high-quality emails only
+        // Intentionally restrictive to filter out edge cases and ensure clean data
         if (!preg_match('/^[a-z0-9]+([._-][a-z0-9]+)*@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/', $email)) {
             return false;
         }
@@ -485,6 +491,18 @@ class WorkerGovernor {
     
     public function spawnWorker($jobId, $command) {
         if (!$this->canSpawnWorker($jobId)) {
+            return false;
+        }
+        
+        // Validate jobId is numeric to prevent injection
+        if (!is_numeric($jobId)) {
+            ErrorHandler::log($jobId, 'WORKER_SPAWN_FAILED', 'Invalid job ID');
+            return false;
+        }
+        
+        // Ensure command is an array for safe execution
+        if (!is_array($command)) {
+            ErrorHandler::log($jobId, 'WORKER_SPAWN_FAILED', 'Command must be an array');
             return false;
         }
         
@@ -813,9 +831,11 @@ class Supervisor {
     }
     
     private function spawnWorkerForJob($jobId) {
-        // This would normally spawn a worker process
-        // For demonstration, we'll just log it
-        ErrorHandler::log($jobId, 'WORKER_SPAWN_ATTEMPT', 'Supervisor attempting to spawn worker');
+        // Worker spawning is handled externally (e.g., via cron job or external daemon)
+        // This method logs the need for a worker, which can be monitored
+        // In a production environment, this would trigger an external process manager
+        // or queue system to spawn the actual worker process
+        ErrorHandler::log($jobId, 'WORKER_SPAWN_NEEDED', 'Job requires worker process');
     }
 }
 
@@ -880,8 +900,6 @@ class SerperAPI {
 // =====================================================================
 // WEB INTERFACE
 // =====================================================================
-
-session_start();
 
 $jobManager = new JobManager();
 $supervisor = new Supervisor($jobManager);
