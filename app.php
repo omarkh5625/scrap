@@ -978,8 +978,14 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $searchQuery = $profile['search_query'] ?? '';
         $country = $profile['country'] ?? '';
         $businessOnly = !empty($profile['filter_business_only']);
-        $targetCount = (int)($profile['target_count'] ?? 100);  // Always use profile's target
+        $rawTargetCount = (int)($profile['target_count'] ?? 100);
+        $targetCount = max(1, $rawTargetCount);  // Ensure at least 1 email target
         $workers = max(1, (int)($profile['workers'] ?? 4));
+        
+        // Log warning if target count was invalid
+        if ($rawTargetCount <= 0) {
+            error_log("PARALLEL_EXTRACTION: WARNING - Profile target_count was {$rawTargetCount}, adjusted to {$targetCount}");
+        }
         
         // Get email domain filtering parameters
         $filterMode = $profile['domain_filter_mode'] ?? 'business_only';
@@ -1202,12 +1208,27 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             $errorMsg .= "=== JOB CONFIGURATION ===\n";
             $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
             $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
+            $errorMsg .= "Target Email Count: {$targetCount}\n";
             $errorMsg .= "Filter Mode: {$filterMode}\n";
             if (!empty($emailDomains)) {
                 $errorMsg .= "Target Domains: " . implode(', ', $emailDomains) . "\n";
             }
             $errorMsg .= "Workers Used: {$workers}\n";
             $errorMsg .= "API Calls Made: {$attempts}\n\n";
+            
+            // Special case: if attempts is 0, provide specific guidance
+            if ($attempts === 0) {
+                $errorMsg .= "⚠️ CRITICAL: No API calls were made! This means the extraction loop never started.\n\n";
+                $errorMsg .= "=== MOST LIKELY CAUSE ===\n";
+                if ($rawTargetCount <= 0) {
+                    $errorMsg .= "✗ Profile 'Target Email Count' was {$rawTargetCount} (invalid - must be at least 1)\n";
+                    $errorMsg .= "  → The system adjusted it to {$targetCount}, but the profile should be updated\n";
+                    $errorMsg .= "  → Edit the profile and set 'Target Email Count' to a valid number (e.g., 100)\n\n";
+                } else {
+                    $errorMsg .= "The extraction loop failed to start. This is unusual.\n";
+                    $errorMsg .= "Check the server error.log for messages starting with 'PARALLEL_EXTRACTION:'\n\n";
+                }
+            }
             
             $errorMsg .= "=== POSSIBLE REASONS ===\n";
             $errorMsg .= "1. The search query returns no results with email addresses\n";
