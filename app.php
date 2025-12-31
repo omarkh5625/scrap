@@ -4443,7 +4443,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'campaign_stats' && isset($_GET['i
 ///////////////////////
 //  ACTIONS
 ///////////////////////
-$action = $_POST['action'] ?? null;
+// Check both POST and GET for action parameter (API endpoints use GET, forms use POST)
+$action = $_POST['action'] ?? $_GET['action'] ?? null;
 $page   = $_GET['page'] ?? 'list';
 
 if ($action === 'check_connection_profile') {
@@ -5430,6 +5431,7 @@ if ($action === 'save_rotation') {
 }
 
 // Test API Connection Action
+// Handles requests from frontend 'Test Connection' button
 if ($action === 'test_connection') {
     // Completely suppress all output/errors before JSON
     @ini_set('display_errors', 0);
@@ -5442,9 +5444,10 @@ if ($action === 'test_connection') {
     header('Content-Type: application/json; charset=utf-8');
     
     try {
-        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : 0;
-        $api_key = trim($_POST['api_key'] ?? '');
-        $search_query = trim($_POST['search_query'] ?? '');
+        // Accept parameters from both POST (direct API calls) and GET (profile list)
+        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : (isset($_GET['profile_id']) ? (int)$_GET['profile_id'] : 0);
+        $api_key = trim($_POST['api_key'] ?? $_GET['api_key'] ?? '');
+        $search_query = trim($_POST['search_query'] ?? $_GET['search_query'] ?? '');
         
         // If profile_id provided, fetch from database
         if ($profile_id > 0) {
