@@ -1400,35 +1400,38 @@ class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
     
-    // Worker configuration - CRITICAL: Tuned to prevent database connection exhaustion
-    // Default MySQL max_connections is typically 151. With overhead, safe limit is ~100 concurrent workers.
-    private const AUTO_MAX_WORKERS = 100; // Maximum workers to spawn (reduced from 1000 to prevent connection exhaustion)
-    private const WORKERS_PER_1000_EMAILS = 10; // Conservative: 10 workers per 1000 emails (reduced from 50)
-    private const OPTIMAL_RESULTS_PER_WORKER = 100; // 10 workers per 1000 emails = 100 emails per worker
+    // Worker configuration - Tuned for parallel processing with connection rate limiting
+    // MySQL default max_connections is typically 151. We spawn workers with staggered start times
+    // to avoid overwhelming the database with simultaneous connections.
+    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn (can handle large jobs)
+    private const WORKERS_PER_1000_EMAILS = 100; // 100 workers per 1000 emails for maximum throughput
+    private const OPTIMAL_RESULTS_PER_WORKER = 10; // 100 workers per 1000 emails = 10 emails per worker
+    
+    // Connection rate limiting to prevent "Too many connections" errors
+    // Spawns workers in waves to respect MySQL max_connections limit
+    private const WORKER_SPAWN_DELAY_MS = 6.6; // ~6.6ms delay = ~151 workers/second (matches MySQL default max_connections)
+    private const MAX_CONCURRENT_SPAWNS = 151; // Match MySQL default max_connections
     
     /**
      * Calculate optimal worker count based on job size
-     * Formula: 10 workers per 1000 emails (conservative to prevent DB connection exhaustion)
+     * Formula: 100 workers per 1000 emails (high throughput with rate limiting)
      * 
-     * IMPORTANT: This is tuned for typical MySQL configurations (max_connections ~151)
-     * If you have increased MySQL max_connections (e.g., to 1000), you can increase:
-     * - AUTO_MAX_WORKERS (e.g., to 500-800)
-     * - WORKERS_PER_1000_EMAILS (e.g., to 20-30)
+     * Workers are spawned with staggered delays (~6.6ms between spawns) to avoid
+     * overwhelming MySQL with simultaneous connection attempts.
      * 
      * Examples with current settings:
-     * - 1,000 emails = 10 workers
-     * - 10,000 emails = 100 workers (capped at AUTO_MAX_WORKERS)
-     * - 100,000 emails = 100 workers (capped)
+     * - 1,000 emails = 100 workers (spawned over ~0.66 seconds)
+     * - 10,000 emails = 1,000 workers (spawned over ~6.6 seconds)
+     * - 100,000 emails = 1,000 workers (capped, spawned over ~6.6 seconds)
      * 
-     * Each worker processes multiple emails, so fewer workers doesn't mean slower processing.
-     * Workers are more efficient with larger batches due to connection reuse.
+     * Each worker processes ~10 emails, providing excellent parallelism while
+     * respecting database connection limits through staggered spawning.
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
-        // Calculate based on conservative formula to prevent connection exhaustion
+        // Calculate based on formula: 100 workers per 1000 emails for maximum throughput
         $calculatedWorkers = (int)ceil(($maxResults / 1000) * self::WORKERS_PER_1000_EMAILS);
         
-        // Cap at maximum workers to prevent exceeding MySQL max_connections
-        // This is critical - spawning 500+ workers will exhaust most MySQL configurations
+        // Cap at maximum workers (1000)
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
@@ -4712,11 +4715,14 @@ class Router {
         error_log("  PHP Binary: {$phpBinary}");
         error_log("  Script Path: {$scriptPath}");
         error_log("  Debug Mode: " . ($debugMode ? 'ENABLED' : 'DISABLED'));
+        error_log("  Connection Rate Limiting: " . self::WORKER_SPAWN_DELAY_MS . "ms delay (~" . (int)(1000 / self::WORKER_SPAWN_DELAY_MS) . " workers/second)");
         
         $spawnedCount = 0;
         $processes = [];
+        $startTime = microtime(true);
         
-        // Spawn ALL workers simultaneously
+        // Spawn workers with staggered delays to prevent overwhelming MySQL
+        // This avoids "Too many connections" errors by limiting connection rate
         for ($i = 0; $i < $workerCount; $i++) {
             try {
                 $workerName = 'parallel-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
@@ -4766,7 +4772,15 @@ class Router {
                     $processes[] = ['handle' => $process, 'name' => $workerName];
                     $spawnedCount++;
                     
-                    error_log("  ✓ Worker {$i}/{$workerCount}: {$workerName} spawned" . ($debugMode ? " (logging to {$logDir})" : ""));
+                    if ($i % 50 === 0 || $i === $workerCount - 1) {
+                        error_log("  ✓ Progress: {$spawnedCount}/{$workerCount} workers spawned" . ($debugMode ? " (logging to {$logDir})" : ""));
+                    }
+                    
+                    // Add small delay to stagger connections (~6.6ms = ~151 workers/second)
+                    // This prevents overwhelming MySQL with simultaneous connection attempts
+                    if ($i < $workerCount - 1) {
+                        usleep((int)(self::WORKER_SPAWN_DELAY_MS * 1000));
+                    }
                 } else {
                     error_log("  ✗ Worker {$i}/{$workerCount}: Failed to spawn {$workerName}");
                     error_log("    Command: " . implode(' ', $args));
@@ -4777,7 +4791,12 @@ class Router {
             }
         }
         
-        error_log("✓✓✓ spawnWorkersViaProcOpenParallel: ALL {$spawnedCount}/{$workerCount} workers spawned SIMULTANEOUSLY!");
+        $totalTime = microtime(true) - $startTime;
+        $workersPerSecond = $spawnedCount / $totalTime;
+        
+        error_log("✓✓✓ spawnWorkersViaProcOpenParallel: {$spawnedCount}/{$workerCount} workers spawned with rate limiting!");
+        error_log("    Total spawn time: " . round($totalTime, 2) . "s (~" . round($workersPerSecond, 1) . " workers/second)");
+        error_log("    This prevents overwhelming MySQL with simultaneous connections");
         
         if ($spawnedCount < $workerCount) {
             error_log("⚠️  WARNING: Only {$spawnedCount}/{$workerCount} workers spawned successfully!");

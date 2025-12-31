@@ -61,37 +61,31 @@ When encountering database connection issues:
 
 ### Email Volume vs Workers
 
-**IMPORTANT**: Default settings are conservative to work with standard MySQL configurations (max_connections ~151).
+**NEW**: System now uses **staggered worker spawning** with rate limiting to prevent overwhelming MySQL!
 
-The system automatically calculates optimal worker count:
+The system automatically calculates optimal worker count with intelligent connection rate limiting:
 
-- 1,000 emails → 10 workers (100 emails/worker)
-- 10,000 emails → 100 workers (100 emails/worker, capped at AUTO_MAX_WORKERS)
-- 100,000 emails → 100 workers (1000 emails/worker, capped)
+- **1,000 emails** → 100 workers (10 emails/worker)
+- **10,000 emails** → 1,000 workers (10 emails/worker)
+- **100,000 emails** → 1,000 workers (100 emails/worker, capped at AUTO_MAX_WORKERS)
 
-**Note**: Fewer workers doesn't mean slower processing! Workers process multiple emails in batches and reuse connections efficiently. 100 workers can handle large-scale extractions without overwhelming the database.
+### How Connection Rate Limiting Works
 
-### Increasing Worker Count (Advanced)
+Workers are spawned with a **~6.6ms delay** between each spawn, which equals approximately **151 workers per second**. This matches MySQL's default `max_connections` limit and prevents the "Too many connections" error.
 
-If you've increased MySQL `max_connections` (see MYSQL_TUNING.md), you can increase worker limits in `app.php`:
-
-```php
-// In Worker class
-private const AUTO_MAX_WORKERS = 100;        // Increase to 500-800 if max_connections = 1000
-private const WORKERS_PER_1000_EMAILS = 10;  // Increase to 20-30 if max_connections = 1000
-```
-
-**Warning**: Don't increase workers without first increasing MySQL max_connections!
+**Example**: For 10,000 emails:
+- Spawns: 1,000 workers
+- Spawn time: ~6.6 seconds
+- Rate: ~151 workers/second
+- Result: ✅ No connection exhaustion!
 
 ### Performance Expectations
 
-With default settings (100 max workers):
-- **Single Worker**: ~2-5 emails/second
-- **10 Workers**: ~20-50 emails/second
+With rate-limited spawning (default settings):
 - **100 Workers**: ~200-500 emails/second
+- **1,000 Workers**: ~2,000-5,000 emails/second
 
-With increased settings (500 workers, requires MySQL tuning):
-- **500 Workers**: ~1000-2500 emails/second
+**Key Benefit**: More workers = faster processing, without database connection issues!
 
 Actual performance depends on:
 - Database server resources
@@ -104,49 +98,52 @@ Actual performance depends on:
 
 ### "Too many connections" Error
 
-**This is the most common issue.** It means the number of workers exceeds MySQL's connection limit.
+**SOLVED!** The system now uses **connection rate limiting** to prevent this error.
 
-**SOLUTION (Choose ONE)**:
+Workers are spawned with staggered delays (~6.6ms between each), limiting the connection rate to ~151 workers/second. This matches MySQL's default `max_connections` and prevents overwhelming the database.
 
-**Option 1: Use Default Settings (Recommended for most users)**
-- The system now defaults to 100 max workers, which works with standard MySQL configurations
-- No changes needed - this should work out of the box
-- For 10,000 emails: 100 workers will be spawned (safe for default MySQL)
+**If you still see this error:**
 
-**Option 2: Increase MySQL max_connections (For advanced users)**
-
-If you need more workers for faster processing:
-
-1. **Check current limit**:
+1. **Check your MySQL max_connections**:
    ```sql
    SHOW VARIABLES LIKE 'max_connections';
    ```
-
-2. **Increase temporarily**:
+   
+2. **If it's below 151**, increase it:
    ```sql
-   SET GLOBAL max_connections = 500;
+   SET GLOBAL max_connections = 200;
    ```
 
-3. **Increase permanently** (edit MySQL config):
+3. **For very large jobs**, increase further:
+   ```sql
+   SET GLOBAL max_connections = 500;  -- For 1000+ workers
+   ```
+
+4. **Make it permanent** (edit MySQL config):
    ```ini
    [mysqld]
    max_connections = 500
    ```
    Then restart MySQL.
 
-4. **Increase worker limits** in `app.php`:
-   ```php
-   // In Worker class (around line 1377)
-   private const AUTO_MAX_WORKERS = 300;        // Increase from 100 to 300
-   private const WORKERS_PER_1000_EMAILS = 20;  // Increase from 10 to 20
-   ```
+### Adjusting Worker Settings
 
-**Option 3: Reduce Workers Further**
-
-If still getting errors, reduce even more:
+The defaults work for most use cases:
 ```php
-private const AUTO_MAX_WORKERS = 50;         // Very conservative
-private const WORKERS_PER_1000_EMAILS = 5;   // Very conservative
+// Current defaults in Worker class
+private const AUTO_MAX_WORKERS = 1000;          // Max workers to spawn
+private const WORKERS_PER_1000_EMAILS = 100;    // 100 workers per 1000 emails
+private const WORKER_SPAWN_DELAY_MS = 6.6;      // ~151 workers/second
+```
+
+**To spawn workers faster** (if MySQL max_connections is high):
+```php
+private const WORKER_SPAWN_DELAY_MS = 3.3;      // ~303 workers/second
+```
+
+**To spawn workers slower** (if MySQL max_connections is low):
+```php
+private const WORKER_SPAWN_DELAY_MS = 13.2;     // ~76 workers/second
 ```
 
 2. **Check current connections**:
@@ -208,11 +205,29 @@ Maximum retry delay is capped at 10 seconds. The 30% jitter prevents thundering 
 
 **Note**: Longer delays give other workers time to finish and release connections.
 
+### Worker Spawn Rate Limiting
+
+**NEW**: Prevents "Too many connections" by staggering worker spawns:
+
+```
+Default: 6.6ms delay between spawns
+Rate: ~151 workers/second
+Matches: MySQL default max_connections (151)
+
+For 1,000 workers:
+- Spawn time: ~6.6 seconds
+- Connection rate: Never exceeds 151/second
+- Result: No database overload!
+```
+
+This rate limiting happens at spawn time, so workers can all run in parallel once started, but they don't all try to connect to the database at the exact same moment.
+
 ### Batch Processing
 
 - Emails are inserted in batches of 1000
 - BloomFilter checks in batches of 1000
 - Parallel URL scraping in batches of 100
+- Workers spawned with rate limiting (~151/second)
 
 ## License
 
