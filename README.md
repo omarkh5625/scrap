@@ -2,6 +2,8 @@
 
 A professional single-file PHP system for real-time, multi-job email extraction using the Serper Google Search API. Designed for cPanel environments with 24/7 continuous operation capability.
 
+> **Note**: This implementation provides a complete architectural framework with all necessary modules (JobManager, WorkerGovernor, EmailValidator, etc.) and a professional UI. The worker processes currently run in simulation mode for demonstration purposes. See the "Integrating Actual Email Extraction" section below for implementation guidelines.
+
 ![Email Extraction System UI](https://github.com/user-attachments/assets/08b21614-8f4a-443c-8560-800b9fceddb8)
 
 ## Features
@@ -258,6 +260,62 @@ php -S localhost:8080 app.php
 # Run in CLI mode with debug output
 php app.php
 ```
+
+### Integrating Actual Email Extraction
+
+The current implementation provides a complete framework with simulation workers. To integrate actual email extraction:
+
+1. **Update Worker Script** (in `WorkerGovernor::generateWorkerScript()`):
+   ```php
+   // Replace the simulation loop with:
+   $scheduler = new SearchScheduler($config['api_key']);
+   $domainLimiter = new DomainLimiter();
+   $dedupEngine = new DedupEngine();
+   
+   // Perform search
+   $results = $scheduler->search($config['query']);
+   
+   foreach ($results as $result) {
+       if (!URLFilter::isValid($result['url'])) continue;
+       
+       $domain = URLFilter::extractDomain($result['url']);
+       if (!$domainLimiter->canAccess($domain)) {
+           sleep(2); // Wait for throttle
+           continue;
+       }
+       
+       // Fetch page content
+       $content = file_get_contents($result['url']);
+       $domainLimiter->recordAccess($domain);
+       
+       // Extract and validate emails
+       $emails = ContentFilter::extractEmails($content);
+       foreach ($emails as $email) {
+           if (!EmailValidator::validateWithMX($email)) continue;
+           if ($dedupEngine->isDuplicate($email)) continue;
+           
+           $context = ContentFilter::analyzeContext($content, $email);
+           $confidence = ConfidenceScorer::score($email, $context);
+           
+           if ($confidence >= Config::CONFIDENCE_THRESHOLD) {
+               $dedupEngine->add($email);
+               // Output email found
+               echo json_encode([
+                   'type' => 'email_found',
+                   'email' => $email,
+                   'confidence' => $confidence
+               ]) . "\n";
+               flush();
+           }
+       }
+   }
+   ```
+
+2. **Copy Required Classes**: Since workers run in separate processes, copy the necessary class definitions (EmailValidator, ContentFilter, etc.) into the worker script template.
+
+3. **Handle API Rate Limits**: Implement proper error handling for HTTP 429 responses and trigger domain backoffs.
+
+4. **Store Results**: Update the worker output handler to save extracted emails to a database or file.
 
 ### Adding Custom Modules
 The system is designed to be extensible. Add new modules as classes and integrate them into the `JobManager` or `WorkerGovernor` as needed.

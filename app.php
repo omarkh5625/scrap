@@ -476,13 +476,27 @@ class WorkerGovernor {
         $configJson = base64_encode(json_encode($config));
         $workerIdSafe = preg_replace('/[^a-zA-Z0-9_-]/', '', $workerId);
         
+        // NOTE: This is a simulation worker for demonstration purposes.
+        // In production, replace this with actual email extraction logic that:
+        // 1. Uses the SearchScheduler to query Serper API with $config['query']
+        // 2. Processes each search result URL with URLFilter
+        // 3. Fetches webpage content and uses ContentFilter::extractEmails()
+        // 4. Validates emails with EmailValidator::validateWithMX()
+        // 5. Scores emails with ConfidenceScorer::score()
+        // 6. Deduplicates with DedupEngine and buffers with BufferManager
+        // 7. Respects DomainLimiter throttling rules
+        //
+        // The worker should receive: api_key, query, job_id, max_emails, options
+        // See README.md for integration guidelines.
+        
         return <<<'PHP'
 <?php
-// Worker Process
+// Worker Process - SIMULATION MODE
+// TODO: Integrate actual email extraction logic here
 $config = json_decode(base64_decode('{CONFIG_B64}'), true);
 $workerId = '{WORKER_ID}';
 
-// Simulate worker doing work
+// Simulate worker doing work (Replace with actual implementation)
 $startTime = time();
 $maxRunTime = $config['max_run_time'] ?? 300;
 
@@ -491,10 +505,10 @@ while ((time() - $startTime) < $maxRunTime) {
     echo json_encode(['type' => 'heartbeat', 'worker_id' => $workerId, 'time' => time()]) . "\n";
     flush();
     
-    // Simulate work
+    // Simulate work (Replace with actual Serper API calls and email extraction)
     sleep(5);
     
-    // Simulate finding emails
+    // Simulate finding emails (Replace with actual extraction results)
     $found = rand(0, 3);
     if ($found > 0) {
         echo json_encode([
@@ -708,14 +722,28 @@ class JobManager {
             throw new Exception("Job already running: {$jobId}");
         }
         
-        // Initialize worker governor
+        // Initialize worker governor with job configuration
+        $workerConfig = [
+            'job_id' => $jobId,
+            'api_key' => $job['api_key'],
+            'query' => $job['query'],
+            'max_emails' => $job['options']['max_emails'] ?? 10000,
+            'max_run_time' => 300
+        ];
         $governor = new WorkerGovernor($jobId);
         $job['worker_governor'] = $governor;
         $job['status'] = 'running';
         $job['started_at'] = time();
         
-        // Spawn initial workers
-        $governor->scaleUp(Config::MIN_WORKERS_PER_JOB);
+        // Spawn initial workers with full configuration
+        for ($i = 0; $i < Config::MIN_WORKERS_PER_JOB; $i++) {
+            $workerId = Utils::generateId('worker_');
+            try {
+                $governor->spawnWorker($workerId, $workerConfig);
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to spawn worker: {$e->getMessage()}");
+            }
+        }
         
         $this->saveJob($jobId);
         
