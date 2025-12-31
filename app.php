@@ -255,6 +255,119 @@ if (PHP_SAPI === 'cli' && isset($argv) && count($argv) > 1) {
     }
 }
 
+///////////////////////
+//  EARLY API HANDLERS (before session)
+///////////////////////
+// Handle test_connection API endpoint early to avoid session/auth overhead
+// This must run before session_start() to prevent any output buffering issues
+if (isset($_GET['action']) && $_GET['action'] === 'test_connection') {
+    // Completely suppress all output/errors before JSON
+    @ini_set('display_errors', 0);
+    @error_reporting(0);
+    
+    // Clear ALL output buffers that might exist
+    while (ob_get_level()) @ob_end_clean();
+    @ob_start();
+    
+    header('Content-Type: application/json; charset=utf-8');
+    
+    try {
+        // Accept parameters from both POST (direct API calls) and GET (profile list)
+        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : (isset($_GET['profile_id']) ? (int)$_GET['profile_id'] : 0);
+        $api_key = trim($_POST['api_key'] ?? $_GET['api_key'] ?? '');
+        $search_query = trim($_POST['search_query'] ?? $_GET['search_query'] ?? '');
+        
+        // If profile_id provided, fetch from database
+        if ($profile_id > 0 && $pdo !== null) {
+            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
+            $stmt->execute([$profile_id]);
+            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($profile) {
+                $api_key = $profile['api_key'];
+                $search_query = $profile['search_query'];
+            }
+        }
+        
+        if (empty($api_key)) {
+            @ob_end_clean();
+            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        if (empty($search_query)) {
+            @ob_end_clean();
+            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // Test API call
+        $start_time = microtime(true);
+        $ch = curl_init('https://google.serper.dev/search');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'X-API-KEY: ' . $api_key,
+            'Content-Type: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+            'q' => $search_query,
+            'num' => 10
+        ]));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+        
+        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
+        
+        if ($curl_error) {
+            @ob_end_clean();
+            echo json_encode([
+                'success' => false,
+                'error' => 'Connection error: ' . $curl_error,
+                'http_code' => 0,
+                'elapsed_ms' => $elapsed_time
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $response_preview = substr($response, 0, 500);
+        
+        if ($http_code === 200) {
+            $data = json_decode($response, true);
+            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
+            
+            @ob_end_clean();
+            echo json_encode([
+                'success' => true,
+                'message' => '✓ Connection successful!',
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'result_count' => $result_count,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        } else {
+            @ob_end_clean();
+            echo json_encode([
+                'success' => false,
+                'error' => 'API returned HTTP ' . $http_code,
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    } catch (Exception $e) {
+        @ob_end_clean();
+        echo json_encode([
+            'success' => false,
+            'error' => 'Internal error: ' . $e->getMessage()
+        ], JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
 session_start();
 
 ///////////////////////
@@ -5430,115 +5543,6 @@ if ($action === 'save_rotation') {
     exit;
 }
 
-// Test API Connection Action
-// Handles requests from frontend 'Test Connection' button
-if ($action === 'test_connection') {
-    // Completely suppress all output/errors before JSON
-    @ini_set('display_errors', 0);
-    @error_reporting(0);
-    
-    // Clear ALL output buffers
-    while (ob_get_level()) @ob_end_clean();
-    @ob_start();
-    
-    header('Content-Type: application/json; charset=utf-8');
-    
-    try {
-        // Accept parameters from both POST (direct API calls) and GET (profile list)
-        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : (isset($_GET['profile_id']) ? (int)$_GET['profile_id'] : 0);
-        $api_key = trim($_POST['api_key'] ?? $_GET['api_key'] ?? '');
-        $search_query = trim($_POST['search_query'] ?? $_GET['search_query'] ?? '');
-        
-        // If profile_id provided, fetch from database
-        if ($profile_id > 0) {
-            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
-            $stmt->execute([$profile_id]);
-            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($profile) {
-                $api_key = $profile['api_key'];
-                $search_query = $profile['search_query'];
-            }
-        }
-        
-        if (empty($api_key)) {
-            @ob_end_clean();
-            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        if (empty($search_query)) {
-            @ob_end_clean();
-            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        // Test API call
-        $start_time = microtime(true);
-        $ch = curl_init('https://google.serper.dev/search');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'X-API-KEY: ' . $api_key,
-            'Content-Type: application/json'
-        ]);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
-            'q' => $search_query,
-            'num' => 10
-        ]));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        
-        $response = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curl_error = curl_error($ch);
-        curl_close($ch);
-        
-        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
-        
-        if ($curl_error) {
-            @ob_end_clean();
-            echo json_encode([
-                'success' => false,
-                'error' => 'Connection error: ' . $curl_error,
-                'http_code' => 0,
-                'elapsed_ms' => $elapsed_time
-            ], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        $response_preview = substr($response, 0, 500);
-        
-        if ($http_code === 200) {
-            $data = json_decode($response, true);
-            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
-            
-            @ob_end_clean();
-            echo json_encode([
-                'success' => true,
-                'message' => '✓ Connection successful!',
-                'http_code' => $http_code,
-                'elapsed_ms' => $elapsed_time,
-                'result_count' => $result_count,
-                'response_preview' => $response_preview
-            ], JSON_UNESCAPED_UNICODE);
-        } else {
-            @ob_end_clean();
-            echo json_encode([
-                'success' => false,
-                'error' => 'API returned HTTP ' . $http_code,
-                'http_code' => $http_code,
-                'elapsed_ms' => $elapsed_time,
-                'response_preview' => $response_preview
-            ], JSON_UNESCAPED_UNICODE);
-        }
-    } catch (Exception $e) {
-        @ob_end_clean();
-        echo json_encode([
-            'success' => false,
-            'error' => 'Internal error: ' . $e->getMessage()
-        ], JSON_UNESCAPED_UNICODE);
-    }
-    exit;
-}
 
 if ($action === 'save_profile') {
     $profile_id   = (int)($_POST['profile_id'] ?? 0);
@@ -8259,7 +8263,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               headers: {'Content-Type': 'application/x-www-form-urlencoded'},
               body: 'api_key=' + encodeURIComponent(apiKey) + '&search_query=' + encodeURIComponent(searchQuery)
             })
-            .then(r => r.json())
+            .then(r => {
+              // Check if response is OK and is JSON
+              if (!r.ok) {
+                throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+              }
+              const contentType = r.headers.get('content-type');
+              if (!contentType || !contentType.includes('application/json')) {
+                // Response is not JSON, likely an error page
+                return r.text().then(text => {
+                  throw new Error('Server returned non-JSON response. Check server logs for errors.');
+                });
+              }
+              return r.json();
+            })
             .then(data => {
               testBtn.disabled = false;
               testBtn.innerHTML = '🔌 Test Connection';
@@ -8315,7 +8332,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
           headers: {'Content-Type': 'application/x-www-form-urlencoded'},
           body: 'profile_id=' + profileId
         })
-        .then(r => r.json())
+        .then(r => {
+          // Check if response is OK and is JSON
+          if (!r.ok) {
+            throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+          }
+          const contentType = r.headers.get('content-type');
+          if (!contentType || !contentType.includes('application/json')) {
+            // Response is not JSON, likely an error page
+            return r.text().then(text => {
+              throw new Error('Server returned non-JSON response. Check server logs for errors.');
+            });
+          }
+          return r.json();
+        })
         .then(data => {
           if (data.success) {
             statusDiv.style.background = '#f0fdf4';
