@@ -1765,7 +1765,8 @@ class Worker {
     public static function processJob(int $jobId, ?int $existingWorkerId = null, ?string $existingWorkerName = null): void {
         $workerStartTime = microtime(true);
         $processId = getmypid();
-        error_log("✓ Worker processJob STARTED in parallel: jobId={$jobId}, PID={$processId} at " . date('H:i:s.') . substr((string)microtime(true), -3));
+        $timestamp = date('H:i:s') . '.' . sprintf('%03d', (int)(fmod(microtime(true), 1) * 1000));
+        error_log("✓ Worker processJob STARTED in parallel: jobId={$jobId}, PID={$processId} at {$timestamp}");
         
         $job = Job::getById($jobId);
         if (!$job) {
@@ -1843,8 +1844,9 @@ class Worker {
         self::updateJobProgress($jobId);
         
         $elapsedTime = round(microtime(true) - $workerStartTime, 2);
+        // Use realistic minimum for rate calculation (1 second minimum for email processing)
         echo "Job chunk completed! Processed {$processed} emails in {$elapsedTime}s\n";
-        error_log("✓ Worker processJob COMPLETED in parallel: jobId={$jobId}, PID={$processId}, emails={$processed}, time={$elapsedTime}s, rate=" . round($processed / max($elapsedTime, 0.01), 1) . " emails/s");
+        error_log("✓ Worker processJob COMPLETED in parallel: jobId={$jobId}, PID={$processId}, emails={$processed}, time={$elapsedTime}s, rate=" . round($processed / max($elapsedTime, 1.0), 1) . " emails/s");
         
         // Mark worker as idle
         self::updateHeartbeat($workerId, 'idle', null, 0, 0);
@@ -1929,7 +1931,8 @@ class Worker {
     
     public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
         $workerStartTime = microtime(true);
-        error_log("✓ processJobImmediately STARTED in parallel: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults} at " . date('H:i:s.') . substr((string)microtime(true), -3));
+        $timestamp = date('H:i:s') . '.' . sprintf('%03d', (int)(fmod(microtime(true), 1) * 1000));
+        error_log("✓ processJobImmediately STARTED in parallel: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults} at {$timestamp}");
         
         try {
             $job = Job::getById($jobId);
@@ -2166,6 +2169,9 @@ class Router {
         // Can be configured via settings for fine-tuning based on system load
         $pollingIntervalSetting = Settings::get('worker_polling_interval', '0.1');
         
+        // Define minimum allowed polling interval as constant
+        $minPollingInterval = 0.05; // 50ms minimum to prevent excessive CPU usage
+        
         // Validate and parse polling interval with safety bounds
         if (!is_numeric($pollingIntervalSetting)) {
             error_log("Warning: Invalid worker_polling_interval '{$pollingIntervalSetting}', using default 0.1s");
@@ -2173,9 +2179,9 @@ class Router {
         } else {
             $pollingInterval = (float)$pollingIntervalSetting;
             // Enforce reasonable bounds to prevent misconfiguration
-            if ($pollingInterval < 0.05) {
-                error_log("Warning: Polling interval {$pollingInterval}s too low, using minimum 0.05s (50ms)");
-                $pollingInterval = 0.05; // Minimum 50ms to prevent excessive CPU usage
+            if ($pollingInterval < $minPollingInterval) {
+                error_log("Warning: Polling interval {$pollingInterval}s too low, using minimum {$minPollingInterval}s");
+                $pollingInterval = $minPollingInterval;
             }
             if ($pollingInterval > 5.0) {
                 error_log("Warning: Polling interval {$pollingInterval}s too high, using maximum 5.0s");
@@ -2197,10 +2203,10 @@ class Router {
             $elapsedTime = microtime(true) - $workerStartTime;
             // Calculate based on actual polling interval (converts to integer checks)
             // Cap at reasonable maximum to prevent excessive idle time
-            // Example: 0.05s polling → 300/0.05 = 6000 checks (5 minutes)
-            //          0.1s polling → 300/0.1 = 3000 checks (5 minutes)
-            //          5s polling → 300/5 = 60 checks (5 minutes)
-            $maxIdleChecks = min((int)($maxIdleTime / $pollingInterval), 10000); // Cap at 10k checks
+            // Protection against division by zero (should not happen due to validation)
+            $maxIdleChecks = $pollingInterval > 0 
+                ? min((int)($maxIdleTime / $pollingInterval), 10000) 
+                : 10000; // Fallback if polling interval is invalid
             if ($emptyPollCount > $maxIdleChecks && $jobsProcessed === 0) {
                 echo "Worker idle timeout ({$maxIdleTime}s) - no jobs found. Exiting.\n";
                 error_log("Worker {$workerName} exiting due to idle timeout after " . round($elapsedTime, 1) . "s");
@@ -2241,7 +2247,8 @@ class Router {
             } else {
                 // Active processing: use configured polling interval for near-instant parallel pickup
                 // Convert to microseconds with minimum of 1000 (1ms) to ensure actual sleep
-                $sleepMicros = max(1000, (int)($pollingInterval * 1000000));
+                // Use round() to preserve precision for fractional intervals
+                $sleepMicros = max(1000, (int)round($pollingInterval * 1000000));
                 usleep($sleepMicros);
             }
         }
@@ -4186,8 +4193,8 @@ class Router {
         }
         
         $elapsedTime = round(microtime(true) - $startTime, 3);
-        // Use reasonable minimum for rate calculation (10ms minimum spawn time is realistic)
-        $workersPerSecond = $spawnedCount > 0 ? round($spawnedCount / max($elapsedTime, 0.01), 1) : 0;
+        // Use realistic minimum for rate calculation (100ms minimum - spawning 10+ workers takes time)
+        $workersPerSecond = $spawnedCount > 0 ? round($spawnedCount / max($elapsedTime, 0.1), 1) : 0;
         
         error_log("spawnWorkersViaProcOpen: ✓ Successfully spawned {$spawnedCount}/{$workerCount} workers in {$elapsedTime}s ({$workersPerSecond} workers/sec) - ALL RUNNING IN PARALLEL");
         
