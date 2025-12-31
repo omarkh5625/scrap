@@ -4570,9 +4570,10 @@ if ($action === 'duplicate_job' || $action === 'duplicate_campaign') {
             $orig = get_job($pdo, $jid);
             if ($orig) {
                 $newName = $orig['name'] . ' (Copy)';
+                // Create new job with clean state - no timestamps, no progress, no errors
                 $stmt = $pdo->prepare("
-                    INSERT INTO jobs (name, profile_id, target_count, status)
-                    VALUES (?, ?, ?, 'draft')
+                    INSERT INTO jobs (name, profile_id, target_count, status, progress_status, progress_extracted, progress_total, started_at, completed_at, error_message)
+                    VALUES (?, ?, ?, 'draft', NULL, 0, 0, NULL, NULL, NULL)
                 ");
                 $stmt->execute([
                     $newName,
