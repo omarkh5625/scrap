@@ -5041,18 +5041,9 @@ if ($action === 'save_job' || $action === 'save_campaign') {
         
         // Check if should start immediately
         if ($start_immediately) {
-            error_log("SAVE_JOB ACTION: start_immediately flag detected, auto-submitting to start_job action");
-            // Auto-submit form to start_job action in hidden iframe (no visible intermediate page)
-            echo '<iframe name="hiddenFrame" style="display:none;"></iframe>';
-            echo '<form id="startForm" method="POST" action="?page=list" target="hiddenFrame">';
-            echo '<input type="hidden" name="action" value="start_job">';
-            echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
-            echo '</form>';
-            echo '<script>';
-            echo 'console.log("SAVE_JOB: Auto-submitting start_job form for job_id=' . (int)$id . '");';
-            echo 'document.getElementById("startForm").submit();';
-            echo 'setTimeout(function() { window.location.href = "?page=list"; }, 500);';
-            echo '</script>';
+            error_log("SAVE_JOB ACTION: start_immediately flag detected, redirecting to start_job");
+            // Redirect to start_job action directly (more reliable than iframe)
+            header("Location: ?action=start_job&job_id=" . (int)$id);
             exit;
         } else {
             error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
