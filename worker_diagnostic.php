@@ -123,6 +123,51 @@ echo "\n";
 
 // Test worker spawn
 echo "=== Test Worker Spawn ===\n";
+
+// Detect correct PHP CLI binary
+$phpBinary = PHP_BINARY;
+$phpBinaryWorks = false;
+
+// Check if PHP_BINARY is actually a CLI binary (not FPM)
+if (strpos($phpBinary, 'php-fpm') !== false || strpos($phpBinary, 'fpm') !== false) {
+    echo "  ⚠️  PHP_BINARY points to FPM: {$phpBinary}\n";
+    echo "  ℹ️  Searching for CLI PHP binary...\n";
+    
+    // Common CLI PHP binary locations
+    $possiblePaths = [
+        '/usr/bin/php',
+        '/usr/local/bin/php',
+        dirname($phpBinary) . '/php',  // Same directory as FPM
+        str_replace('php-fpm', 'php', $phpBinary),  // Replace fpm with cli
+        str_replace('/sbin/', '/bin/', $phpBinary),  // sbin to bin
+    ];
+    
+    // Also check for version-specific binaries
+    $version = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+    $possiblePaths[] = "/usr/bin/php{$version}";
+    $possiblePaths[] = "/opt/cpanel/ea-php" . str_replace('.', '', $version) . "/root/usr/bin/php";
+    
+    foreach ($possiblePaths as $path) {
+        if (file_exists($path) && is_executable($path)) {
+            // Test if it's actually a CLI binary
+            $output = [];
+            $return = 0;
+            @exec($path . ' -v 2>&1', $output, $return);
+            if ($return === 0 && !empty($output)) {
+                $phpBinary = $path;
+                echo "  ✓ Found CLI PHP binary: {$phpBinary}\n";
+                break;
+            }
+        }
+    }
+    
+    if (strpos($phpBinary, 'php-fpm') !== false) {
+        echo "  ✗ Could not find CLI PHP binary\n";
+        echo "  ℹ️  Workers may not start properly with FPM binary\n";
+        echo "  💡 Contact your hosting provider for the correct PHP CLI path\n";
+    }
+}
+
 if (function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))))) {
     $testScript = $currentDir . '/test_worker_spawn.php';
     file_put_contents($testScript, '<?php
@@ -138,12 +183,12 @@ exit(0);
         2 => ['file', $nullDevice, 'w']
     ];
     
-    $process = proc_open([PHP_BINARY, $testScript], $descriptors, $pipes);
+    $process = proc_open([$phpBinary, $testScript], $descriptors, $pipes);
     if (is_resource($process)) {
         if (isset($pipes[0])) {
             fclose($pipes[0]);
         }
-        echo "  proc_open: ✓ Test worker spawned\n";
+        echo "  proc_open: ✓ Test worker spawned with: {$phpBinary}\n";
         sleep(1);
         proc_close($process);
         
@@ -151,8 +196,17 @@ exit(0);
         if (file_exists($spawnLog)) {
             echo "  Worker execution: ✓ Worker ran successfully\n";
             unlink($spawnLog);
+            $phpBinaryWorks = true;
         } else {
             echo "  Worker execution: ✗ Worker did not write log\n";
+            echo "  ⚠️  PHP binary '{$phpBinary}' may not work for CLI execution\n";
+            
+            // If using FPM, this is expected
+            if (strpos($phpBinary, 'php-fpm') !== false) {
+                echo "  💡 SOLUTION: Add this line after line 38 in app.php:\n";
+                echo "      define('PHP_CLI_BINARY', '/usr/bin/php');\n";
+                echo "  💡 Replace /usr/bin/php with your actual PHP CLI path\n";
+            }
         }
         unlink($testScript);
     } else {

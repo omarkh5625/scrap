@@ -4368,6 +4368,51 @@ class Router {
     }
     
     /**
+     * Detect the correct PHP CLI binary
+     * PHP_BINARY might point to php-fpm which doesn't work for CLI execution
+     * This function finds the correct CLI binary
+     */
+    private static function getPhpCliBinary(): string {
+        // Check if user defined a custom CLI binary
+        if (defined('PHP_CLI_BINARY') && file_exists(PHP_CLI_BINARY)) {
+            return PHP_CLI_BINARY;
+        }
+        
+        $phpBinary = PHP_BINARY;
+        
+        // If PHP_BINARY is php-fpm, try to find the CLI binary
+        if (strpos($phpBinary, 'php-fpm') !== false || strpos($phpBinary, 'fpm') !== false) {
+            error_log("⚠️  PHP_BINARY is FPM ({$phpBinary}), searching for CLI binary...");
+            
+            // Common CLI PHP binary locations
+            $possiblePaths = [
+                '/usr/bin/php',
+                '/usr/local/bin/php',
+                dirname($phpBinary) . '/php',  // Same directory as FPM
+                str_replace('php-fpm', 'php', $phpBinary),  // Replace fpm with cli
+                str_replace('/sbin/', '/bin/', $phpBinary),  // sbin to bin
+            ];
+            
+            // Also check for version-specific binaries
+            $version = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+            $possiblePaths[] = "/usr/bin/php{$version}";
+            $possiblePaths[] = "/opt/cpanel/ea-php" . str_replace('.', '', $version) . "/root/usr/bin/php";
+            
+            foreach ($possiblePaths as $path) {
+                if (file_exists($path) && is_executable($path)) {
+                    error_log("✓ Found CLI PHP binary: {$path}");
+                    return $path;
+                }
+            }
+            
+            error_log("✗ Could not find CLI PHP binary, using FPM binary (may not work)");
+            error_log("💡 Define PHP_CLI_BINARY constant in app.php to specify correct path");
+        }
+        
+        return $phpBinary;
+    }
+    
+    /**
      * Spawn workers using proc_open in TRUE parallel mode
      * Each worker is an independent PHP process that runs simultaneously
      * Returns the number of successfully spawned workers
@@ -4378,7 +4423,7 @@ class Router {
         // without adding noticeable overhead to spawn time
         $processInitDelayMicroseconds = 100000;
         
-        $phpBinary = PHP_BINARY;
+        $phpBinary = self::getPhpCliBinary();
         $scriptPath = __FILE__;
         
         // Check if debug mode is enabled for worker spawning

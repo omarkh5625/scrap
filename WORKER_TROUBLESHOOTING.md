@@ -6,6 +6,7 @@ If you see errors like:
 - "Log file not found! Workers may not have started"
 - "Only 2 workers started instead of 50"
 - "Stale Workers Detected"
+- "Worker execution: ✗ Worker did not write log"
 - Workers show as crashed in dashboard
 
 Follow these steps to diagnose and fix the issue:
@@ -22,8 +23,33 @@ This will check:
 - File permissions
 - Database connectivity
 - Ability to spawn test workers
+- **PHP binary type (CLI vs FPM)**
 
 **Fix any ✗ or errors** reported by the diagnostic before proceeding.
+
+### Critical: PHP Binary Issue
+
+If diagnostic shows:
+```
+⚠️  PHP_BINARY points to FPM: /path/to/php-fpm
+Worker execution: ✗ Worker did not write log
+```
+
+**This means PHP_BINARY points to php-fpm which cannot execute CLI scripts!**
+
+**SOLUTION:**
+1. Diagnostic will try to find the correct CLI PHP binary
+2. If found, note the path shown (e.g., `/usr/bin/php`)
+3. Add this line after line 38 in `app.php`:
+   ```php
+   define('PHP_CLI_BINARY', '/usr/bin/php');
+   ```
+4. Replace `/usr/bin/php` with the actual CLI path from diagnostic
+5. System will now use correct PHP binary for workers
+
+Common CLI PHP paths:
+- cPanel: `/opt/cpanel/ea-php82/root/usr/bin/php` (adjust version)
+- Standard: `/usr/bin/php` or `/usr/local/bin/php`
 
 ## Step 2: Enable Worker Debug Mode
 
@@ -66,6 +92,29 @@ Look for:
 - Initialization errors
 
 ## Common Issues and Solutions
+
+### Issue: PHP Binary is FPM (Most Common on cPanel/Shared Hosting)
+
+**Symptoms:**
+- Diagnostic shows: "⚠️ PHP_BINARY points to FPM"
+- "Worker execution: ✗ Worker did not write log"
+- Workers spawn but immediately crash
+- `PHP_BINARY` shows path like `/opt/cpanel/.../php-fpm` or contains "fpm"
+
+**Solution:**
+1. Run diagnostic - it will search for CLI PHP binary
+2. Note the path it finds (e.g., `/usr/bin/php` or `/opt/cpanel/ea-php82/root/usr/bin/php`)
+3. Add to `app.php` after line 38:
+   ```php
+   define('PHP_CLI_BINARY', '/usr/bin/php');  // Use path from diagnostic
+   ```
+4. System will automatically use this CLI binary instead of FPM
+5. Workers should now start successfully
+
+**Why this happens:**
+- PHP-FPM is for web requests, not CLI execution
+- On shared hosting (especially cPanel), `PHP_BINARY` often points to FPM
+- Workers need the CLI binary to execute as background processes
 
 ### Issue: Database Connection Failed
 
