@@ -133,14 +133,17 @@ class ConnectionPoolManager {
             $attemptNumber++;
             
             // Try to acquire a lock on the pool file
-            $fp = fopen($this->lockFile, 'r+');
+            $fp = fopen($this->lockFile, 'c+');
             if (!$fp) {
                 error_log("⚠️ Failed to open connection pool lock file");
                 return false;
             }
             
             if (flock($fp, LOCK_EX)) {
-                $data = json_decode(fread($fp, 8192) ?: '{}', true);
+                // Read current state
+                rewind($fp);
+                $contents = stream_get_contents($fp);
+                $data = json_decode($contents ?: '{}', true) ?: [];
                 $currentActive = (int)($data['active'] ?? 0);
                 $peak = (int)($data['peak'] ?? 0);
                 
@@ -158,6 +161,7 @@ class ConnectionPoolManager {
                         'peak' => $peak,
                         'last_update' => time()
                     ]));
+                    fflush($fp);
                     
                     flock($fp, LOCK_UN);
                     fclose($fp);
@@ -177,6 +181,7 @@ class ConnectionPoolManager {
                     'peak' => $peak,
                     'last_update' => time()
                 ]));
+                fflush($fp);
                 
                 flock($fp, LOCK_UN);
                 fclose($fp);
@@ -206,14 +211,16 @@ class ConnectionPoolManager {
      * Release a connection slot back to the pool
      */
     public function releaseConnection(): void {
-        $fp = fopen($this->lockFile, 'r+');
+        $fp = fopen($this->lockFile, 'c+');
         if (!$fp) {
             error_log("⚠️ Failed to open connection pool lock file for release");
             return;
         }
         
         if (flock($fp, LOCK_EX)) {
-            $data = json_decode(fread($fp, 8192) ?: '{}', true);
+            rewind($fp);
+            $contents = stream_get_contents($fp);
+            $data = json_decode($contents ?: '{}', true) ?: [];
             $currentActive = max(0, (int)($data['active'] ?? 0) - 1);
             
             ftruncate($fp, 0);
@@ -224,6 +231,7 @@ class ConnectionPoolManager {
                 'peak' => $data['peak'] ?? 0,
                 'last_update' => time()
             ]));
+            fflush($fp);
             
             flock($fp, LOCK_UN);
             
@@ -244,7 +252,9 @@ class ConnectionPoolManager {
         }
         
         if (flock($fp, LOCK_SH)) {
-            $data = json_decode(fread($fp, 8192) ?: '{}', true);
+            rewind($fp);
+            $contents = stream_get_contents($fp);
+            $data = json_decode($contents ?: '{}', true) ?: [];
             flock($fp, LOCK_UN);
             fclose($fp);
             
