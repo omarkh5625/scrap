@@ -21,13 +21,19 @@
  * - Database Connection Pooling with Retry Logic
  * - Exponential Backoff for Connection Failures
  * - Optimized Batch Operations
+ * - Connection Pool Manager (150 concurrent connections limit)
+ * - Batched Worker Spawning (150 workers per batch)
  * 
  * DATABASE CONNECTION MANAGEMENT:
+ * - Connection pool manager limits concurrent connections to 150
+ * - Workers spawned in batches of 150 with 2s delay between batches
  * - Automatic retry with exponential backoff for "Too many connections" errors
- * - Connection pooling via singleton pattern
+ * - Connection pooling via singleton pattern with slot-based allocation
  * - Automatic connection closing after batch operations
  * - Configurable retry attempts (default: 5)
  * - Jitter added to prevent thundering herd problem
+ * - File-based locking for connection slot coordination across processes
+ * - Real-time connection pool monitoring via API endpoint
  * 
  * TROUBLESHOOTING WORKERS:
  * If workers are not starting or crashing:
@@ -37,7 +43,11 @@
  * 3. Check worker_logs/ directory for error logs from each worker
  * 4. Check your PHP error log for worker initialization errors
  * 5. Ensure database connection is working properly
- * 6. If seeing "Too many connections", the system will automatically retry with backoff
+ * 6. If seeing "Too many connections", the system will automatically:
+ *    - Throttle worker spawning to batches of 150
+ *    - Queue workers waiting for connection slots
+ *    - Retry with exponential backoff
+ *    - Log connection pool statistics
  */
 
 // ============================================================================
@@ -80,12 +90,186 @@ ini_set('mysqli.reconnect', '1');
 session_start();
 
 // ============================================================================
+// CONNECTION POOL MANAGER
+// ============================================================================
+
+class ConnectionPoolManager {
+    private static ?self $instance = null;
+    private int $activeConnections = 0;
+    private int $maxConnections = 150; // Maximum concurrent database connections
+    private int $waitingWorkers = 0;
+    private string $lockFile;
+    
+    private function __construct() {
+        $this->lockFile = sys_get_temp_dir() . '/scrap_connection_pool.lock';
+        // Initialize lock file if it doesn't exist
+        if (!file_exists($this->lockFile)) {
+            file_put_contents($this->lockFile, json_encode([
+                'active' => 0,
+                'waiting' => 0,
+                'peak' => 0,
+                'last_update' => time()
+            ]));
+        }
+    }
+    
+    public static function getInstance(): self {
+        if (self::$instance === null) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+    
+    /**
+     * Acquire a connection slot - blocks until a slot is available
+     * Implements connection throttling to prevent "Too many connections" errors
+     */
+    public function acquireConnection(): bool {
+        $maxWaitTime = 30; // Maximum wait time in seconds
+        $startTime = time();
+        $attemptNumber = 0;
+        
+        while (true) {
+            $attemptNumber++;
+            
+            // Try to acquire a lock on the pool file
+            $fp = fopen($this->lockFile, 'r+');
+            if (!$fp) {
+                error_log("⚠️ Failed to open connection pool lock file");
+                return false;
+            }
+            
+            if (flock($fp, LOCK_EX)) {
+                $data = json_decode(fread($fp, 8192) ?: '{}', true);
+                $currentActive = (int)($data['active'] ?? 0);
+                $peak = (int)($data['peak'] ?? 0);
+                
+                if ($currentActive < $this->maxConnections) {
+                    // Slot available - acquire it
+                    $currentActive++;
+                    $peak = max($peak, $currentActive);
+                    
+                    // Update the lock file
+                    ftruncate($fp, 0);
+                    rewind($fp);
+                    fwrite($fp, json_encode([
+                        'active' => $currentActive,
+                        'waiting' => max(0, ($data['waiting'] ?? 0) - 1),
+                        'peak' => $peak,
+                        'last_update' => time()
+                    ]));
+                    
+                    flock($fp, LOCK_UN);
+                    fclose($fp);
+                    
+                    $this->activeConnections = $currentActive;
+                    error_log("✓ Connection slot acquired ({$currentActive}/{$this->maxConnections} active, peak: {$peak})");
+                    return true;
+                }
+                
+                // No slot available - increment waiting counter
+                $waiting = ($data['waiting'] ?? 0) + 1;
+                ftruncate($fp, 0);
+                rewind($fp);
+                fwrite($fp, json_encode([
+                    'active' => $currentActive,
+                    'waiting' => $waiting,
+                    'peak' => $peak,
+                    'last_update' => time()
+                ]));
+                
+                flock($fp, LOCK_UN);
+                fclose($fp);
+                
+                // Check if we've exceeded max wait time
+                if (time() - $startTime > $maxWaitTime) {
+                    error_log("✗ Connection slot acquisition timeout after {$maxWaitTime}s (attempt {$attemptNumber})");
+                    return false;
+                }
+                
+                // Log waiting status every 5 attempts
+                if ($attemptNumber % 5 == 0) {
+                    error_log("⏳ Waiting for connection slot... ({$currentActive}/{$this->maxConnections} active, {$waiting} waiting, attempt {$attemptNumber})");
+                }
+                
+                // Wait with exponential backoff before retry
+                $waitTime = min(100000 * pow(2, min($attemptNumber - 1, 4)), 1000000); // Max 1s
+                usleep($waitTime);
+            } else {
+                fclose($fp);
+                usleep(50000); // 50ms
+            }
+        }
+    }
+    
+    /**
+     * Release a connection slot back to the pool
+     */
+    public function releaseConnection(): void {
+        $fp = fopen($this->lockFile, 'r+');
+        if (!$fp) {
+            error_log("⚠️ Failed to open connection pool lock file for release");
+            return;
+        }
+        
+        if (flock($fp, LOCK_EX)) {
+            $data = json_decode(fread($fp, 8192) ?: '{}', true);
+            $currentActive = max(0, (int)($data['active'] ?? 0) - 1);
+            
+            ftruncate($fp, 0);
+            rewind($fp);
+            fwrite($fp, json_encode([
+                'active' => $currentActive,
+                'waiting' => $data['waiting'] ?? 0,
+                'peak' => $data['peak'] ?? 0,
+                'last_update' => time()
+            ]));
+            
+            flock($fp, LOCK_UN);
+            
+            $this->activeConnections = $currentActive;
+            error_log("✓ Connection slot released ({$currentActive}/{$this->maxConnections} active)");
+        }
+        
+        fclose($fp);
+    }
+    
+    /**
+     * Get current pool statistics
+     */
+    public function getStats(): array {
+        $fp = @fopen($this->lockFile, 'r');
+        if (!$fp) {
+            return ['active' => 0, 'waiting' => 0, 'peak' => 0, 'max' => $this->maxConnections];
+        }
+        
+        if (flock($fp, LOCK_SH)) {
+            $data = json_decode(fread($fp, 8192) ?: '{}', true);
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            
+            return [
+                'active' => (int)($data['active'] ?? 0),
+                'waiting' => (int)($data['waiting'] ?? 0),
+                'peak' => (int)($data['peak'] ?? 0),
+                'max' => $this->maxConnections,
+                'last_update' => $data['last_update'] ?? null
+            ];
+        }
+        
+        fclose($fp);
+        return ['active' => 0, 'waiting' => 0, 'peak' => 0, 'max' => $this->maxConnections];
+    }
+}
+
+// ============================================================================
 // DATABASE CLASS
 // ============================================================================
 
 class Database {
     private static ?PDO $pdo = null;
     private static bool $migrated = false;
+    private static bool $connectionAcquired = false;
     
     // Connection pooling configuration
     private const MAX_RETRY_ATTEMPTS = 5;
@@ -101,11 +285,21 @@ class Database {
     /**
      * Get database connection with retry logic and exponential backoff
      * Implements connection pooling by reusing the static PDO instance
+     * Now includes connection slot acquisition to prevent "Too many connections" errors
      */
     public static function connect(): PDO {
         global $DB_CONFIG;
         
         if (self::$pdo === null) {
+            // Acquire a connection slot from the pool before connecting
+            if (!self::$connectionAcquired) {
+                $poolManager = ConnectionPoolManager::getInstance();
+                if (!$poolManager->acquireConnection()) {
+                    throw new PDOException("Failed to acquire connection slot from pool");
+                }
+                self::$connectionAcquired = true;
+            }
+            
             self::$pdo = self::connectWithRetry();
             
             // Run migrations if not already done
@@ -233,6 +427,7 @@ class Database {
     /**
      * Close the database connection to free up resources
      * Should be called after completing a batch of operations
+     * Releases the connection slot back to the pool
      * 
      * Note: Using non-persistent connections is critical in high-concurrency scenarios.
      * Persistent connections would remain open even after PHP scripts finish, quickly
@@ -243,7 +438,15 @@ class Database {
     public static function closeConnection(): void {
         if (self::$pdo !== null) {
             self::$pdo = null;
-            error_log("✓ Database connection closed to free resources");
+            
+            // Release the connection slot back to the pool
+            if (self::$connectionAcquired) {
+                $poolManager = ConnectionPoolManager::getInstance();
+                $poolManager->releaseConnection();
+                self::$connectionAcquired = false;
+            }
+            
+            error_log("✓ Database connection closed and slot released");
         }
     }
     
@@ -2597,7 +2800,14 @@ class Router {
                 break;
                 
             case 'worker-stats':
-                echo json_encode(Worker::getStats());
+                $workerStats = Worker::getStats();
+                $poolStats = ConnectionPoolManager::getInstance()->getStats();
+                echo json_encode(array_merge($workerStats, ['connection_pool' => $poolStats]));
+                break;
+                
+            case 'connection-pool-stats':
+                // New endpoint for monitoring connection pool
+                echo json_encode(ConnectionPoolManager::getInstance()->getStats());
                 break;
                 
             case 'system-resources':
@@ -4656,8 +4866,9 @@ class Router {
     }
     
     /**
-     * Spawn workers using proc_open in TRUE parallel mode
+     * Spawn workers using proc_open in TRUE parallel mode with batched throttling
      * Each worker is an independent PHP process that runs simultaneously
+     * Workers are spawned in batches to prevent overwhelming the database with connections
      * Returns the number of successfully spawned workers
      */
     private static function spawnWorkersViaProcOpenParallel(int $workerCount, ?int $jobId = null): int {
@@ -4665,6 +4876,10 @@ class Router {
         // Tested value: 100ms provides reliable initialization across platforms
         // without adding noticeable overhead to spawn time
         $processInitDelayMicroseconds = 100000;
+        
+        // Batch configuration - spawn workers in batches to limit connection surge
+        $batchSize = 150; // Match connection pool limit
+        $batchDelaySeconds = 2; // Delay between batches to allow connections to stabilize
         
         $phpBinary = self::getPhpCliBinary();
         $scriptPath = __FILE__;
@@ -4677,79 +4892,107 @@ class Router {
             @mkdir($logDir, 0755, true);
         }
         
-        error_log("🚀 spawnWorkersViaProcOpenParallel: Spawning {$workerCount} parallel workers using proc_open()");
+        error_log("🚀 spawnWorkersViaProcOpenParallel: Spawning {$workerCount} parallel workers in batches of {$batchSize}");
         error_log("  PHP Binary: {$phpBinary}");
         error_log("  Script Path: {$scriptPath}");
         error_log("  Debug Mode: " . ($debugMode ? 'ENABLED' : 'DISABLED'));
+        error_log("  Batch Strategy: {$batchSize} workers per batch with {$batchDelaySeconds}s delay");
         
-        $spawnedCount = 0;
+        $totalSpawned = 0;
         $processes = [];
         
-        // Spawn ALL workers simultaneously
-        for ($i = 0; $i < $workerCount; $i++) {
-            try {
-                $workerName = 'parallel-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
-                
-                // Build command arguments for worker in CLI mode
-                $args = [$phpBinary, $scriptPath, $workerName];
-                if ($jobId !== null) {
-                    $args[] = (string)$jobId;
-                }
-                
-                // Descriptors for proc_open
-                // In debug mode, capture stderr to log files for troubleshooting
-                if ($debugMode) {
-                    $errorLog = $logDir . "/{$workerName}.err.log";
-                    $descriptors = [
-                        0 => ['pipe', 'r'],
-                        1 => ['file', $logDir . "/{$workerName}.out.log", 'w'],
-                        2 => ['file', $errorLog, 'w']
-                    ];
-                } else {
-                    // Normal mode - redirect output to null
-                    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+        // Calculate number of batches needed
+        $numBatches = (int)ceil($workerCount / $batchSize);
+        
+        for ($batchNum = 0; $batchNum < $numBatches; $batchNum++) {
+            $batchStart = $batchNum * $batchSize;
+            $batchEnd = min($batchStart + $batchSize, $workerCount);
+            $batchActualSize = $batchEnd - $batchStart;
+            
+            error_log("📦 Batch " . ($batchNum + 1) . "/{$numBatches}: Spawning workers {$batchStart}-" . ($batchEnd - 1) . " ({$batchActualSize} workers)");
+            
+            $batchSpawned = 0;
+            
+            // Spawn workers in this batch
+            for ($i = $batchStart; $i < $batchEnd; $i++) {
+                try {
+                    $workerName = 'parallel-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                    
+                    // Build command arguments for worker in CLI mode
+                    $args = [$phpBinary, $scriptPath, $workerName];
+                    if ($jobId !== null) {
+                        $args[] = (string)$jobId;
+                    }
+                    
+                    // Descriptors for proc_open
+                    // In debug mode, capture stderr to log files for troubleshooting
+                    if ($debugMode) {
+                        $errorLog = $logDir . "/{$workerName}.err.log";
                         $descriptors = [
                             0 => ['pipe', 'r'],
-                            1 => ['file', 'NUL', 'w'],
-                            2 => ['file', 'NUL', 'w']
+                            1 => ['file', $logDir . "/{$workerName}.out.log", 'w'],
+                            2 => ['file', $errorLog, 'w']
                         ];
                     } else {
-                        $descriptors = [
-                            0 => ['pipe', 'r'],
-                            1 => ['file', '/dev/null', 'w'],
-                            2 => ['file', '/dev/null', 'w']
-                        ];
-                    }
-                }
-                
-                // Spawn process - this returns IMMEDIATELY, allowing parallel execution
-                $process = proc_open($args, $descriptors, $pipes, null, null, ['bypass_shell' => true]);
-                
-                if (is_resource($process)) {
-                    // Close stdin pipe if created
-                    if (isset($pipes[0]) && is_resource($pipes[0])) {
-                        fclose($pipes[0]);
+                        // Normal mode - redirect output to null
+                        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                            $descriptors = [
+                                0 => ['pipe', 'r'],
+                                1 => ['file', 'NUL', 'w'],
+                                2 => ['file', 'NUL', 'w']
+                            ];
+                        } else {
+                            $descriptors = [
+                                0 => ['pipe', 'r'],
+                                1 => ['file', '/dev/null', 'w'],
+                                2 => ['file', '/dev/null', 'w']
+                            ];
+                        }
                     }
                     
-                    // Store process handle (we'll close them all at once later)
-                    $processes[] = ['handle' => $process, 'name' => $workerName];
-                    $spawnedCount++;
+                    // Spawn process - this returns IMMEDIATELY, allowing parallel execution
+                    $process = proc_open($args, $descriptors, $pipes, null, null, ['bypass_shell' => true]);
                     
-                    error_log("  ✓ Worker {$i}/{$workerCount}: {$workerName} spawned" . ($debugMode ? " (logging to {$logDir})" : ""));
-                } else {
-                    error_log("  ✗ Worker {$i}/{$workerCount}: Failed to spawn {$workerName}");
-                    error_log("    Command: " . implode(' ', $args));
+                    if (is_resource($process)) {
+                        // Close stdin pipe if created
+                        if (isset($pipes[0]) && is_resource($pipes[0])) {
+                            fclose($pipes[0]);
+                        }
+                        
+                        // Store process handle (we'll close them all at once later)
+                        $processes[] = ['handle' => $process, 'name' => $workerName];
+                        $batchSpawned++;
+                        $totalSpawned++;
+                        
+                        if ($debugMode) {
+                            error_log("  ✓ Worker {$i}: {$workerName} spawned (logging to {$logDir})");
+                        }
+                    } else {
+                        error_log("  ✗ Worker {$i}: Failed to spawn {$workerName}");
+                        error_log("    Command: " . implode(' ', $args));
+                    }
+                } catch (Exception $e) {
+                    error_log("  ✗ Worker {$i}: Exception during spawn: " . $e->getMessage());
                 }
-            } catch (Exception $e) {
-                error_log("  ✗ Worker {$i}: Exception during spawn: " . $e->getMessage());
-                error_log("    Stack trace: " . $e->getTraceAsString());
+            }
+            
+            error_log("✓ Batch " . ($batchNum + 1) . "/{$numBatches} complete: {$batchSpawned} workers spawned");
+            
+            // Get connection pool stats after batch
+            $poolStats = ConnectionPoolManager::getInstance()->getStats();
+            error_log("  📊 Connection Pool: {$poolStats['active']}/{$poolStats['max']} active, {$poolStats['waiting']} waiting, peak: {$poolStats['peak']}");
+            
+            // Delay between batches (except after the last batch)
+            if ($batchNum < $numBatches - 1) {
+                error_log("  ⏸️  Waiting {$batchDelaySeconds}s before next batch to allow connections to stabilize...");
+                sleep($batchDelaySeconds);
             }
         }
         
-        error_log("✓✓✓ spawnWorkersViaProcOpenParallel: ALL {$spawnedCount}/{$workerCount} workers spawned SIMULTANEOUSLY!");
+        error_log("✓✓✓ spawnWorkersViaProcOpenParallel: ALL {$totalSpawned}/{$workerCount} workers spawned in {$numBatches} batches!");
         
-        if ($spawnedCount < $workerCount) {
-            error_log("⚠️  WARNING: Only {$spawnedCount}/{$workerCount} workers spawned successfully!");
+        if ($totalSpawned < $workerCount) {
+            error_log("⚠️  WARNING: Only {$totalSpawned}/{$workerCount} workers spawned successfully!");
             error_log("⚠️  Run worker_diagnostic.php to troubleshoot issues");
         }
         
@@ -4769,8 +5012,8 @@ class Router {
             $result = $stmt->fetch();
             $activeWorkers = (int)$result['active'];
             
-            if ($activeWorkers < $spawnedCount) {
-                error_log("⚠️  WARNING: Only {$activeWorkers}/{$spawnedCount} workers registered in database!");
+            if ($activeWorkers < $totalSpawned) {
+                error_log("⚠️  WARNING: Only {$activeWorkers}/{$totalSpawned} workers registered in database!");
                 error_log("⚠️  Some workers may have crashed during initialization");
                 error_log("⚠️  Enable WORKER_DEBUG_MODE to see worker error logs");
             } else {
@@ -4788,7 +5031,7 @@ class Router {
         
         error_log("✓ Process handles closed - workers continue running independently");
         
-        return $spawnedCount;
+        return $totalSpawned;
     }
     
     private static function renderNewJob(): void {
