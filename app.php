@@ -413,12 +413,13 @@ if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_lo
             ");
             
             // Also fix jobs where progress_status is 'completed' but main status is not 'completed'
+            // Only apply to jobs that have actually completed extraction (completed_at is set)
             $pdo->exec("
                 UPDATE jobs 
-                SET status = 'completed', 
-                    completed_at = COALESCE(completed_at, NOW())
+                SET status = 'completed'
                 WHERE progress_status = 'completed'
                   AND status != 'completed'
+                  AND completed_at IS NOT NULL
             ");
         } catch (Exception $e) {
             error_log("Retroactive job fix error: " . $e->getMessage());
