@@ -6,6 +6,9 @@
  * Run this before starting workers to check system compatibility.
  */
 
+// Start output buffering to prevent header issues
+ob_start();
+
 echo "=== Worker Environment Diagnostic ===\n\n";
 
 // Check PHP version
@@ -16,6 +19,7 @@ echo "PHP SAPI: " . php_sapi_name() . "\n\n";
 // Check required functions
 echo "=== Required Functions ===\n";
 $requiredFunctions = ['proc_open', 'proc_close', 'exec', 'curl_init', 'mysqli_connect'];
+$hasRequiredFunctions = true;
 foreach ($requiredFunctions as $func) {
     $available = function_exists($func);
     $disabled = in_array($func, array_map('trim', explode(',', ini_get('disable_functions'))));
@@ -24,6 +28,16 @@ foreach ($requiredFunctions as $func) {
         $status .= ' (disabled in php.ini)';
     }
     echo sprintf("  %-20s %s\n", $func, $status);
+    
+    // Track if critical functions are missing
+    if ($func === 'proc_open' && (!$available || $disabled)) {
+        $hasRequiredFunctions = false;
+    }
+}
+
+// Note about exec being optional
+if (!function_exists('exec') || in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))))) {
+    echo "\n  ℹ️  NOTE: 'exec' is disabled but that's OK - system will use 'proc_open' instead\n";
 }
 echo "\n";
 
@@ -56,9 +70,21 @@ echo "\n";
 // Check database connectivity (if config exists)
 echo "=== Database Connectivity ===\n";
 if (file_exists($appFile)) {
+    // Capture output before loading app.php
+    $output = ob_get_clean();
+    
     // Try to include and check database
+    // Set a flag to prevent Router from running
+    define('DIAGNOSTIC_MODE', true);
+    
     try {
+        // Suppress any output from app.php during load
+        ob_start();
         require_once $appFile;
+        ob_end_clean();
+        
+        // Resume our output
+        echo $output;
         
         // Check if database is configured
         global $DB_CONFIG;
@@ -82,10 +108,15 @@ if (file_exists($appFile)) {
             echo "  Database: ⚠️  Not configured (run setup first)\n";
         }
     } catch (Exception $e) {
+        // Resume our output even on error
+        ob_end_clean();
+        echo $output;
         echo "  App file: ✗ Cannot load\n";
         echo "  Error: " . $e->getMessage() . "\n";
     }
 } else {
+    $output = ob_get_clean();
+    echo $output;
     echo "  App file: ✗ Not found\n";
 }
 echo "\n";

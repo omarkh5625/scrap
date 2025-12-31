@@ -6191,4 +6191,7 @@ class Router {
 // APPLICATION ENTRY POINT
 // ============================================================================
 
-Router::handleRequest();
+// Only run router if not in diagnostic mode
+if (!defined('DIAGNOSTIC_MODE')) {
+    Router::handleRequest();
+}

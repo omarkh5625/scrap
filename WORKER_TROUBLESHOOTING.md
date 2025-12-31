@@ -79,16 +79,27 @@ Look for:
 3. Check that database exists and is accessible
 4. Test connection: `php -r "require 'app.php'; Database::connect();"`
 
+### Issue: exec Function Disabled
+
+**Symptoms:**
+- Diagnostic shows "exec: ✗ Not Available (disabled in php.ini)"
+
+**Solution:**
+- **This is OK!** The system uses `proc_open` as the primary method for spawning workers
+- `exec` is only a fallback and is not required
+- As long as `proc_open` shows "✓ Available", workers will work correctly
+- If both `proc_open` and `exec` are disabled, the system will use HTTP worker fallback (slower but functional)
+
 ### Issue: proc_open Disabled
 
 **Symptoms:**
 - Diagnostic shows "proc_open: ✗ Not Available (disabled in php.ini)"
-- Workers never spawn
+- Workers never spawn or system uses HTTP fallback
 
 **Solution:**
 1. Contact your hosting provider to enable proc_open
-2. Or use HTTP worker fallback (slower but works)
-3. Check php.ini for `disable_functions = proc_open` and remove it
+2. System will automatically use HTTP worker fallback (slower but works)
+3. Check php.ini for `disable_functions = proc_open` and remove it if you have access
 
 ### Issue: File Permissions
 
