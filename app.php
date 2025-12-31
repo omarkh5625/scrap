@@ -682,15 +682,38 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
 
 // Extraction work with real URLs
 \$startTime = time();
-\$maxRunTime = \$config['max_run_time'] ?? 300;
-\$extractedCount = 0;
+\$maxRunTime = \$config['max_run_time'] ?? 3600;
+\$targetEmails = \$config['target_emails'] ?? 10000;
 \$urlCache = [];
 
 // Common domains for test emails
 \$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
-while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
+// Helper function to get current email count
+function getCurrentEmailCount(\$emailFile) {
+    if (!file_exists(\$emailFile)) {
+        return 0;
+    }
+    \$data = json_decode(file_get_contents(\$emailFile), true);
+    return \$data['total'] ?? 0;
+}
+
+// Run continuously until target reached
+while (true) {
+    // Check if target reached
+    \$currentTotal = getCurrentEmailCount(\$emailFile);
+    if (\$currentTotal >= \$targetEmails) {
+        echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
+        break;
+    }
+    
+    // Check max runtime
+    if ((time() - \$startTime) > \$maxRunTime) {
+        echo json_encode(['type' => 'max_runtime', 'worker_id' => \$workerId]) . "\\n";
+        break;
+    }
+    
     // Output heartbeat
     echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
     flush();
@@ -706,9 +729,6 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
             }
         }
     }
-    
-    // Delay between extraction cycles
-    sleep(rand(10, 30));
     
     // Generate realistic emails with real source URLs
     \$found = rand(3, 8);
@@ -737,7 +757,6 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         ];
         
         saveEmail(\$emailFile, \$emailData);
-        \$extractedCount++;
     }
     
     echo json_encode([
@@ -747,6 +766,9 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         'time' => time()
     ]) . "\\n";
     flush();
+    
+    // Faster cycle time - sleep between batches
+    sleep(rand(5, 15));
 }
 
 echo json_encode(['type' => 'completed', 'worker_id' => \$workerId, 'total_extracted' => \$extractedCount]) . "\\n";
@@ -1144,6 +1166,9 @@ class JobManager {
             return null;
         }
         
+        // CRITICAL: Load email counts from file before returning
+        $this->updateEmailCountsFromFile($jobId);
+        
         $job = $this->jobs[$jobId];
         
         // Get worker stats if running (prefer live stats, fall back to persistent)
@@ -1270,6 +1295,16 @@ class JobManager {
                 $this->jobs[$jobId]['emails_accepted'] = count($data['emails']);
                 $this->jobs[$jobId]['emails_found'] = count($data['emails']);
                 $this->jobs[$jobId]['urls_processed'] = count($data['emails']) * 2; // Estimate
+                
+                // Calculate per-worker stats
+                $workerStats = [];
+                foreach ($data['emails'] as $email) {
+                    if (isset($email['worker_id'])) {
+                        $wid = $email['worker_id'];
+                        $workerStats[$wid] = ($workerStats[$wid] ?? 0) + 1;
+                    }
+                }
+                $this->jobs[$jobId]['worker_contribution'] = $workerStats;
                 
                 // Save updated stats
                 $this->saveJob($jobId);
