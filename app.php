@@ -2164,12 +2164,23 @@ class Router {
         // OPTIMIZATION: Use much shorter polling interval for near-instant job pickup
         // Changed from 5 seconds to 0.1 seconds for maximum parallel performance
         // Can be configured via settings for fine-tuning based on system load
-        $pollingInterval = (float)(Settings::get('worker_polling_interval', '0.1')); // Default: 100ms
-        if ($pollingInterval < 0.01) {
-            $pollingInterval = 0.01; // Minimum 10ms to prevent CPU overload
-        }
-        if ($pollingInterval > 5.0) {
-            $pollingInterval = 5.0; // Maximum 5s (old behavior)
+        $pollingIntervalSetting = Settings::get('worker_polling_interval', '0.1');
+        
+        // Validate and parse polling interval with safety bounds
+        if (!is_numeric($pollingIntervalSetting)) {
+            error_log("Warning: Invalid worker_polling_interval '{$pollingIntervalSetting}', using default 0.1s");
+            $pollingInterval = 0.1;
+        } else {
+            $pollingInterval = (float)$pollingIntervalSetting;
+            // Enforce reasonable bounds to prevent misconfiguration
+            if ($pollingInterval < 0.05) {
+                error_log("Warning: Polling interval {$pollingInterval}s too low, using minimum 0.05s (50ms)");
+                $pollingInterval = 0.05; // Minimum 50ms to prevent excessive CPU usage
+            }
+            if ($pollingInterval > 5.0) {
+                error_log("Warning: Polling interval {$pollingInterval}s too high, using maximum 5.0s");
+                $pollingInterval = 5.0; // Maximum 5s (old behavior)
+            }
         }
         
         // Track consecutive empty polls to implement adaptive backoff
@@ -2185,8 +2196,11 @@ class Router {
             // Check if worker has been idle too long (safety exit)
             $elapsedTime = microtime(true) - $workerStartTime;
             // Calculate based on actual polling interval (converts to integer checks)
-            // For default 0.1s polling: 300s / 0.1s = 3000 checks
-            $maxIdleChecks = (int)($maxIdleTime / $pollingInterval);
+            // Cap at reasonable maximum to prevent excessive idle time
+            // Example: 0.05s polling → 300/0.05 = 6000 checks (5 minutes)
+            //          0.1s polling → 300/0.1 = 3000 checks (5 minutes)
+            //          5s polling → 300/5 = 60 checks (5 minutes)
+            $maxIdleChecks = min((int)($maxIdleTime / $pollingInterval), 10000); // Cap at 10k checks
             if ($emptyPollCount > $maxIdleChecks && $jobsProcessed === 0) {
                 echo "Worker idle timeout ({$maxIdleTime}s) - no jobs found. Exiting.\n";
                 error_log("Worker {$workerName} exiting due to idle timeout after " . round($elapsedTime, 1) . "s");
@@ -2226,7 +2240,9 @@ class Router {
                 usleep(1000000); // 1 second
             } else {
                 // Active processing: use configured polling interval for near-instant parallel pickup
-                usleep((int)($pollingInterval * 1000000)); // Convert seconds to microseconds
+                // Convert to microseconds with minimum of 1000 (1ms) to ensure actual sleep
+                $sleepMicros = max(1000, (int)($pollingInterval * 1000000));
+                usleep($sleepMicros);
             }
         }
     }
@@ -4170,7 +4186,8 @@ class Router {
         }
         
         $elapsedTime = round(microtime(true) - $startTime, 3);
-        $workersPerSecond = $spawnedCount > 0 ? round($spawnedCount / max($elapsedTime, 0.001), 1) : 0;
+        // Use reasonable minimum for rate calculation (10ms minimum spawn time is realistic)
+        $workersPerSecond = $spawnedCount > 0 ? round($spawnedCount / max($elapsedTime, 0.01), 1) : 0;
         
         error_log("spawnWorkersViaProcOpen: ✓ Successfully spawned {$spawnedCount}/{$workerCount} workers in {$elapsedTime}s ({$workersPerSecond} workers/sec) - ALL RUNNING IN PARALLEL");
         
