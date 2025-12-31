@@ -970,9 +970,10 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             throw new Exception("API key or search query is missing");
         }
         
-        // Each worker will extract in parallel batches
-        // Calculate how many results each worker should request per API call
-        $resultsPerWorkerCall = min(100, max(10, (int)ceil($targetCount / $workers)));
+        // Each worker requests a fixed optimal number of results per API call
+        // This ensures we get enough results to find emails regardless of target count
+        // serper.dev returns max 100 results per call, so we use 50-100 for efficiency
+        $resultsPerWorkerCall = 100; // Fixed optimal value for best results
         
         error_log("PARALLEL_EXTRACTION: Each worker will request {$resultsPerWorkerCall} results per call");
         
@@ -7533,11 +7534,11 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               </div>
 
               <div class="form-group">
-                <label>Target Email Count (Optional Override)</label>
+                <label>Target Emails to Extract</label>
                 <input type="number" name="target_count" min="1" max="10000" 
                   value="<?php echo (int)($job['target_count'] ?? 0); ?>" 
                   placeholder="Leave empty to use profile default">
-                <small class="hint">Override the target count for this specific job</small>
+                <small class="hint">How many emails to extract for this job. This does NOT affect worker count - workers are configured in the profile.</small>
               </div>
 
               <div class="checkbox-row">
