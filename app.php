@@ -808,6 +808,7 @@ class JobManager {
             'emails_rejected' => 0,
             'urls_processed' => 0,
             'errors' => 0,
+            'error_messages' => [], // Store error messages for UI display
             'worker_governor' => null,
             'hourly_stats' => [] // Track emails per hour
         ];
@@ -818,6 +819,60 @@ class JobManager {
         Utils::logMessage('INFO', "Job created: {$jobId} - {$name}");
         
         return $jobId;
+    }
+    
+    private function checkSystemRequirements() {
+        $errors = [];
+        
+        // Check if proc_open is available
+        if (!function_exists('proc_open')) {
+            $errors[] = 'proc_open function is not available. Enable it in php.ini';
+        }
+        
+        // Check if proc_close is available
+        if (!function_exists('proc_close')) {
+            $errors[] = 'proc_close function is not available. Enable it in php.ini';
+        }
+        
+        // Check memory
+        $memoryLimit = ini_get('memory_limit');
+        $memoryUsage = memory_get_usage(true) / 1024 / 1024;
+        if ($memoryUsage > 400) {
+            $errors[] = "High memory usage: {$memoryUsage}MB. Consider restarting PHP";
+        }
+        
+        // Check if we can write to data directory
+        if (!is_writable(Config::DATA_DIR) && !@mkdir(Config::DATA_DIR, 0755, true)) {
+            $errors[] = 'Cannot write to data directory: ' . Config::DATA_DIR;
+        }
+        
+        return $errors;
+    }
+    
+    private function addJobError($jobId, $error) {
+        if (!isset($this->jobs[$jobId])) {
+            return;
+        }
+        
+        if (!isset($this->jobs[$jobId]['error_messages'])) {
+            $this->jobs[$jobId]['error_messages'] = [];
+        }
+        
+        $this->jobs[$jobId]['error_messages'][] = [
+            'time' => time(),
+            'message' => $error
+        ];
+        
+        // Keep only last 10 errors
+        if (count($this->jobs[$jobId]['error_messages']) > 10) {
+            $this->jobs[$jobId]['error_messages'] = array_slice(
+                $this->jobs[$jobId]['error_messages'], 
+                -10
+            );
+        }
+        
+        $this->jobs[$jobId]['errors']++;
+        $this->saveJob($jobId);
     }
     
     public function startJob($jobId) {
@@ -831,34 +886,73 @@ class JobManager {
             throw new Exception("Job already running: {$jobId}");
         }
         
-        // Initialize worker governor with job configuration
-        $workerConfig = [
-            'job_id' => $jobId,
-            'api_key' => $job['api_key'],
-            'query' => $job['query'],
-            'max_emails' => $job['options']['max_emails'] ?? 10000,
-            'max_run_time' => 300
-        ];
-        $governor = new WorkerGovernor($jobId);
-        $job['worker_governor'] = $governor;
-        $job['status'] = 'running';
-        $job['started_at'] = time();
-        
-        // Spawn initial workers with full configuration
-        for ($i = 0; $i < Config::MIN_WORKERS_PER_JOB; $i++) {
-            $workerId = Utils::generateId('worker_');
-            try {
-                $governor->spawnWorker($workerId, $workerConfig);
-            } catch (Exception $e) {
-                Utils::logMessage('ERROR', "Failed to spawn worker: {$e->getMessage()}");
+        // Check system requirements
+        $systemErrors = $this->checkSystemRequirements();
+        if (!empty($systemErrors)) {
+            foreach ($systemErrors as $error) {
+                $this->addJobError($jobId, $error);
             }
+            throw new Exception("System requirements not met: " . implode(', ', $systemErrors));
         }
         
-        $this->saveJob($jobId);
+        // Validate API key exists
+        if (empty($job['api_key'])) {
+            $this->addJobError($jobId, "API key is missing");
+            throw new Exception("API key is required to start job");
+        }
         
-        Utils::logMessage('INFO', "Job started: {$jobId}");
+        // Validate query exists
+        if (empty($job['query'])) {
+            $this->addJobError($jobId, "Search query is missing");
+            throw new Exception("Search query is required to start job");
+        }
         
-        return true;
+        try {
+            // Initialize worker governor with job configuration
+            $workerConfig = [
+                'job_id' => $jobId,
+                'api_key' => $job['api_key'],
+                'query' => $job['query'],
+                'max_emails' => $job['options']['max_emails'] ?? 10000,
+                'max_run_time' => 300
+            ];
+            
+            $governor = new WorkerGovernor($jobId);
+            $job['worker_governor'] = $governor;
+            $job['status'] = 'running';
+            $job['started_at'] = time();
+            
+            // Spawn initial workers with full configuration
+            $workersSpawned = 0;
+            for ($i = 0; $i < Config::MIN_WORKERS_PER_JOB; $i++) {
+                $workerId = Utils::generateId('worker_');
+                try {
+                    $governor->spawnWorker($workerId, $workerConfig);
+                    $workersSpawned++;
+                    Utils::logMessage('INFO', "Worker spawned: {$workerId}");
+                } catch (Exception $e) {
+                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
+                    Utils::logMessage('ERROR', $errorMsg);
+                    $this->addJobError($jobId, $errorMsg);
+                }
+            }
+            
+            if ($workersSpawned === 0) {
+                $job['status'] = 'error';
+                $this->saveJob($jobId);
+                throw new Exception("Failed to spawn any workers. Check system requirements.");
+            }
+            
+            $this->saveJob($jobId);
+            Utils::logMessage('INFO', "Job started: {$jobId} with {$workersSpawned} workers");
+            
+            return true;
+        } catch (Exception $e) {
+            $job['status'] = 'error';
+            $this->addJobError($jobId, "Start failed: " . $e->getMessage());
+            $this->saveJob($jobId);
+            throw $e;
+        }
     }
     
     public function stopJob($jobId) {
@@ -1529,6 +1623,48 @@ class Application {
             color: #0c5460;
         }
         
+        .job-status.error {
+            background: #f8d7da;
+            color: #721c24;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        .job-errors {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 15px;
+        }
+        
+        .error-item {
+            display: flex;
+            gap: 10px;
+            padding: 5px 0;
+            font-size: 12px;
+            border-bottom: 1px solid #ffe69c;
+        }
+        
+        .error-item:last-child {
+            border-bottom: none;
+        }
+        
+        .error-time {
+            color: #856404;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        
+        .error-message {
+            color: #856404;
+            flex: 1;
+        }
+        
         .job-info {
             margin-bottom: 15px;
             font-size: 13px;
@@ -1865,12 +2001,28 @@ class Application {
                 const runtime = job.started_at ? ((Date.now() / 1000) - job.started_at) / 3600 : 0;
                 const emailsPerHour = runtime > 0 ? Math.round(acceptedEmails / runtime) : 0;
                 
+                // Get recent errors
+                const errorMessages = job.error_messages || [];
+                const recentErrors = errorMessages.slice(-3); // Show last 3 errors
+                
                 return `
                     <div class="job-card" data-job-id="${job.id}">
                         <div class="job-header">
                             <div class="job-title">${this.escapeHtml(job.name)}</div>
                             <div class="job-status ${statusClass}">${job.status}</div>
                         </div>
+                        
+                        ${recentErrors.length > 0 ? `
+                            <div class="job-errors">
+                                <strong style="color: #dc3545;">⚠ Recent Errors:</strong>
+                                ${recentErrors.map(err => `
+                                    <div class="error-item">
+                                        <span class="error-time">${new Date(err.time * 1000).toLocaleTimeString()}</span>
+                                        <span class="error-message">${this.escapeHtml(err.message)}</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        ` : ''}
                         
                         <div class="job-info">
                             <div class="job-info-item">
@@ -1927,6 +2079,8 @@ class Application {
                         <div class="job-actions">
                             ${job.status === 'running' ? `
                                 <button onclick="JobController.stopJob('${job.id}')" class="danger">Stop</button>
+                            ` : job.status === 'error' ? `
+                                <button onclick="JobController.startJob('${job.id}')" class="primary">Retry</button>
                             ` : `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Start</button>
                             `}
