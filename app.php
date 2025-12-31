@@ -2163,7 +2163,14 @@ class Router {
         
         // OPTIMIZATION: Use much shorter polling interval for near-instant job pickup
         // Changed from 5 seconds to 0.1 seconds for maximum parallel performance
-        $pollingInterval = 0.1; // 100ms - fast enough for real-time, efficient on CPU
+        // Can be configured via settings for fine-tuning based on system load
+        $pollingInterval = (float)(Settings::get('worker_polling_interval', '0.1')); // Default: 100ms
+        if ($pollingInterval < 0.01) {
+            $pollingInterval = 0.01; // Minimum 10ms to prevent CPU overload
+        }
+        if ($pollingInterval > 5.0) {
+            $pollingInterval = 5.0; // Maximum 5s (old behavior)
+        }
         
         // Track consecutive empty polls to implement adaptive backoff
         $emptyPollCount = 0;
@@ -2177,7 +2184,10 @@ class Router {
             
             // Check if worker has been idle too long (safety exit)
             $elapsedTime = microtime(true) - $workerStartTime;
-            if ($emptyPollCount > ($maxIdleTime / $pollingInterval) && $jobsProcessed === 0) {
+            // Calculate based on actual polling interval (converts to integer checks)
+            // For default 0.1s polling: 300s / 0.1s = 3000 checks
+            $maxIdleChecks = (int)($maxIdleTime / $pollingInterval);
+            if ($emptyPollCount > $maxIdleChecks && $jobsProcessed === 0) {
                 echo "Worker idle timeout ({$maxIdleTime}s) - no jobs found. Exiting.\n";
                 error_log("Worker {$workerName} exiting due to idle timeout after " . round($elapsedTime, 1) . "s");
                 break;
@@ -2215,8 +2225,8 @@ class Router {
                 // After extended idle time, use 1 second interval to save CPU
                 usleep(1000000); // 1 second
             } else {
-                // Active processing: use 100ms for near-instant parallel pickup
-                usleep(100000); // 0.1 seconds = 100ms
+                // Active processing: use configured polling interval for near-instant parallel pickup
+                usleep((int)($pollingInterval * 1000000)); // Convert seconds to microseconds
             }
         }
     }
@@ -4100,10 +4110,10 @@ class Router {
         error_log("spawnWorkersViaProcOpen: Starting PARALLEL spawn of {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
         
         $spawnedCount = 0;
-        $processes = []; // Store process handles to ensure they stay detached
         
         // OPTIMIZATION: Spawn all workers as fast as possible for true parallel execution
         // No delays between spawns - let OS handle scheduling
+        // Note: We don't store process handles - proc_open spawns detached processes
         for ($i = 0; $i < $workerCount; $i++) {
             try {
                 // Build command to run worker in queue mode
@@ -4141,9 +4151,9 @@ class Router {
                         fclose($pipes[0]);
                     }
                     
-                    // Store process handle to keep it alive (don't call proc_close yet)
-                    // This ensures the process continues running in the background
-                    $processes[] = $process;
+                    // Don't call proc_close - this allows the process to run in background
+                    // The process is now detached and will continue independently
+                    // No need to store handle - it will be garbage collected without blocking
                     
                     $spawnedCount++;
                     
@@ -4165,7 +4175,7 @@ class Router {
         error_log("spawnWorkersViaProcOpen: ✓ Successfully spawned {$spawnedCount}/{$workerCount} workers in {$elapsedTime}s ({$workersPerSecond} workers/sec) - ALL RUNNING IN PARALLEL");
         
         // All workers are now running independently in the background
-        // They will start processing queue items immediately with 100ms polling
+        // They will start processing queue items immediately with configurable polling
         return $spawnedCount;
     }
     
