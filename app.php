@@ -1,23 +1,76 @@
 <?php
 /**
- * MAFIA SINGLE SENDS ROTATION
+ * EMAIL EXTRACTION SYSTEM
  *
- * Professional Email Marketing System with Installation Wizard
+ * Professional Email Extraction Tool using serper.dev API
  * 
  * Features:
  * - Database Installation Wizard
  * - Admin Authentication System
- * - Multi-profile rotation sending
- * - Real-time campaign progress tracking
- * - Contact list management
- * - Email tracking (opens, clicks, bounces)
+ * - Multi-worker parallel extraction
+ * - Real-time job progress tracking
+ * - API job profiles management
+ * - Serper.dev API integration for email extraction
  * 
  * Enhanced with:
  * - First-time setup wizard with professional UI
  * - Secure admin login
  * - Automatic database table creation
- * - Fixed campaign status bug (campaigns no longer stuck at "sending")
+ * - Efficient parallel worker system
  */
+
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error.log');
+
+// Custom error handler for better debugging
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    $error_message = sprintf(
+        "[%s] Error #%d: %s in %s on line %d",
+        date('Y-m-d H:i:s'),
+        $errno,
+        $errstr,
+        $errfile,
+        $errline
+    );
+    error_log($error_message);
+    
+    // Display error in development mode ONLY if not an AJAX request
+    if (ini_get('display_errors') && !isset($_POST['action']) && !isset($_GET['action'])) {
+        echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
+        echo "<strong>Error:</strong> $errstr<br>";
+        echo "<strong>File:</strong> $errfile<br>";
+        echo "<strong>Line:</strong> $errline<br>";
+        echo "</div>";
+    }
+    return false;
+});
+
+// Exception handler
+set_exception_handler(function($exception) {
+    $error_message = sprintf(
+        "[%s] Exception: %s in %s on line %d\nStack trace:\n%s",
+        date('Y-m-d H:i:s'),
+        $exception->getMessage(),
+        $exception->getFile(),
+        $exception->getLine(),
+        $exception->getTraceAsString()
+    );
+    error_log($error_message);
+    
+    // Display exception in development mode ONLY if not an AJAX request
+    if (ini_get('display_errors') && !isset($_POST['action']) && !isset($_GET['action'])) {
+        echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
+        echo "<strong>Exception:</strong> " . htmlspecialchars($exception->getMessage()) . "<br>";
+        echo "<strong>File:</strong> " . htmlspecialchars($exception->getFile()) . "<br>";
+        echo "<strong>Line:</strong> " . $exception->getLine() . "<br>";
+        echo "<strong>Stack trace:</strong><br><pre>" . htmlspecialchars($exception->getTraceAsString()) . "</pre>";
+        echo "</div>";
+    }
+});
 
 ///////////////////////
 //  LOAD CONFIGURATION
@@ -53,31 +106,21 @@ if ($configExists) {
 //  CONSTANTS
 ///////////////////////
 // Brand configuration
-define('BRAND_NAME', 'MAFIA MAILER');
+define('BRAND_NAME', 'EMAIL EXTRACTOR');
 
-// Worker configuration defaults (kept for backward compatibility)
+// Worker configuration defaults for extraction
 define('DEFAULT_WORKERS', 4);
-define('DEFAULT_MESSAGES_PER_WORKER', 100);
+define('DEFAULT_EMAILS_PER_WORKER', 100);
 define('MIN_WORKERS', 1);
 // MAX_WORKERS removed - NO LIMIT on number of workers - accepts ANY value
-define('MIN_MESSAGES_PER_WORKER', 1);
-define('MAX_MESSAGES_PER_WORKER', 10000);
+define('MIN_EMAILS_PER_WORKER', 1);
+define('MAX_EMAILS_PER_WORKER', 10000);
 // IMPORTANT: This is ONLY for logging warnings - NOT a limit!
 // Workers can be set to ANY number (100, 500, 1000+)
 // This threshold just triggers informational log messages for monitoring
 define('WORKERS_LOG_WARNING_THRESHOLD', 50);
 
-// Connection Numbers configuration (MaxBulk Mailer style)
-define('DEFAULT_CONNECTIONS', 5);
-define('MIN_CONNECTIONS', 1);
-define('MAX_CONNECTIONS', 40);
-
-// Batch size configuration (emails per single SMTP connection)
-define('DEFAULT_BATCH_SIZE', 50);
-define('MIN_BATCH_SIZE', 1);
-define('MAX_BATCH_SIZE', 500);
-
-// Progress update frequency (update progress every N emails)
+// Progress update frequency (update progress every N emails extracted)
 define('PROGRESS_UPDATE_FREQUENCY', 10);
 
 // Cycle delay configuration (delay between worker processing cycles in milliseconds)
@@ -182,6 +225,34 @@ if (PHP_SAPI === 'cli' && isset($argv) && count($argv) > 1) {
         }
         exit(0);
     }
+    
+    if ($argv[1] === '--bg-extract') {
+        // Background extraction worker
+        $jobId = isset($argv[2]) ? (int)$argv[2] : 0;
+        if ($jobId > 0) {
+            try {
+                $job = get_job($pdo, $jobId);
+                if ($job && !empty($job['profile_id'])) {
+                    // Get profile information
+                    $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
+                    $profile_stmt->execute([$job['profile_id']]);
+                    $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+                    
+                    if ($profile) {
+                        // Perform extraction using the shared function
+                        perform_extraction($pdo, $jobId, $job, $profile);
+                    }
+                }
+            } catch (Exception $e) {
+                error_log("Background extraction worker failed for job {$jobId}: " . $e->getMessage());
+                try {
+                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error' WHERE id = ?");
+                    $stmt->execute([$jobId]);
+                } catch (Exception $e2) {}
+            }
+        }
+        exit(0);
+    }
 }
 
 session_start();
@@ -253,40 +324,25 @@ if (isset($_GET['action']) && $_GET['action'] === 'install') {
 }
 
 ///////////////////////
-//  OPTIONAL SCHEMA (Contacts + added columns)
+//  OPTIONAL SCHEMA (Job Profiles + Extraction Jobs)
 ///////////////////////
 // Only run schema updates if PDO is connected and user is authenticated
 if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_logged_in'] === true)) {
     try {
+        // Create extracted_emails table to store extracted emails
         $pdo->exec("
-            CREATE TABLE IF NOT EXISTS contact_lists (
+            CREATE TABLE IF NOT EXISTS extracted_emails (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                type ENUM('global','list') NOT NULL DEFAULT 'list',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS contacts (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                list_id INT NOT NULL,
+                job_id INT NOT NULL,
                 email VARCHAR(255) NOT NULL,
-                first_name VARCHAR(100) DEFAULT NULL,
-                last_name VARCHAR(100) DEFAULT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX(list_id),
+                source VARCHAR(500) DEFAULT NULL,
+                extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX(job_id),
                 INDEX(email)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         ");
 
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS unsubscribes (
-                email VARCHAR(255) PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-
-        // Create global settings table for tracking configuration
+        // Create global settings table
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS settings (
                 setting_key VARCHAR(100) PRIMARY KEY,
@@ -294,76 +350,80 @@ if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_lo
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         ");
-        
-        // Initialize default tracking settings
-        try {
-            $pdo->exec("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('open_tracking_enabled', '1')");
-            $pdo->exec("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('click_tracking_enabled', '1')");
-        } catch (Exception $e) {}
 
-        // Ensure sending_profiles has useful columns
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) NOT NULL DEFAULT ''"); } catch (Exception $e) {}
-        // Add provider column for profile identification
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS provider VARCHAR(100) NOT NULL DEFAULT 'Custom'"); } catch (Exception $e) {}
-        // Add connection_numbers field (MaxBulk Mailer style - concurrent SMTP connections)
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS connection_numbers INT NOT NULL DEFAULT 5"); } catch (Exception $e) {}
-        // Add batch_size field (number of emails to send per single SMTP connection)
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS batch_size INT NOT NULL DEFAULT 50"); } catch (Exception $e) {}
+        // Ensure job_profiles table exists (replacing sending_profiles)
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS job_profiles (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                profile_name VARCHAR(255) NOT NULL,
+                api_key TEXT NOT NULL,
+                search_query TEXT NOT NULL,
+                target_count INT DEFAULT 100,
+                filter_business_only TINYINT(1) DEFAULT 1,
+                country VARCHAR(100) DEFAULT '',
+                workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS . ",
+                emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER . ",
+                cycle_delay_ms INT NOT NULL DEFAULT " . DEFAULT_CYCLE_DELAY_MS . ",
+                active TINYINT(1) DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
 
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS unsubscribe_enabled TINYINT(1) NOT NULL DEFAULT 0"); } catch (Exception $e) {}
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) NOT NULL DEFAULT ''"); } catch (Exception $e) {}
-        // Add tracking settings columns
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS open_tracking_enabled TINYINT(1) NOT NULL DEFAULT 1"); } catch (Exception $e) {}
-        try { $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS click_tracking_enabled TINYINT(1) NOT NULL DEFAULT 1"); } catch (Exception $e) {}
-        // Add campaign progress tracking fields
+        // Ensure jobs table exists (renamed from campaigns)
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                status VARCHAR(50) DEFAULT 'draft',
+                profile_id INT DEFAULT NULL,
+                target_count INT DEFAULT 100,
+                progress_extracted INT NOT NULL DEFAULT 0,
+                progress_total INT NOT NULL DEFAULT 0,
+                progress_status VARCHAR(50) DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP NULL DEFAULT NULL,
+                completed_at TIMESTAMP NULL DEFAULT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
+
+        // Add job progress tracking fields if they don't exist
         try { 
-            $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS progress_sent INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS progress_total INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS progress_status VARCHAR(50) DEFAULT 'draft'");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_extracted INT NOT NULL DEFAULT 0");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_total INT NOT NULL DEFAULT 0");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_status VARCHAR(50) DEFAULT 'draft'");
         } catch (Exception $e) {}
-        try {
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS bounce_imap_server VARCHAR(255) DEFAULT ''");
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS bounce_imap_user VARCHAR(255) DEFAULT ''");
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS bounce_imap_pass VARCHAR(255) DEFAULT ''");
-        } catch (Exception $e) {}
-        
-        // Keep old fields for backward compatibility but they won't be shown in UI
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS send_rate INT NOT NULL DEFAULT 0"); } catch (Exception $e) {}
-        try { $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS sends_used INT NOT NULL DEFAULT 0"); } catch (Exception $e) {}
+
+        // Update rotation settings for extraction
         try {
             $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS);
-            $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS messages_per_worker INT NOT NULL DEFAULT " . DEFAULT_MESSAGES_PER_WORKER);
-        } catch (Exception $e) {}
-        try {
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS);
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS messages_per_worker INT NOT NULL DEFAULT " . DEFAULT_MESSAGES_PER_WORKER);
-            $pdo->exec("ALTER TABLE sending_profiles ADD COLUMN IF NOT EXISTS cycle_delay_ms INT NOT NULL DEFAULT " . DEFAULT_CYCLE_DELAY_MS);
+            $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER);
         } catch (Exception $e) {}
         
-        // RETROACTIVE FIX: Convert stuck campaigns to 'sent'
-        // Fix campaigns that are 100% complete but stuck at 'sending' status
+        // RETROACTIVE FIX: Convert stuck jobs to 'completed'
+        // Fix jobs that are 100% complete but stuck at 'extracting' status
         try {
             $pdo->exec("
-                UPDATE campaigns 
-                SET status = 'sent', 
-                    sent_at = COALESCE(sent_at, NOW()),
+                UPDATE jobs 
+                SET status = 'completed', 
+                    completed_at = COALESCE(completed_at, NOW()),
                     progress_status = 'completed'
-                WHERE status IN ('sending', 'queued')
+                WHERE status IN ('extracting', 'queued')
                   AND progress_total > 0
-                  AND progress_sent >= progress_total
-                  AND progress_sent > 0
+                  AND progress_extracted >= progress_total
+                  AND progress_extracted > 0
             ");
             
-            // Also fix campaigns where progress_status is 'completed' but main status is not 'sent'
+            // Also fix jobs where progress_status is 'completed' but main status is not 'completed'
+            // Only apply to jobs that have actually completed extraction (completed_at is set)
             $pdo->exec("
-                UPDATE campaigns 
-                SET status = 'sent', 
-                    sent_at = COALESCE(sent_at, NOW())
+                UPDATE jobs 
+                SET status = 'completed'
                 WHERE progress_status = 'completed'
-                  AND status != 'sent'
+                  AND status != 'completed'
+                  AND completed_at IS NOT NULL
             ");
         } catch (Exception $e) {
-            error_log("Retroactive campaign fix error: " . $e->getMessage());
+            error_log("Retroactive job fix error: " . $e->getMessage());
         }
     } catch (Exception $e) {
         // Log error but don't stop execution
@@ -740,6 +800,143 @@ function spawn_bounce_scan(PDO $pdo): bool {
 }
 
 /**
+ * Spawn a detached background PHP process to extract emails for a job
+ * Returns true if spawn was likely successful.
+ */
+function spawn_extraction_worker(PDO $pdo, int $jobId): bool {
+    $php = PHP_BINARY ?: 'php';
+    $script = $_SERVER['SCRIPT_FILENAME'] ?? __FILE__;
+    
+    // Build command for background extraction
+    $cmd = escapeshellcmd($php) . ' -f ' . escapeshellarg($script)
+         . ' -- ' . '--bg-extract ' . escapeshellarg((string)$jobId);
+    
+    // Try variants: with nohup, with & redirect, etc.
+    $candidates = [
+        $cmd . " > /dev/null 2>&1 &",
+        "nohup " . $cmd . " > /dev/null 2>&1 &",
+        $cmd,
+    ];
+    
+    foreach ($candidates as $c) {
+        if (try_background_exec($c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Perform email extraction for a job (called from fastcgi_finish_request or background worker)
+ * This is the core extraction logic, similar to send_campaign_real in the old system
+ */
+function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
+    error_log("PERFORM_EXTRACTION: ========== STARTING for job_id={$jobId} ==========");
+    error_log("PERFORM_EXTRACTION: Job data: " . json_encode($job));
+    error_log("PERFORM_EXTRACTION: Profile data: " . json_encode($profile));
+    
+    try {
+        // Update status to extracting
+        error_log("PERFORM_EXTRACTION: Updating job status to 'extracting'");
+        $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
+        $stmt->execute([$jobId]);
+        error_log("PERFORM_EXTRACTION: Job status updated successfully");
+        
+        // Get extraction parameters
+        $apiKey = $profile['api_key'] ?? '';
+        $searchQuery = $profile['search_query'] ?? '';
+        $country = $profile['country'] ?? '';
+        $businessOnly = !empty($profile['business_only']);
+        $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)($profile['target_count'] ?? 100);
+        
+        error_log("PERFORM_EXTRACTION: Parameters - apiKey=" . (empty($apiKey) ? 'EMPTY' : 'SET') . ", searchQuery='{$searchQuery}', country='{$country}', businessOnly=" . ($businessOnly ? 'YES' : 'NO') . ", targetCount={$targetCount}");
+        
+        if (empty($apiKey) || empty($searchQuery)) {
+            error_log("PERFORM_EXTRACTION: ERROR - API key or search query is missing");
+            throw new Exception("API key or search query is missing");
+        }
+        
+        // Call serper.dev API to extract emails
+        error_log("PERFORM_EXTRACTION: Calling extract_emails_serper()...");
+        $result = extract_emails_serper($apiKey, $searchQuery, $country, $businessOnly, $targetCount);
+        error_log("PERFORM_EXTRACTION: extract_emails_serper() returned: success=" . ($result['success'] ? 'YES' : 'NO'));
+        
+        if (isset($result['log']) && is_array($result['log'])) {
+            foreach ($result['log'] as $logEntry) {
+                error_log("PERFORM_EXTRACTION: API LOG: " . $logEntry);
+            }
+        }
+        
+        if (!$result['success']) {
+            // Mark job as failed and store error message
+            $errorMsg = $result['error'] ?? 'Unknown error';
+            error_log("PERFORM_EXTRACTION: Extraction failed: {$errorMsg}");
+            error_log("PERFORM_EXTRACTION: Full error details: " . json_encode($result));
+            // Store complete error message + full API log for UI display
+            $apiLog = isset($result['log']) ? implode("\n", $result['log']) : '';
+            $fullError = $errorMsg . "\n\n--- API Log ---\n" . $apiLog;
+            
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
+            $stmt->execute([$fullError, $jobId]);
+            error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log'] ?? []));
+            throw new Exception("API extraction failed: {$errorMsg}");
+        }
+        
+        $extractedEmails = $result['emails'] ?? [];
+        $extractedCount = 0;
+        error_log("PERFORM_EXTRACTION: Got " . count($extractedEmails) . " emails from serper.dev");
+        
+        // Store extracted emails in database
+        foreach ($extractedEmails as $emailData) {
+            try {
+                $stmt = $pdo->prepare("INSERT INTO extracted_emails (job_id, email, source, extracted_at) VALUES (?, ?, ?, NOW())");
+                $stmt->execute([
+                    $jobId,
+                    $emailData['email'],
+                    $emailData['source'] ?? ''
+                ]);
+                $extractedCount++;
+                
+                // Update progress every 10 emails
+                if ($extractedCount % 10 === 0) {
+                    $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
+                    $stmt->execute([$extractedCount, $jobId]);
+                    error_log("PERFORM_EXTRACTION: Progress update - {$extractedCount} emails extracted so far");
+                }
+            } catch (Exception $e) {
+                // Skip duplicate emails (unique constraint violation)
+                error_log("PERFORM_EXTRACTION: Skipping duplicate email: " . ($emailData['email'] ?? 'unknown'));
+                continue;
+            }
+        }
+        
+        // Mark job as completed
+        error_log("PERFORM_EXTRACTION: Marking job as completed");
+        $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$extractedCount, $jobId]);
+        
+        error_log("PERFORM_EXTRACTION: Job {$jobId} completed successfully. Extracted {$extractedCount} emails.");
+        error_log("PERFORM_EXTRACTION: ========== FINISHED ==========");
+        
+    } catch (Throwable $e) {
+        // Mark job as failed
+        error_log("PERFORM_EXTRACTION: EXCEPTION CAUGHT - " . $e->getMessage());
+        error_log("PERFORM_EXTRACTION: Exception file: " . $e->getFile() . " line: " . $e->getLine());
+        error_log("PERFORM_EXTRACTION: Stack trace: " . $e->getTraceAsString());
+        
+        try {
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
+            $stmt->execute([$e->getMessage(), $jobId]);
+            error_log("PERFORM_EXTRACTION: Job marked as draft due to error");
+        } catch (Exception $e2) {
+            error_log("PERFORM_EXTRACTION: Failed to mark job as draft: " . $e2->getMessage());
+        }
+        error_log("PERFORM_EXTRACTION: Job {$jobId} extraction error: " . $e->getMessage());
+        throw $e;
+    }
+}
+
+/**
  * Get a global setting value
  */
 function get_setting(PDO $pdo, string $key, string $default = ''): string {
@@ -885,6 +1082,142 @@ function build_tracked_html(array $campaign, string $recipientEmail = ''): strin
     }
 
     return $html;
+}
+
+/**
+ * Extract emails using serper.dev API
+ * @param string $apiKey The serper.dev API key
+ * @param string $query Search query (e.g., "real estate agents california")
+ * @param string $country Optional country code (e.g., "us")
+ * @param bool $businessOnly Filter for business emails only
+ * @param int $numResults Number of results to fetch (default: 10)
+ * @return array Array with 'success' boolean and 'emails' array or 'error' string
+ */
+function extract_emails_serper(string $apiKey, string $query, string $country = '', bool $businessOnly = true, int $numResults = 10): array {
+    $log = [];
+    
+    if ($apiKey === '' || $query === '') {
+        return ['success' => false, 'error' => 'Missing API key or search query', 'log' => $log];
+    }
+    
+    $apiUrl = 'https://google.serper.dev/search';
+    
+    // Build request payload
+    $payload = [
+        'q' => $query,
+        'num' => min($numResults, 100) // serper.dev typically supports up to 100 results
+    ];
+    
+    if ($country !== '') {
+        $payload['gl'] = $country;
+    }
+    
+    $headers = [
+        'X-API-KEY: ' . $apiKey,
+        'Content-Type: application/json'
+    ];
+    
+    $log[] = 'Calling serper.dev API...';
+    $log[] = 'Query: ' . $query;
+    if ($country) $log[] = 'Country: ' . $country;
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $apiUrl);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    
+    if ($response === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        $log[] = 'cURL error: ' . $error;
+        return ['success' => false, 'error' => 'API request failed: ' . $error, 'log' => $log];
+    }
+    
+    curl_close($ch);
+    
+    $log[] = 'HTTP Code: ' . $httpCode;
+    $log[] = 'Response length: ' . strlen($response) . ' bytes';
+    $log[] = 'First 500 chars of response: ' . substr($response, 0, 500);
+    
+    if ($httpCode !== 200) {
+        $log[] = 'FULL ERROR RESPONSE: ' . $response;
+        return ['success' => false, 'error' => "HTTP $httpCode: " . substr($response, 0, 200), 'log' => $log];
+    }
+    
+    $data = json_decode($response, true);
+    if (!is_array($data)) {
+        $log[] = 'Invalid JSON response';
+        return ['success' => false, 'error' => 'Invalid API response', 'log' => $log];
+    }
+    
+    // Extract emails from search results
+    $emails = [];
+    // More robust email pattern that prevents multiple consecutive dots
+    $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
+    
+    // Check organic results
+    if (isset($data['organic']) && is_array($data['organic'])) {
+        foreach ($data['organic'] as $result) {
+            $text = '';
+            if (isset($result['snippet'])) $text .= ' ' . $result['snippet'];
+            if (isset($result['title'])) $text .= ' ' . $result['title'];
+            if (isset($result['link'])) $text .= ' ' . $result['link'];
+            
+            // Extract all emails from text
+            if (preg_match_all($emailPattern, $text, $matches)) {
+                foreach ($matches[0] as $email) {
+                    $email = strtolower($email);
+                    
+                    // Additional validation: check for @ symbol
+                    $atPos = strpos($email, '@');
+                    if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
+                        continue; // Invalid email format
+                    }
+                    
+                    // Filter business emails if requested
+                    if ($businessOnly) {
+                        // Skip common free email providers
+                        $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
+                        $domain = substr($email, $atPos + 1);
+                        if (in_array($domain, $freeProviders)) {
+                            continue;
+                        }
+                    }
+                    
+                    // Check if email already added
+                    $emailExists = false;
+                    foreach ($emails as $existingEmail) {
+                        if ($existingEmail['email'] === $email) {
+                            $emailExists = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!$emailExists) {
+                        $emails[] = [
+                            'email' => $email,
+                            'source' => $result['link'] ?? $query
+                        ];
+                    }
+                }
+            }
+        }
+    }
+    
+    $log[] = 'Extracted ' . count($emails) . ' unique emails';
+    
+    return [
+        'success' => true,
+        'emails' => $emails,
+        'log' => $log
+    ];
 }
 
 function smtp_check_connection(array $profile): array {
@@ -2038,74 +2371,50 @@ function api_send_batch(array $profile, array $campaign, array $recipients, arra
     ];
 }
 
-function get_campaign(PDO $pdo, int $id) {
-    $stmt = $pdo->prepare("SELECT * FROM campaigns WHERE id = ?");
+function get_job(PDO $pdo, int $id) {
+    $stmt = $pdo->prepare("SELECT * FROM jobs WHERE id = ?");
     $stmt->execute([$id]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$row) return false;
-    if (isset($row['html']) && is_string($row['html'])) {
-        if (strpos($row['html'], 'BASE64:') === 0) {
-            $decoded = base64_decode(substr($row['html'], 7));
-            if ($decoded !== false) {
-                $row['html'] = $decoded;
-            }
-        }
-    }
-    return $row;
+    return $row ?: false;
 }
 
-function get_campaign_stats(PDO $pdo, int $id) {
+// Keep get_campaign as alias for backward compatibility during transition
+function get_campaign(PDO $pdo, int $id) {
+    return get_job($pdo, $id);
+}
+
+function get_job_stats(PDO $pdo, int $id) {
     $stats = [
-        'delivered'   => 0,
-        'delivered_raw' => 0,
-        'open'        => 0,
-        'click'       => 0,
-        'bounce'      => 0,
-        'spam'        => 0,
-        'unsubscribe' => 0,
-        'sent_attempts' => 0,
+        'extracted'   => 0,
+        'queries_processed' => 0,
         'target' => 0,
-        'target_after_bounces' => 0,
+        'progress_extracted' => 0,
+        'progress_total' => 0,
     ];
 
-    $stmt = $pdo->prepare("SELECT event_type, COUNT(*) as cnt FROM events WHERE campaign_id = ? GROUP BY event_type");
-    $stmt->execute([$id]);
-    foreach ($stmt as $row) {
-        $etype = $row['event_type'];
-        $cnt = (int)$row['cnt'];
-        if ($etype === 'delivered') {
-            $stats['delivered_raw'] = $cnt;
-        } elseif ($etype === 'bounce') {
-            $stats['bounce'] = $cnt;
-        } elseif (isset($stats[$etype])) {
-            $stats[$etype] = $cnt;
+    try {
+        // Get job details from jobs table
+        $stmt = $pdo->prepare("SELECT target_count, progress_extracted, progress_total FROM jobs WHERE id = ? LIMIT 1");
+        $stmt->execute([$id]);
+        $job = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($job) {
+            $stats['target'] = (int)($job['target_count'] ?? 0);
+            $stats['progress_extracted'] = (int)($job['progress_extracted'] ?? 0);
+            $stats['progress_total'] = (int)($job['progress_total'] ?? 0);
         }
+        
+        // Get actual count of extracted emails from extracted_emails table
+        $stmt2 = $pdo->prepare("SELECT COUNT(*) FROM extracted_emails WHERE job_id = ?");
+        $stmt2->execute([$id]);
+        $stats['extracted'] = (int)$stmt2->fetchColumn();
+        
+        // Queries processed is same as progress_extracted for now
+        $stats['queries_processed'] = $stats['progress_extracted'];
+        
+    } catch (Exception $e) {
+        // If tables don't exist yet, return default stats
     }
-
-    $stats['delivered'] = max(0, $stats['delivered_raw'] - $stats['bounce']);
-    $stats['sent_attempts'] = $stats['delivered_raw'] + $stats['bounce'];
-
-    try {
-        $stmt2 = $pdo->prepare("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND event_type = ?");
-        $stmt2->execute([$id, 'skipped_unsubscribe']);
-        $skipped = (int)$stmt2->fetchColumn();
-        if ($skipped > 0) {
-            $stats['unsubscribe'] += $skipped;
-        }
-    } catch (Exception $e) {}
-
-    try {
-        $stmtc = $pdo->prepare("SELECT total_recipients FROM campaigns WHERE id = ? LIMIT 1");
-        $stmtc->execute([$id]);
-        $camp = $stmtc->fetch(PDO::FETCH_ASSOC);
-        $target = 0;
-        if ($camp) {
-            // Audience column doesn't exist in user's table, use total_recipients instead
-            $target = (int)($camp['total_recipients'] ?? 0);
-        }
-        $stats['target'] = $target;
-        $stats['target_after_bounces'] = max(0, $target - $stats['bounce']);
-    } catch (Exception $e) {}
 
     return $stats;
 }
@@ -2156,7 +2465,7 @@ function get_campaign_progress(PDO $pdo, int $campaignId): array {
 }
 
 function get_profiles(PDO $pdo) {
-    $stmt = $pdo->query("SELECT * FROM sending_profiles ORDER BY id ASC");
+    $stmt = $pdo->query("SELECT * FROM job_profiles ORDER BY id ASC");
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
@@ -2172,19 +2481,18 @@ function get_rotation_settings(PDO $pdo) {
 }
 
 function update_rotation_settings(PDO $pdo, array $data) {
-    // Only update columns that exist in the schema (rotation_enabled, workers, messages_per_worker)
-    // Older columns like batch_size and max_sends_per_profile may not exist
+    // Only update columns that exist in the schema (rotation_enabled, workers, emails_per_worker)
     $stmt = $pdo->prepare("
         UPDATE rotation_settings
         SET rotation_enabled = :rotation_enabled,
             workers = :workers,
-            messages_per_worker = :messages_per_worker
+            emails_per_worker = :emails_per_worker
         WHERE id = 1
     ");
     $stmt->execute([
         ':rotation_enabled'      => $data['rotation_enabled'],
         ':workers'               => $data['workers'] ?? 4,
-        ':messages_per_worker'   => $data['messages_per_worker'] ?? 100,
+        ':emails_per_worker'     => $data['emails_per_worker'] ?? $data['messages_per_worker'] ?? 100,
     ]);
 }
 
@@ -4241,14 +4549,14 @@ if ($action === 'get_campaign_progress') {
     }
 }
 
-if ($action === 'create_campaign') {
+if ($action === 'create_job' || $action === 'create_campaign') {
     $name = trim($_POST['name'] ?? '');
     if ($name === '') {
-        $name = 'New Single Send';
+        $name = 'New Extraction Job';
     }
     $stmt = $pdo->prepare("
-        INSERT INTO campaigns (name, subject, preheader, status)
-        VALUES (?, '', '', 'draft')
+        INSERT INTO jobs (name, status)
+        VALUES (?, 'draft')
     ");
     $stmt->execute([$name]);
     $newId = (int)$pdo->lastInsertId();
@@ -4256,26 +4564,22 @@ if ($action === 'create_campaign') {
     exit;
 }
 
-if ($action === 'duplicate_campaign') {
-    $cid = (int)($_POST['campaign_id'] ?? 0);
-    if ($cid > 0) {
+if ($action === 'duplicate_job' || $action === 'duplicate_campaign') {
+    $jid = (int)($_POST['job_id'] ?? $_POST['campaign_id'] ?? 0);
+    if ($jid > 0) {
         try {
-            $orig = get_campaign($pdo, $cid);
+            $orig = get_job($pdo, $jid);
             if ($orig) {
                 $newName = $orig['name'] . ' (Copy)';
+                // Create new job with clean state - no timestamps, no progress, no errors
                 $stmt = $pdo->prepare("
-                    INSERT INTO campaigns (name, subject, preheader, from_email, html, unsubscribe_enabled, sender_name, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')
+                    INSERT INTO jobs (name, profile_id, target_count, status, progress_status, progress_extracted, progress_total, started_at, completed_at, error_message)
+                    VALUES (?, ?, ?, 'draft', NULL, 0, 0, NULL, NULL, NULL)
                 ");
-                $htmlToStore = is_string($orig['html']) ? ('BASE64:' . base64_encode($orig['html'])) : '';
                 $stmt->execute([
                     $newName,
-                    $orig['subject'] ?? '',
-                    $orig['preheader'] ?? '',
-                    $orig['from_email'] ?? '',
-                    $htmlToStore,
-                    $orig['unsubscribe_enabled'] ?? 0,
-                    $orig['sender_name'] ?? '',
+                    $orig['profile_id'] ?? null,
+                    $orig['target_count'] ?? 100,
                 ]);
                 $newId = (int)$pdo->lastInsertId();
                 header("Location: ?page=editor&id={$newId}");
@@ -4287,8 +4591,8 @@ if ($action === 'duplicate_campaign') {
     exit;
 }
 
-if ($action === 'bulk_campaigns') {
-    $ids = $_POST['campaign_ids'] ?? [];
+if ($action === 'bulk_jobs' || $action === 'bulk_campaigns') {
+    $ids = $_POST['job_ids'] ?? $_POST['campaign_ids'] ?? [];
     $bulk_action = $_POST['bulk_action'] ?? '';
     if (!is_array($ids) || empty($ids)) {
         header("Location: ?page=list");
@@ -4298,31 +4602,26 @@ if ($action === 'bulk_campaigns') {
     if ($bulk_action === 'delete_selected') {
         foreach ($ids as $id) {
             try {
-                $stmt = $pdo->prepare("DELETE FROM events WHERE campaign_id = ?");
+                $stmt = $pdo->prepare("DELETE FROM extracted_emails WHERE job_id = ?");
                 $stmt->execute([$id]);
-                $stmt = $pdo->prepare("DELETE FROM campaigns WHERE id = ?");
+                $stmt = $pdo->prepare("DELETE FROM jobs WHERE id = ?");
                 $stmt->execute([$id]);
             } catch (Exception $e) {}
         }
     } elseif ($bulk_action === 'duplicate_selected') {
         foreach ($ids as $id) {
             try {
-                $orig = get_campaign($pdo, $id);
+                $orig = get_job($pdo, $id);
                 if ($orig) {
                     $newName = $orig['name'] . ' (Copy)';
                     $stmt = $pdo->prepare("
-                        INSERT INTO campaigns (name, subject, preheader, from_email, html, unsubscribe_enabled, sender_name, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')
+                        INSERT INTO jobs (name, profile_id, target_count, status)
+                        VALUES (?, ?, ?, 'draft')
                     ");
-                    $htmlToStore = is_string($orig['html']) ? ('BASE64:' . base64_encode($orig['html'])) : '';
                     $stmt->execute([
                         $newName,
-                        $orig['subject'] ?? '',
-                        $orig['preheader'] ?? '',
-                        $orig['from_email'] ?? '',
-                        $htmlToStore,
-                        $orig['unsubscribe_enabled'] ?? 0,
-                        $orig['sender_name'] ?? '',
+                        $orig['profile_id'] ?? null,
+                        $orig['target_count'] ?? 100,
                     ]);
                 }
             } catch (Exception $e) {}
@@ -4359,14 +4658,14 @@ if ($action === 'delete_bounces') {
     exit;
 }
 
-if ($action === 'delete_campaign') {
-    $cid = (int)($_POST['campaign_id'] ?? 0);
-    if ($cid > 0) {
+if ($action === 'delete_job' || $action === 'delete_campaign') {
+    $jid = (int)($_POST['job_id'] ?? $_POST['campaign_id'] ?? 0);
+    if ($jid > 0) {
         try {
-            $stmt = $pdo->prepare("DELETE FROM events WHERE campaign_id = ?");
-            $stmt->execute([$cid]);
-            $stmt = $pdo->prepare("DELETE FROM campaigns WHERE id = ?");
-            $stmt->execute([$cid]);
+            $stmt = $pdo->prepare("DELETE FROM extracted_emails WHERE job_id = ?");
+            $stmt->execute([$jid]);
+            $stmt = $pdo->prepare("DELETE FROM jobs WHERE id = ?");
+            $stmt->execute([$jid]);
         } catch (Exception $e) {
             // ignore
         }
@@ -4375,40 +4674,63 @@ if ($action === 'delete_campaign') {
     exit;
 }
 
-if ($action === 'save_campaign') {
+if ($action === 'save_job' || $action === 'save_campaign') {
     $id        = (int)($_POST['id'] ?? 0);
-    $subject   = trim($_POST['subject'] ?? '');
-    $preheader = trim($_POST['preheader'] ?? '');
-    $audience  = trim($_POST['audience'] ?? '');
-    $html      = $_POST['html'] ?? '';
-
-    $rot       = get_rotation_settings($pdo);
-    $rotOn     = (int)$rot['rotation_enabled'] === 1;
-
-    if ($rotOn) {
-        $existing   = get_campaign($pdo, $id);
-        $fromEmail  = $existing ? $existing['from_email'] : '';
-    } else {
-        $fromEmail  = trim($_POST['from_email'] ?? '');
-    }
-
-    $unsubscribe_enabled = isset($_POST['unsubscribe_enabled']) ? 1 : 0;
-    $sender_name = trim($_POST['sender_name'] ?? '');
-
-    $htmlToStore = 'BASE64:' . base64_encode($html);
+    $name      = trim($_POST['name'] ?? '');
+    $profile_id = (int)($_POST['profile_id'] ?? 0);
+    $target_count = (int)($_POST['target_count'] ?? 0);
+    $start_immediately = isset($_POST['start_immediately']) && $_POST['start_immediately'];
+    
+    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, target_count={$target_count}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
 
     try {
-        $stmt = $pdo->prepare("
-            UPDATE campaigns
-            SET subject = ?, preheader = ?, from_email = ?, html = ?, unsubscribe_enabled = ?, sender_name = ?
-            WHERE id = ?
-        ");
-        $stmt->execute([$subject, $preheader, $fromEmail, $htmlToStore, $unsubscribe_enabled, $sender_name, $id]);
+        if ($target_count > 0) {
+            $stmt = $pdo->prepare("
+                UPDATE jobs
+                SET name = ?, profile_id = ?, target_count = ?
+                WHERE id = ?
+            ");
+            $stmt->execute([$name, $profile_id, $target_count, $id]);
+            error_log("SAVE_JOB ACTION: Job {$id} updated with target_count");
+        } else {
+            $stmt = $pdo->prepare("
+                UPDATE jobs
+                SET name = ?, profile_id = ?
+                WHERE id = ?
+            ");
+            $stmt->execute([$name, $profile_id, $id]);
+            error_log("SAVE_JOB ACTION: Job {$id} updated without target_count");
+        }
+        
+        // Verify save was successful
+        $verify = $pdo->prepare("SELECT id, name, profile_id, target_count, status FROM jobs WHERE id = ?");
+        $verify->execute([$id]);
+        $saved_job = $verify->fetch(PDO::FETCH_ASSOC);
+        error_log("SAVE_JOB ACTION: Verified job after save: " . json_encode($saved_job));
+        
+        // Check if should start immediately
+        if ($start_immediately) {
+            error_log("SAVE_JOB ACTION: start_immediately flag detected, auto-submitting to start_job action");
+            // Auto-submit form to start_job action in hidden iframe (no visible intermediate page)
+            echo '<iframe name="hiddenFrame" style="display:none;"></iframe>';
+            echo '<form id="startForm" method="POST" action="?page=list" target="hiddenFrame">';
+            echo '<input type="hidden" name="action" value="start_job">';
+            echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
+            echo '</form>';
+            echo '<script>';
+            echo 'console.log("SAVE_JOB: Auto-submitting start_job form for job_id=' . (int)$id . '");';
+            echo 'document.getElementById("startForm").submit();';
+            echo 'setTimeout(function() { window.location.href = "?page=list"; }, 500);';
+            echo '</script>';
+            exit;
+        } else {
+            error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
+        }
     } catch (Exception $e) {
-        error_log("Failed to save campaign id {$id}: " . $e->getMessage());
+        error_log("Failed to save job id {$id}: " . $e->getMessage());
         if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) || strpos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== false) {
             http_response_code(500);
-            echo json_encode(['error' => 'Failed to save campaign']);
+            echo json_encode(['error' => 'Failed to save job']);
             exit;
         }
         header("Location: ?page=editor&id={$id}&save_error=1");
@@ -4425,6 +4747,135 @@ if ($action === 'save_campaign') {
         }
         header("Location: ?page=editor&id={$id}&saved=1");
     }
+    exit;
+}
+
+// Start extraction job action
+if ($action === 'start_job') {
+    $job_id = (int)($_POST['job_id'] ?? $_GET['job_id'] ?? 0);
+    error_log("START_JOB ACTION: ========== STARTING ==========");
+    error_log("START_JOB ACTION: Received job_id=" . $job_id);
+    error_log("START_JOB ACTION: POST data: " . json_encode($_POST));
+    error_log("START_JOB ACTION: GET data: " . json_encode($_GET));
+    
+    if ($job_id <= 0) {
+        error_log("START_JOB ACTION: ERROR - Invalid job_id (<=0)");
+        header("Location: ?page=list&error=invalid_job_id");
+        exit;
+    }
+    
+    if ($job_id > 0) {
+        error_log("START_JOB ACTION: Calling get_job() for job_id={$job_id}");
+        $job = get_job($pdo, $job_id);
+        error_log("START_JOB ACTION: Job fetched: " . ($job ? "YES" : "NO"));
+        
+        if ($job) {
+            error_log("START_JOB ACTION: Job details: " . json_encode($job));
+            error_log("START_JOB ACTION: profile_id = " . ($job['profile_id'] ?? 'NULL') . " (empty=" . (empty($job['profile_id']) ? 'YES' : 'NO') . ")");
+        }
+        
+        if (!$job) {
+            error_log("START_JOB ACTION: ERROR - Job not found in database");
+            header("Location: ?page=list&error=job_not_found");
+            exit;
+        }
+        
+        if (empty($job['profile_id'])) {
+            error_log("START_JOB ACTION: ERROR - Job has no profile_id assigned");
+            header("Location: ?page=list&error=no_profile");
+            exit;
+        }
+        
+        if ($job && !empty($job['profile_id'])) {
+            error_log("START_JOB ACTION: Job and profile_id valid, continuing...");
+            try {
+                // Get profile information
+                $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
+                $profile_stmt->execute([$job['profile_id']]);
+                $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+                
+                error_log("START_JOB ACTION: Profile fetched: " . ($profile ? "YES (id=" . $profile['id'] . ")" : "NO"));
+                
+                if ($profile) {
+                    // Use target from job or profile
+                    $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)$profile['target_count'];
+                    
+                    // Update job status to extracting immediately (like old "sending" status)
+                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting', progress_total = ?, started_at = NOW() WHERE id = ?");
+                    $stmt->execute([$targetCount, $job_id]);
+                    error_log("START_JOB ACTION: Job {$job_id} status updated to 'extracting', progress_total={$targetCount}");
+                    
+                    $redirect = "?page=list&started_job=" . (int)$job_id;
+                    
+                    // Close session to allow immediate redirect
+                    session_write_close();
+                    
+                    // Use fastcgi_finish_request if available (like old email sending system)
+                    if (function_exists('fastcgi_finish_request')) {
+                        error_log("START_JOB ACTION: Using fastcgi_finish_request method");
+                        header("Location: $redirect");
+                        echo "<!doctype html><html><body>Extracting emails in background... Redirecting.</body></html>";
+                        @ob_end_flush();
+                        @flush();
+                        fastcgi_finish_request();
+                        
+                        ignore_user_abort(true);
+                        set_time_limit(0);
+                        
+                        // Execute extraction in same process (non-blocking for user)
+                        try {
+                            error_log("START_JOB ACTION: Starting perform_extraction for job {$job_id}");
+                            perform_extraction($pdo, $job_id, $job, $profile);
+                            error_log("START_JOB ACTION: perform_extraction completed for job {$job_id}");
+                        } catch (Throwable $e) {
+                            error_log("Job extraction error: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
+                            error_log("Stack trace: " . $e->getTraceAsString());
+                        }
+                        exit;
+                    }
+                    
+                    // Fallback: Try background worker (if fastcgi not available)
+                    error_log("START_JOB ACTION: fastcgi not available, trying background worker");
+                    $spawned = spawn_extraction_worker($pdo, $job_id);
+                    error_log("START_JOB ACTION: Worker spawn result: " . ($spawned ? "SUCCESS" : "FAILED"));
+                    
+                    if ($spawned) {
+                        header("Location: $redirect");
+                        exit;
+                    }
+                    
+                    // Last resort: synchronous extraction (blocking but works everywhere)
+                    error_log("START_JOB ACTION: Using synchronous (blocking) method");
+                    header("Location: $redirect");
+                    echo "<!doctype html><html><body>Extracting emails... Please wait.</body></html>";
+                    @ob_end_flush();
+                    @flush();
+                    
+                    ignore_user_abort(true);
+                    set_time_limit(0);
+                    
+                    try {
+                        perform_extraction($pdo, $job_id, $job, $profile);
+                        error_log("START_JOB ACTION: Synchronous extraction completed for job {$job_id}");
+                    } catch (Throwable $e) {
+                        error_log("Job extraction error (blocking): " . $e->getMessage());
+                    }
+                    exit;
+                }
+                error_log("START_JOB ACTION: Profile not found for job {$job_id}");
+            } catch (Exception $e) {
+                error_log("Failed to start job {$job_id}: " . $e->getMessage());
+                header("Location: ?page=editor&id={$job_id}&error=" . urlencode($e->getMessage()));
+                exit;
+            }
+        } else {
+            error_log("START_JOB ACTION: Job check failed - job exists: " . ($job ? "YES" : "NO") . ", has profile_id: " . (!empty($job['profile_id']) ? "YES" : "NO"));
+        }
+    } else {
+        error_log("START_JOB ACTION: Invalid job_id: " . $job_id);
+    }
+    error_log("START_JOB ACTION: Redirecting to list page (fallback)");
+    header("Location: ?page=list");
     exit;
 }
 
@@ -4966,161 +5417,181 @@ if ($action === 'save_rotation') {
         error_log("Info: Rotation settings saved with $workers workers (NOT an error)");
     }
     
-    $messages_per_worker   = max(MIN_MESSAGES_PER_WORKER, min(MAX_MESSAGES_PER_WORKER, (int)($_POST['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER)));
+    $emails_per_worker   = max(MIN_EMAILS_PER_WORKER, min(MAX_EMAILS_PER_WORKER, (int)($_POST['emails_per_worker'] ?? $_POST['messages_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER)));
     
-    // Keep default values for backward compatibility (not shown in UI)
-    $rotation_mode         = 'sequential';
-    $batch_size            = 1;
-    $max_sends_per_profile = 0;
-
     update_rotation_settings($pdo, [
         'rotation_enabled'      => $rotation_enabled,
-        'mode'                  => $rotation_mode,
-        'batch_size'            => $batch_size,
-        'max_sends_per_profile' => $max_sends_per_profile,
         'workers'               => $workers,
-        'messages_per_worker'   => $messages_per_worker,
+        'emails_per_worker'     => $emails_per_worker,
     ]);
 
     header("Location: ?page=list&rot_saved=1");
     exit;
 }
 
+// Test API Connection Action
+if ($action === 'test_connection') {
+    // Completely suppress all output/errors before JSON
+    @ini_set('display_errors', 0);
+    @error_reporting(0);
+    
+    // Clear ALL output buffers
+    while (ob_get_level()) @ob_end_clean();
+    @ob_start();
+    
+    header('Content-Type: application/json; charset=utf-8');
+    
+    try {
+        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : 0;
+        $api_key = trim($_POST['api_key'] ?? '');
+        $search_query = trim($_POST['search_query'] ?? '');
+        
+        // If profile_id provided, fetch from database
+        if ($profile_id > 0) {
+            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
+            $stmt->execute([$profile_id]);
+            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($profile) {
+                $api_key = $profile['api_key'];
+                $search_query = $profile['search_query'];
+            }
+        }
+        
+        if (empty($api_key)) {
+            @ob_end_clean();
+            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        if (empty($search_query)) {
+            @ob_end_clean();
+            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // Test API call
+        $start_time = microtime(true);
+        $ch = curl_init('https://google.serper.dev/search');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'X-API-KEY: ' . $api_key,
+            'Content-Type: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+            'q' => $search_query,
+            'num' => 10
+        ]));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+        
+        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
+        
+        if ($curl_error) {
+            @ob_end_clean();
+            echo json_encode([
+                'success' => false,
+                'error' => 'Connection error: ' . $curl_error,
+                'http_code' => 0,
+                'elapsed_ms' => $elapsed_time
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $response_preview = substr($response, 0, 500);
+        
+        if ($http_code === 200) {
+            $data = json_decode($response, true);
+            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
+            
+            @ob_end_clean();
+            echo json_encode([
+                'success' => true,
+                'message' => '✓ Connection successful!',
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'result_count' => $result_count,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        } else {
+            @ob_end_clean();
+            echo json_encode([
+                'success' => false,
+                'error' => 'API returned HTTP ' . $http_code,
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    } catch (Exception $e) {
+        @ob_end_clean();
+        echo json_encode([
+            'success' => false,
+            'error' => 'Internal error: ' . $e->getMessage()
+        ], JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
 if ($action === 'save_profile') {
     $profile_id   = (int)($_POST['profile_id'] ?? 0);
     $profile_name = trim($_POST['profile_name'] ?? '');
-    $type         = $_POST['type'] === 'api' ? 'api' : 'smtp';
-    $from_email   = trim($_POST['from_email'] ?? '');
-    $provider     = trim($_POST['provider'] ?? '');
-    
-    // Handle host selection: prioritize custom_host, then dropdown selection
-    $custom_host  = trim($_POST['custom_host'] ?? '');
-    if ($custom_host !== '') {
-        $host = $custom_host;
-    } else {
-        $host = trim($_POST['host'] ?? '');
-    }
-    
-    $port         = (int)($_POST['port'] ?? 0);
-    $username     = trim($_POST['username'] ?? '');
-    $password     = trim($_POST['password'] ?? '');
     $api_key      = trim($_POST['api_key'] ?? '');
-    $api_url      = trim($_POST['api_url'] ?? '');
-    $headers_json = trim($_POST['headers_json'] ?? '');
+    $search_query = trim($_POST['search_query'] ?? '');
+    $target_count = max(1, min(10000, (int)($_POST['target_count'] ?? 100)));
+    $country      = trim($_POST['country'] ?? '');
+    $filter_business_only = isset($_POST['filter_business_only']) ? 1 : 0;
     $active       = isset($_POST['active']) ? 1 : 0;
-
-    $profile_sender_name = trim($_POST['sender_name'] ?? '');
-
-    $bounce_server = trim($_POST['bounce_imap_server'] ?? '');
-    $bounce_user = trim($_POST['bounce_imap_user'] ?? '');
-    $bounce_pass = trim($_POST['bounce_imap_pass'] ?? '');
     
     // Workers field - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
     $profile_workers = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
     
     // OPTIONAL logging for monitoring (NOT a limit)
     if ($profile_workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Sending profile saved with $profile_workers workers (NOT an error)");
+        error_log("Info: Job profile saved with $profile_workers workers (NOT an error)");
     }
     
-    // Messages per worker field - controls maximum number of messages each worker handles
-    $profile_messages_per_worker = max(MIN_MESSAGES_PER_WORKER, min(MAX_MESSAGES_PER_WORKER, (int)($_POST['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER)));
+    // Emails per worker field - controls maximum number of emails each worker extracts
+    $profile_emails_per_worker = max(MIN_EMAILS_PER_WORKER, min(MAX_EMAILS_PER_WORKER, (int)($_POST['emails_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER)));
     
     // Cycle delay in milliseconds - delay between worker processing cycles
     $profile_cycle_delay_ms = max(MIN_CYCLE_DELAY_MS, min(MAX_CYCLE_DELAY_MS, (int)($_POST['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS)));
-    
-    // Keep old fields for backward compatibility (but set defaults, not from form)
-    $random_en    = 0;
-    $max_sends    = 0;
-    $send_rate    = 0;
 
     try {
         if ($profile_id > 0) {
             $stmt = $pdo->prepare("
-                UPDATE sending_profiles SET
-                  profile_name=?, type=?, from_email=?, provider=?, host=?, port=?, username=?, password=?,
-                  api_key=?, api_url=?, headers_json=?, active=?,
-                  bounce_imap_server=?, bounce_imap_user=?, bounce_imap_pass=?, sender_name=?, workers=?, messages_per_worker=?, cycle_delay_ms=?
+                UPDATE job_profiles SET
+                  profile_name=?, api_key=?, search_query=?, target_count=?, 
+                  filter_business_only=?, country=?, active=?,
+                  workers=?, emails_per_worker=?, cycle_delay_ms=?
                 WHERE id=?
             ");
             $stmt->execute([
-                $profile_name, $type, $from_email, $provider, $host, $port, $username, $password,
-                $api_key, $api_url, $headers_json, $active,
-                $bounce_server, $bounce_user, $bounce_pass, $profile_sender_name, $profile_workers, $profile_messages_per_worker, $profile_cycle_delay_ms,
+                $profile_name, $api_key, $search_query, $target_count,
+                $filter_business_only, $country, $active,
+                $profile_workers, $profile_emails_per_worker, $profile_cycle_delay_ms,
                 $profile_id
             ]);
         } else {
             $stmt = $pdo->prepare("
-                INSERT INTO sending_profiles
-                  (profile_name, type, from_email, provider, host, port, username, password,
-                   api_key, api_url, headers_json, active,
-                   bounce_imap_server, bounce_imap_user, bounce_imap_pass, sender_name, workers, messages_per_worker, cycle_delay_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO job_profiles
+                  (profile_name, api_key, search_query, target_count,
+                   filter_business_only, country, active,
+                   workers, emails_per_worker, cycle_delay_ms)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             ");
             $stmt->execute([
-                $profile_name, $type, $from_email, $provider, $host, $port, $username, $password,
-                $api_key, $api_url, $headers_json, $active,
-                $bounce_server, $bounce_user, $bounce_pass, $profile_sender_name, $profile_workers, $profile_messages_per_worker, $profile_cycle_delay_ms
+                $profile_name, $api_key, $search_query, $target_count,
+                $filter_business_only, $country, $active,
+                $profile_workers, $profile_emails_per_worker, $profile_cycle_delay_ms
             ]);
         }
     } catch (Exception $e) {
-        // Fallback for tables without newer columns
-        try {
-            if ($profile_id > 0) {
-                $stmt = $pdo->prepare("
-                    UPDATE sending_profiles SET
-                      profile_name=?, type=?, from_email=?, host=?, port=?, username=?, password=?,
-                      api_key=?, api_url=?, headers_json=?, active=?, sender_name=?, workers=?, messages_per_worker=?
-                    WHERE id=?
-                ");
-                $stmt->execute([
-                    $profile_name, $type, $from_email, $host, $port, $username, $password,
-                    $api_key, $api_url, $headers_json, $active, $profile_sender_name, $profile_workers, $profile_messages_per_worker,
-                    $profile_id
-                ]);
-            } else {
-                $stmt = $pdo->prepare("
-                    INSERT INTO sending_profiles
-                      (profile_name, type, from_email, host, port, username, password,
-                       api_key, api_url, headers_json, active, sender_name, workers, messages_per_worker)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ");
-                $stmt->execute([
-                    $profile_name, $type, $from_email, $host, $port, $username, $password,
-                    $api_key, $api_url, $headers_json, $active, $profile_sender_name, $profile_workers, $profile_messages_per_worker
-                ]);
-            }
-        } catch (Exception $e2) {
-            // Final fallback without provider, workers
-            try {
-                if ($profile_id > 0) {
-                    $stmt = $pdo->prepare("
-                        UPDATE sending_profiles SET
-                          profile_name=?, type=?, from_email=?, host=?, port=?, username=?, password=?,
-                          api_key=?, api_url=?, headers_json=?, active=?, sender_name=?
-                        WHERE id=?
-                    ");
-                    $stmt->execute([
-                        $profile_name, $type, $from_email, $host, $port, $username, $password,
-                        $api_key, $api_url, $headers_json, $active, $profile_sender_name,
-                        $profile_id
-                    ]);
-                } else {
-                    $stmt = $pdo->prepare("
-                        INSERT INTO sending_profiles
-                          (profile_name, type, from_email, host, port, username, password,
-                           api_key, api_url, headers_json, active, sender_name)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ");
-                    $stmt->execute([
-                        $profile_name, $type, $from_email, $host, $port, $username, $password,
-                        $api_key, $api_url, $headers_json, $active, $profile_sender_name
-                    ]);
-                }
-            } catch (Exception $e3) {
-                error_log("Failed to save profile: " . $e3->getMessage());
-            }
-        }
+        error_log("Failed to save job profile: " . $e->getMessage());
     }
 
     header("Location: ?page=list&profiles=1");
@@ -5130,7 +5601,7 @@ if ($action === 'save_profile') {
 if ($action === 'delete_profile') {
     $pid = (int)($_POST['profile_id'] ?? 0);
     if ($pid > 0) {
-        $stmt = $pdo->prepare("DELETE FROM sending_profiles WHERE id = ?");
+        $stmt = $pdo->prepare("DELETE FROM job_profiles WHERE id = ?");
         $stmt->execute([$pid]);
     }
     header("Location: ?page=list&profiles=1");
@@ -5239,7 +5710,7 @@ if ($pdo === null) {
     // PDO is available, fetch data
     $rotationSettings = get_rotation_settings($pdo);
     $profiles         = get_profiles($pdo);
-    $contactLists     = get_contact_lists($pdo);
+    $contactLists     = []; // Not used in email extraction system
 }
 
 $editProfile      = null;
@@ -6346,100 +6817,90 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
       <div class="nav-avatar"><?php echo strtoupper(substr($_SESSION['admin_username'] ?? 'A', 0, 1)); ?></div>
       <div class="nav-user-info">
         <div class="nav-user-email"><?php echo htmlspecialchars($_SESSION['admin_username'] ?? 'Admin'); ?></div>
-        <div class="nav-user-sub">MAFIA MAILER</div>
+        <div class="nav-user-sub">EMAIL EXTRACTOR</div>
       </div>
     </div>
     <div class="nav-scroll">
-      <div class="nav-section-title">Email Marketing</div>
+      <div class="nav-section-title">Email Extraction</div>
 
-      <div class="nav-section-title">Marketing</div>
+      <div class="nav-section-title">Jobs</div>
       <a href="?page=list" class="nav-link <?php echo $isSingleSendsPage ? 'active' : ''; ?>">
-        <span>Single Sends</span>
+        <span>Extraction Jobs</span>
       </a>
-      <a href="?page=contacts" class="nav-link <?php echo $isContactsPage ? 'active' : ''; ?>">
-        <span>Contacts</span>
-      </a>
-      <a href="#" class="nav-link"><span>Design Library</span></a>
+      <a href="#" class="nav-link"><span>Export Data</span></a>
 
       <div class="nav-section-title">Analytics</div>
       <a href="?page=stats" class="nav-link"><span>Stats</span></a>
-      <a href="?page=activity" class="nav-link"><span>Activity</span></a>
-      <a href="?page=tracking" class="nav-link"><span>Tracking Settings</span></a>
     </div>
     <div class="nav-footer">
       <a href="?action=logout" style="color: var(--sg-danger); display: block; padding: 8px 0; font-weight: 600;">🚪 Logout</a>
-      MAFIA MAILER v1.0<br>Professional Email Marketing
+      EMAIL EXTRACTOR v1.0<br>Professional Email Extraction
     </div>
   </aside>
 
-  <!-- LEFT SLIDE PANEL: Sending Profiles -->
+  <!-- LEFT SLIDE PANEL: Job Profiles -->
   <div class="sidebar-sp" id="spSidebar">
     <div class="sidebar-inner">
       <div class="sidebar-header">
-        <div class="sidebar-header-title">Sending Profiles</div>
+        <div class="sidebar-header-title">Job Profiles</div>
         <button class="btn btn-outline" type="button" id="spCloseBtn">✕</button>
       </div>
       <div class="sidebar-body">
         <!-- Rotation settings -->
         <form method="post" class="sp-rotation-card">
           <input type="hidden" name="action" value="save_rotation">
-          <div class="sidebar-section-title">Rotation Settings</div>
+          <div class="sidebar-section-title">Extraction Settings</div>
           <div class="checkbox-row">
             <input type="checkbox" name="rotation_enabled" id="rot_enabled" <?php if ($rotationSettings['rotation_enabled']) echo 'checked'; ?>>
-            <label for="rot_enabled">Enable Global SMTP/API Rotation</label>
+            <label for="rot_enabled">Enable Profile Rotation</label>
           </div>
           <div class="form-group">
             <label>Workers</label>
             <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo (int)($rotationSettings['workers'] ?? DEFAULT_WORKERS); ?>">
-            <small class="hint">⚠️ NO LIMIT - accepts ANY number (1, 100, 500, 1000+). Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical volume, 10-50 for high volume. Note: Values above 50 will log informational messages (not errors) for monitoring purposes only.</small>
+            <small class="hint">⚠️ NO LIMIT - accepts ANY number (1, 100, 500, 1000+). Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical volume, 10-50 for high volume.</small>
           </div>
           <div class="form-group">
-            <label>Messages Per Worker</label>
-            <input type="number" name="messages_per_worker" min="<?php echo MIN_MESSAGES_PER_WORKER; ?>" max="<?php echo MAX_MESSAGES_PER_WORKER; ?>" value="<?php echo (int)($rotationSettings['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER); ?>">
-            <small class="hint">Number of emails each worker processes (<?php echo MIN_MESSAGES_PER_WORKER; ?>-<?php echo MAX_MESSAGES_PER_WORKER; ?>, default: <?php echo DEFAULT_MESSAGES_PER_WORKER; ?>). Controls distribution granularity across workers.</small>
+            <label>Emails Per Worker</label>
+            <input type="number" name="emails_per_worker" min="<?php echo MIN_EMAILS_PER_WORKER; ?>" max="<?php echo MAX_EMAILS_PER_WORKER; ?>" value="<?php echo (int)($rotationSettings['emails_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER); ?>">
+            <small class="hint">Number of emails each worker extracts (<?php echo MIN_EMAILS_PER_WORKER; ?>-<?php echo MAX_EMAILS_PER_WORKER; ?>, default: <?php echo DEFAULT_EMAILS_PER_WORKER; ?>). Controls distribution granularity across workers.</small>
           </div>
           <div class="form-group">
             <small class="hint" style="display:block; margin-top:8px;">
-              When enabled, campaigns will rotate through all active sending profiles. 
-              Configure individual profiles with Workers to control parallel sending speed.
+              When enabled, jobs will rotate through all active extraction profiles. 
+              Configure individual profiles with Workers to control parallel extraction speed.
               <?php if (function_exists('pcntl_fork')): ?>
-                <br><strong style="color:#4CAF50;">✓ Parallel Mode Available:</strong> Multiple workers will send in parallel for maximum speed.
+                <br><strong style="color:#4CAF50;">✓ Parallel Mode Available:</strong> Multiple workers will extract in parallel for maximum speed.
               <?php else: ?>
                 <br><strong style="color:#ff9800;">⚠ Sequential Mode:</strong> PHP pcntl extension not available. Workers will process sequentially.
               <?php endif; ?>
             </small>
           </div>
-          <button class="btn btn-primary" type="submit">Save Rotation</button>
+          <button class="btn btn-primary" type="submit">Save Settings</button>
         </form>
 
         <!-- Profiles list -->
         <div class="profiles-list">
-          <div class="sidebar-section-title">Profiles</div>
+          <div class="sidebar-section-title">Extraction Profiles</div>
           <?php if (empty($profiles)): ?>
-            <div class="hint">No profiles yet. Create your first SMTP or API profile below.</div>
+            <div class="hint">No profiles yet. Create your first extraction profile below.</div>
           <?php else: ?>
             <?php foreach ($profiles as $p): ?>
               <div class="profile-card" id="profile-card-<?php echo (int)$p['id']; ?>">
                 <div class="profile-card-header">
                   <div class="profile-name"><?php echo h($p['profile_name']); ?></div>
-                  <div class="pill"><?php echo strtoupper($p['type']); ?> · <?php echo h($p['provider'] ?? 'Custom'); ?></div>
+                  <div class="pill">SERPER.DEV</div>
                 </div>
                 <div class="profile-meta">
-                  <span>From: <?php echo h($p['from_email']); ?></span>
-                  <?php if (!empty($p['sender_name'])): ?>
-                    <span>Sender: <?php echo h($p['sender_name']); ?></span>
-                  <?php endif; ?>
+                  <span>Query: <?php echo h(substr($p['search_query'] ?? '', 0, 50)); ?><?php echo strlen($p['search_query'] ?? '') > 50 ? '...' : ''; ?></span>
+                  <span>Target: <?php echo (int)($p['target_count'] ?? 100); ?> emails</span>
                   <span>Status: <?php echo $p['active'] ? 'Active' : 'Disabled'; ?></span>
                   <?php if (!empty($p['workers'])): ?>
                     <span>Workers: <?php echo (int)$p['workers']; ?></span>
                   <?php endif; ?>
-                  <?php if (!empty($p['messages_per_worker'])): ?>
-                    <span>Msgs/Worker: <?php echo (int)$p['messages_per_worker']; ?></span>
-                  <?php endif; ?>
                 </div>
                 <div class="profile-actions">
+                  <button type="button" class="btn-mini" onclick="testProfileConnection(<?php echo (int)$p['id']; ?>)">🔌 Test</button>
                   <a href="?page=list&edit_profile=<?php echo (int)$p['id']; ?>" class="btn-mini">Edit</a>
-                  <button type="button" class="btn-mini check-conn-btn" data-pid="<?php echo (int)$p['id']; ?>">Check Connection</button>
                   <form method="post" style="display:inline;">
                     <input type="hidden" name="action" value="delete_profile">
                     <input type="hidden" name="profile_id" value="<?php echo (int)$p['id']; ?>">
@@ -6464,152 +6925,58 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
             <input type="text" name="profile_name" required value="<?php echo $editProfile ? h($editProfile['profile_name']) : ''; ?>">
           </div>
           <div class="form-group">
-            <label>Profile Type</label>
-            <select name="type" id="pf_type">
-              <option value="smtp" <?php if(!$editProfile || $editProfile['type']==='smtp') echo 'selected'; ?>>SMTP</option>
-              <option value="api"  <?php if($editProfile && $editProfile['type']==='api') echo 'selected'; ?>>API</option>
-            </select>
+            <label>Serper.dev API Key</label>
+            <input type="text" name="api_key" id="profile_api_key" required value="<?php echo $editProfile ? h($editProfile['api_key']) : ''; ?>">
+            <small class="hint">Your Serper.dev API key for email extraction</small>
           </div>
           <div class="form-group">
-            <label>From Email</label>
-            <input type="email" name="from_email" required value="<?php echo $editProfile ? h($editProfile['from_email']) : ''; ?>">
+            <label>Search Query</label>
+            <textarea name="search_query" id="profile_search_query" rows="3" required><?php echo $editProfile ? h($editProfile['search_query']) : ''; ?></textarea>
+            <small class="hint">e.g., "real estate agents california"</small>
           </div>
-
-          <!-- NEW: Sender name per profile -->
+          
+          <!-- Test Connection Button & Result -->
           <div class="form-group">
-            <label>Sender Name (display name)</label>
-            <input type="text" name="sender_name" placeholder="e.g. Acme Co." value="<?php echo $editProfile ? h($editProfile['sender_name'] ?? '') : ''; ?>">
-            <small class="hint">This name will be used in the From header when rotation is enabled (or as fallback).</small>
+            <button type="button" class="btn btn-outline" id="testConnectionBtn" style="width:100%;">
+              🔌 Test Connection
+            </button>
+            <div id="connectionTestResult" style="margin-top:10px; display:none; padding:12px; border-radius:4px; font-size:13px;"></div>
           </div>
-
           <div class="form-group">
-            <label>Provider</label>
-            <select name="provider" id="pf_provider">
-              <?php
-                $providers = ['Gmail','Outlook','Yahoo','Zoho','SendGrid SMTP','MailGun','MailJet','SparkPost','Amazon SES','SendGrid API','MailJet API','Custom'];
-                $selectedProvider = $editProfile ? ($editProfile['provider'] ?? 'Custom') : '';
-                foreach ($providers as $prov):
-              ?>
-                <option value="<?php echo h($prov); ?>" <?php if ($selectedProvider === $prov) echo 'selected'; ?>>
-                  <?php echo h($prov); ?>
-                </option>
-              <?php endforeach; ?>
-            </select>
+            <label>Target Email Count</label>
+            <input type="number" name="target_count" min="1" max="10000" value="<?php echo $editProfile ? (int)$editProfile['target_count'] : 100; ?>">
+            <small class="hint">Number of emails to extract (1-10000)</small>
           </div>
-
-          <div id="pf_smtp_fields" style="<?php echo (!$editProfile || $editProfile['type']==='smtp') ? '' : 'display:none'; ?>">
-            <div class="form-group">
-              <label>Host</label>
-              <select name="host" id="pf_host" style="height:120px;">
-                <?php
-                  $predefinedHosts = [
-                    'smtp.gmail.com',
-                    'smtp.office365.com',
-                    'smtp.mail.yahoo.com',
-                    'smtp.zoho.com',
-                    'smtp.sendgrid.net',
-                    'smtp.mailgun.org',
-                    'smtp.sparkpostmail.com',
-                    'smtp.mailjet.com',
-                    'email-smtp.us-east-1.amazonaws.com',
-                  ];
-                  $currentHost = $editProfile ? h($editProfile['host']) : '';
-                  foreach ($predefinedHosts as $host):
-                ?>
-                  <option value="<?php echo h($host); ?>" <?php if ($currentHost === $host) echo 'selected'; ?>>
-                    <?php echo h($host); ?>
-                  </option>
-                <?php endforeach; ?>
-                <?php if ($currentHost !== '' && !in_array($currentHost, $predefinedHosts)): ?>
-                  <option value="<?php echo h($currentHost); ?>" selected><?php echo h($currentHost); ?></option>
-                <?php endif; ?>
-              </select>
-              <small class="hint">Select a predefined SMTP host or enter a custom host below.</small>
-              <input type="text" name="custom_host" placeholder="Or enter custom host" style="margin-top:8px;" value="">
-            </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label>Port</label>
-                <input type="number" name="port" value="<?php echo $editProfile ? (int)$editProfile['port'] : 587; ?>">
-              </div>
-              <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" value="<?php echo $editProfile ? h($editProfile['username']) : ''; ?>">
-              </div>
-            </div>
-            <div class="form-group">
-              <label>Password</label>
-              <input type="text" name="password" value="<?php echo $editProfile ? h($editProfile['password']) : ''; ?>">
-            </div>
-
-            <div style="margin-top:8px; border-top:1px dashed var(--sg-border); padding-top:8px;">
-              <div class="form-group">
-                <label>Bounce IMAP Server (optional)</label>
-                <input type="text" name="bounce_imap_server" placeholder="e.g. {imap.example.com:993/imap/ssl}INBOX" value="<?php echo $editProfile ? h($editProfile['bounce_imap_server'] ?? '') : ''; ?>">
-                <small class="hint">Provide full IMAP mailbox string (or host) to scan bounces. Leave blank to skip.</small>
-              </div>
-              <div class="form-row">
-                <div class="form-group">
-                  <label>Bounce IMAP User</label>
-                  <input type="text" name="bounce_imap_user" value="<?php echo $editProfile ? h($editProfile['bounce_imap_user'] ?? '') : ''; ?>">
-                </div>
-                <div class="form-group">
-                  <label>Bounce IMAP Pass</label>
-                  <input type="text" name="bounce_imap_pass" value="<?php echo $editProfile ? h($editProfile['bounce_imap_pass'] ?? '') : ''; ?>">
-                </div>
-              </div>
-            </div>
+          <div class="form-group">
+            <label>Country (optional)</label>
+            <input type="text" name="country" placeholder="us" value="<?php echo $editProfile ? h($editProfile['country']) : ''; ?>">
+            <small class="hint">ISO country code (e.g., us, uk, ca)</small>
           </div>
-
-          <div id="pf_api_fields" style="<?php echo ($editProfile && $editProfile['type']==='api') ? '' : 'display:none'; ?>">
-            <div class="form-group">
-              <label>API Key</label>
-              <input type="text" name="api_key" value="<?php echo $editProfile ? h($editProfile['api_key']) : ''; ?>">
-            </div>
-            <div class="form-group">
-              <label>API URL</label>
-              <input type="text" name="api_url" value="<?php echo $editProfile ? h($editProfile['api_url']) : ''; ?>">
-            </div>
-            <div class="form-group">
-              <label>Headers JSON (optional)</label>
-              <textarea name="headers_json" rows="3"><?php echo $editProfile ? h($editProfile['headers_json']) : ''; ?></textarea>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label>Workers</label>
-              <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)($editProfile['workers'] ?? DEFAULT_WORKERS) : DEFAULT_WORKERS; ?>">
-              <small class="hint">⚠️ NO LIMIT - accepts ANY number (1, 100, 500, 1000+). Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical volume, 10-50 for high volume. Controls how many parallel processes send emails. Higher values increase speed but use more system resources. Note: Values above 50 will log informational messages (not errors). Example: Workers=1 processes sequentially; Workers=100 distributes across 100 parallel workers.</small>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label>Messages Per Worker</label>
-              <input type="number" name="messages_per_worker" min="<?php echo MIN_MESSAGES_PER_WORKER; ?>" max="<?php echo MAX_MESSAGES_PER_WORKER; ?>" value="<?php echo $editProfile ? (int)($editProfile['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER) : DEFAULT_MESSAGES_PER_WORKER; ?>">
-              <small class="hint">Batch size for round-robin distribution (<?php echo MIN_MESSAGES_PER_WORKER; ?>-<?php echo MAX_MESSAGES_PER_WORKER; ?>, default: <?php echo DEFAULT_MESSAGES_PER_WORKER; ?>). Controls how emails are distributed across workers in batches. Example: 100 emails with Workers=2 and Messages=10 distributes in rounds, each worker getting 10 emails per round until all sent.</small>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label>Cycle Delay (milliseconds)</label>
-              <input type="number" name="cycle_delay_ms" min="<?php echo MIN_CYCLE_DELAY_MS; ?>" max="<?php echo MAX_CYCLE_DELAY_MS; ?>" value="<?php echo $editProfile ? (int)($editProfile['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS) : DEFAULT_CYCLE_DELAY_MS; ?>">
-              <small class="hint">Delay between worker processing cycles in milliseconds (<?php echo MIN_CYCLE_DELAY_MS; ?>-<?php echo MAX_CYCLE_DELAY_MS; ?>, default: <?php echo DEFAULT_CYCLE_DELAY_MS; ?>). This adds a pause between each round of email distribution across workers. Example: 100ms delay adds a brief pause between distribution cycles. Use 0 for no delay (maximum speed).</small>
-            </div>
-          </div>
-
           <div class="checkbox-row">
-            <input type="checkbox" name="active" id="pf_active" <?php if(!$editProfile || $editProfile['active']) echo 'checked'; ?>>
+            <input type="checkbox" name="filter_business_only" id="pf_business" <?php if (!$editProfile || $editProfile['filter_business_only']) echo 'checked'; ?>>
+            <label for="pf_business">Business Emails Only (filter out free providers)</label>
+          </div>
+          <div class="form-group">
+            <label>Workers</label>
+            <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)$editProfile['workers'] : DEFAULT_WORKERS; ?>">
+            <small class="hint">Number of parallel extraction workers</small>
+          </div>
+          <div class="form-group">
+            <label>Emails Per Worker</label>
+            <input type="number" name="emails_per_worker" min="<?php echo MIN_EMAILS_PER_WORKER; ?>" max="<?php echo MAX_EMAILS_PER_WORKER; ?>" value="<?php echo $editProfile ? (int)$editProfile['emails_per_worker'] : DEFAULT_EMAILS_PER_WORKER; ?>">
+            <small class="hint">Emails per worker cycle</small>
+          </div>
+          <div class="checkbox-row">
+            <input type="checkbox" name="active" id="pf_active" <?php if (!$editProfile || $editProfile['active']) echo 'checked'; ?>>
             <label for="pf_active">Active</label>
           </div>
-
-          <button class="btn btn-primary" type="submit"><?php echo $editProfile ? 'Save Changes' : 'Create Profile'; ?></button>
+          <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <?php if ($editProfile): ?>
+              <a href="?page=list" class="btn btn-outline">Cancel</a>
+            <?php endif; ?>
+            <button class="btn btn-primary" type="submit"><?php echo $editProfile ? 'Update' : 'Create'; ?> Profile</button>
+          </div>
         </form>
-      </div>
-      <div class="sidebar-foot">
-        <div class="hint">Rotation + profiles apply globally to all Single Sends. Configure bounce mailbox to auto-add bounces to unsubscribes.</div>
       </div>
     </div>
   </div>
@@ -6622,13 +6989,11 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
       </div>
       <div class="topbar-actions">
         <?php if ($page === 'list'): ?>
-          <a href="?page=contacts" class="btn btn-outline">Contacts</a>
-          <button class="btn btn-outline" id="spOpenBtn" type="button">Sending Profiles ⚙</button>
+          <button class="btn btn-outline" id="spOpenBtn" type="button">Job Profiles ⚙</button>
         <?php elseif ($page === 'contacts'): ?>
-          <a href="?page=list" class="btn btn-outline">Single Sends</a>
+          <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
         <?php else: ?>
-          <a href="?page=list" class="btn btn-outline">Single Sends</a>
-          <a href="?page=contacts" class="btn btn-outline">Contacts</a>
+          <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
         <?php endif; ?>
       </div>
     </div>
@@ -6641,29 +7006,29 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               echo '<div class="page-title">Database Error</div>';
               echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
           } else {
-              $stmt = $pdo->query("SELECT * FROM campaigns ORDER BY created_at DESC");
+              $stmt = $pdo->query("SELECT * FROM jobs ORDER BY created_at DESC");
               $campaigns = $stmt->fetchAll(PDO::FETCH_ASSOC);
         ?>
-        <div class="page-title">Single Sends</div>
-        <div class="page-subtitle">Design, review, and send one-off campaigns, just like SendGrid.</div>
+        <div class="page-title">Extraction Jobs</div>
+        <div class="page-subtitle">Create and manage email extraction jobs using serper.dev API.</div>
 
         <div class="card">
           <div class="card-header">
             <div>
-              <div class="card-title">Campaigns</div>
-              <div class="card-subtitle">Draft and sent Single Sends with live stats.</div>
+              <div class="card-title">Extraction Jobs</div>
+              <div class="card-subtitle">Create and manage email extraction jobs.</div>
             </div>
             <form method="post" style="display:flex; gap:8px; align-items:center;">
-              <input type="hidden" name="action" value="create_campaign">
-              <input type="text" name="name" placeholder="Campaign name" style="font-size:13px; padding:6px 8px;">
-              <button type="submit" class="btn btn-primary">+ Create Single Send</button>
+              <input type="hidden" name="action" value="create_job">
+              <input type="text" name="name" placeholder="Job name" style="font-size:13px; padding:6px 8px;">
+              <button type="submit" class="btn btn-primary">+ Create Extraction Job</button>
             </form>
           </div>
 
           <!-- Bulk actions toolbar -->
           <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
             <form method="post" id="bulkActionsForm" style="display:flex; gap:8px; align-items:center;">
-              <input type="hidden" name="action" value="bulk_campaigns">
+              <input type="hidden" name="action" value="bulk_jobs">
               <select name="bulk_action" id="bulkActionSelect" style="padding:6px;">
                 <option value="">Bulk actions</option>
                 <option value="delete_selected">Delete selected</option>
@@ -6671,63 +7036,67 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               </select>
               <button type="submit" class="btn btn-outline">Apply</button>
             </form>
-
-            <div style="margin-left:auto; display:flex; gap:8px;">
-              <form method="post" onsubmit="return confirm('Delete ALL unsubscribes? This will remove every address from unsubscribes table.');">
-                <input type="hidden" name="action" value="delete_unsubscribes">
-                <button class="btn btn-outline" type="submit">Clear Unsubscribes</button>
-              </form>
-              <form method="post" onsubmit="return confirm('Delete ALL bounce events? This will remove all bounce events from events table.');">
-                <input type="hidden" name="action" value="delete_bounces">
-                <button class="btn btn-outline" type="submit">Clear Bounces</button>
-              </form>
-            </div>
           </div>
 
-          <form method="post" id="campaignsTableForm">
-            <input type="hidden" name="action" value="bulk_campaigns">
+          <form method="post" id="jobsTableForm">
+            <input type="hidden" name="action" value="bulk_jobs">
             <table class="table">
               <thead>
                 <tr>
                   <th style="width:36px;"><input type="checkbox" id="chkAll"></th>
-                  <th>Campaign</th>
+                  <th>Job Name</th>
                   <th>Status</th>
-                  <th>Subject</th>
-                  <th>Sent</th>
+                  <th>Profile</th>
+                  <th>Extracted</th>
                   <th>Target</th>
-                  <th>Bounces</th>
-                  <th>Delivered</th>
-                  <th>Opens</th>
-                  <th>Clicks</th>
-                  <th>Updated</th>
+                  <th>Progress</th>
+                  <th>Created</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 <?php if (empty($campaigns)): ?>
                   <tr>
-                    <td colspan="12" style="text-align:center; padding:20px; color:var(--sg-muted);">
-                      No campaigns yet. Create your first Single Send above.
+                    <td colspan="9" style="text-align:center; padding:20px; color:var(--sg-muted);">
+                      No jobs yet. Create your first extraction job above.
                     </td>
                   </tr>
-                                 <?php else: ?>
+                <?php else: ?>
                   <?php foreach ($campaigns as $c):
-                    $stats = get_campaign_stats($pdo, (int)$c['id']);
+                    $stats = get_job_stats($pdo, (int)$c['id']);
                     $status = $c['status'];
-                    // Support queued status: Grey (draft) → Orange (queued) → Yellow (sending) → Green (sent)
-                    if ($status === 'sent') {
+                    // Support statuses: Grey (draft) → Orange (queued) → Yellow (extracting) → Green (completed)
+                    if ($status === 'completed' || $status === 'sent') {
                         $dotClass = 'status-sent';
-                    } elseif ($status === 'sending') {
+                        $statusLabel = 'Completed';
+                    } elseif ($status === 'extracting' || $status === 'sending') {
                         $dotClass = 'status-sending';
+                        $statusLabel = 'Extracting';
                     } elseif ($status === 'queued') {
                         $dotClass = 'status-queued';
+                        $statusLabel = 'Queued';
                     } else {
                         $dotClass = 'status-draft';
+                        $statusLabel = 'Draft';
                     }
-                    $link = ($status === 'sent' || $status === 'sending' || $status === 'queued') ? '?page=stats&id='.$c['id'] : '?page=editor&id='.$c['id'];
+                    $link = ($status === 'completed' || $status === 'sent' || $status === 'extracting' || $status === 'sending' || $status === 'queued') ? '?page=stats&id='.$c['id'] : '?page=editor&id='.$c['id'];
+                    
+                    $profileName = 'N/A';
+                    if (!empty($c['profile_id'])) {
+                        foreach ($profiles as $p) {
+                            if ($p['id'] == $c['profile_id']) {
+                                $profileName = $p['profile_name'];
+                                break;
+                            }
+                        }
+                    }
+                    
+                    $extracted = (int)($c['progress_extracted'] ?? 0);
+                    $target = (int)($c['progress_total'] ?? $c['target_count'] ?? 0);
+                    $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
                   ?>
                     <tr data-cid="<?php echo (int)$c['id']; ?>">
-                      <td><input type="checkbox" name="campaign_ids[]" value="<?php echo (int)$c['id']; ?>" class="campaign-checkbox"></td>
+                      <td><input type="checkbox" name="job_ids[]" value="<?php echo (int)$c['id']; ?>" class="job-checkbox"></td>
                       <td>
                         <a href="<?php echo $link; ?>">
                           <span class="status-dot <?php echo $dotClass; ?>"></span>
@@ -6735,36 +7104,33 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                         </a>
                       </td>
                       <td><?php echo ucfirst($status); ?>
-                        <?php if ($status === 'sending' || $status === 'queued'): ?>
+                        <?php if ($status === 'sending' || $status === 'queued' || $status === 'extracting'): ?>
                           <div id="progress-bar-<?php echo (int)$c['id']; ?>" style="margin-top:4px;">
                             <div style="background:#eee; height:4px; border-radius:2px; overflow:hidden;">
-                              <div id="progress-fill-<?php echo (int)$c['id']; ?>" style="background:#4CAF50; height:100%; width:0%; transition:width 0.3s;"></div>
+                              <div id="progress-fill-<?php echo (int)$c['id']; ?>" style="background:#4CAF50; height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
                             </div>
                             <div id="progress-text-<?php echo (int)$c['id']; ?>" style="font-size:11px; color:var(--sg-muted); margin-top:2px;">
-                              0% • 0/0 • 0 workers
+                              <?php echo $progress; ?>% • <?php echo $extracted; ?>/<?php echo $target; ?>
                             </div>
                           </div>
                         <?php endif; ?>
                       </td>
-                      <td><?php echo h($c['subject']); ?></td>
-                      <td><?php echo $c['sent_at'] ? h($c['sent_at']) : '—'; ?></td>
-                      <td><?php echo (int)$stats['target']; ?></td>
-                      <td><span id="bounce-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['bounce']; ?></span></td>
-                      <td><span id="delivered-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['delivered']; ?></span></td>
-                      <td><span id="open-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['open']; ?></span></td>
-                      <td><span id="click-<?php echo (int)$c['id']; ?>"><?php echo (int)$stats['click']; ?></span></td>
+                      <td><?php echo h($profileName); ?></td>
+                      <td><span id="extracted-<?php echo (int)$c['id']; ?>"><?php echo $extracted; ?></span></td>
+                      <td><?php echo $target; ?></td>
+                      <td><?php echo $progress; ?>%</td>
                       <td><?php echo h($c['created_at'] ?? ''); ?></td>
                       <td>
                         <a class="btn-mini" href="<?php echo $link; ?>">Open</a>
                         <form method="post" style="display:inline;">
-                          <input type="hidden" name="action" value="duplicate_campaign">
-                          <input type="hidden" name="campaign_id" value="<?php echo (int)$c['id']; ?>">
+                          <input type="hidden" name="action" value="duplicate_job">
+                          <input type="hidden" name="job_id" value="<?php echo (int)$c['id']; ?>">
                           <button type="submit" class="btn-mini">Duplicate</button>
                         </form>
                         <form method="post" style="display:inline;">
-                          <input type="hidden" name="action" value="delete_campaign">
-                          <input type="hidden" name="campaign_id" value="<?php echo (int)$c['id']; ?>">
-                          <button type="submit" class="btn-mini" onclick="return confirm('Delete this campaign and its events?');">Delete</button>
+                          <input type="hidden" name="action" value="delete_job">
+                          <input type="hidden" name="job_id" value="<?php echo (int)$c['id']; ?>">
+                          <button type="submit" class="btn-mini" onclick="return confirm('Delete this job and its extracted emails?');">Delete</button>
                         </form>
                       </td>
                     </tr>
@@ -6934,676 +7300,244 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
           } else {
               $id = (int)($_GET['id'] ?? 0);
-              $campaign = get_campaign($pdo, $id);
-              if (!$campaign) {
-                echo "<p>Campaign not found.</p>";
+              $job = get_job($pdo, $id);
+              if (!$job) {
+                echo "<p>Job not found.</p>";
               } else {
-                $rotOnEditor = (int)$rotationSettings['rotation_enabled'] === 1;
         ?>
-          <div class="page-title">Editor — <?php echo h($campaign['name']); ?></div>
-          <div class="page-subtitle">Define subject, from, preheader and design your email content.</div>
+          <div class="page-title">Job Configuration — <?php echo h($job['name']); ?></div>
+          <div class="page-subtitle">Configure your email extraction job and select profiles to execute.</div>
 
-          <!-- Editor shell: left modules + envelope, right canvas -->
-          <form method="post" id="editorForm">
-            <input type="hidden" name="action" value="save_campaign">
-            <input type="hidden" name="id" value="<?php echo (int)$campaign['id']; ?>">
-
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-              <div style="display:flex; gap:12px; align-items:center;">
-                <button class="btn btn-outline" type="button" id="saveBtnTop">Save</button>
-                <button class="btn btn-outline" type="button" id="undoBtn" disabled>Undo</button>
-                <button class="btn btn-outline" type="button" id="redoBtn" disabled>Redo</button>
-              </div>
-              <div>
-                <!-- single Review button -->
-                <button class="btn btn-primary" type="button" id="reviewTopBtn">Review Details and Send →</button>
-              </div>
-            </div>
-
-            <div class="editor-shell">
-              <!-- LEFT: Modules + Envelope -->
-              <div class="editor-left" role="region" aria-label="Design left sidebar">
-                <div class="editor-tabs">
-                  <div class="tab active" data-tab="build">Build</div>
-                  <div class="tab" data-tab="settings">Settings</div>
-                  <div class="tab" data-tab="tags">Tags</div>
-                  <div class="tab" data-tab="ab">A/B Testing</div>
+          <!-- Status Message Display -->
+          <div id="extraction-status" style="display:none; margin-bottom:20px; padding:15px; border-radius:5px; position:relative;">
+            <button type="button" onclick="document.getElementById('extraction-status').style.display='none'" 
+                    style="position:absolute; top:10px; right:10px; background:none; border:none; font-size:20px; cursor:pointer; color:inherit; opacity:0.7;">
+              ×
+            </button>
+            <div style="display:flex; align-items:flex-start; gap:12px;">
+              <div id="status-icon" style="font-size:24px; line-height:1;"></div>
+              <div style="flex:1;">
+                <strong id="status-title" style="display:block; margin-bottom:8px; font-size:16px;"></strong>
+                <p id="status-message" style="margin:0; line-height:1.5;"></p>
+                <div id="status-details-toggle" style="margin-top:10px; display:none;">
+                  <a href="#" onclick="event.preventDefault(); document.getElementById('status-details').style.display = document.getElementById('status-details').style.display === 'none' ? 'block' : 'none'; this.textContent = document.getElementById('status-details').style.display === 'none' ? '▼ Show Technical Details' : '▲ Hide Technical Details';" style="color:inherit; opacity:0.8; text-decoration:underline; font-size:13px;">▼ Show Technical Details</a>
                 </div>
-
-                <div class="modules-pane" id="modulesPane">
-                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                    <div style="font-weight:600; color:var(--sg-muted);">Add Modules</div>
-                    <div style="color:var(--sg-muted); font-size:13px;">Drag or click → drop into the canvas</div>
-                  </div>
-                  <div class="modules-grid" id="modulesGrid">
-                    <div class="module-tile" data-module="image"><div class="icon">🖼️</div>Image</div>
-                    <div class="module-tile" data-module="text"><div class="icon">✏️</div>Text</div>
-                    <div class="module-tile" data-module="columns"><div class="icon">▦</div>Columns</div>
-                    <div class="module-tile" data-module="imgtext"><div class="icon">🧩</div>Image &amp; Text</div>
-                    <div class="module-tile" data-module="button"><div class="icon">🔘</div>Button</div>
-                    <div class="module-tile" data-module="code"><div class="icon">&lt;&gt;</div>Code</div>
-                    <div class="module-tile" data-module="divider"><div class="icon">─</div>Divider</div>
-                    <div class="module-tile" data-module="spacer"><div class="icon">↕️</div>Spacer</div>
-                    <div class="module-tile" data-module="social"><div class="icon">⚑</div>Social</div>
-                    <div class="module-tile" data-module="unsubscribe"><div class="icon">✖</div>Unsubscribe</div>
-                  </div>
-
-                </div>
-
-                <div class="envelope">
-                  <div style="font-weight:600; margin-bottom:8px;">Envelope</div>
-                  <div class="form-group">
-                    <label>Subject</label>
-                    <input type="text" name="subject" value="<?php echo h($campaign['subject']); ?>" required>
-                  </div>
-                  <div class="form-group">
-                    <label>Preheader</label>
-                    <input type="text" name="preheader" value="<?php echo h($campaign['preheader']); ?>">
-                  </div>
-
-                  <div class="form-group">
-                    <label>
-                      From
-                      <?php if ($rotOnEditor): ?>
-                        <span style="font-weight:400; color:var(--sg-muted);">(taken from each active profile while rotation is ON)</span>
-                      <?php endif; ?>
-                    </label>
-                    <?php if ($rotOnEditor): ?>
-                      <select disabled>
-                        <option>Rotation enabled — using each profile's From</option>
-                      </select>
-                    <?php else: ?>
-                      <select name="from_email" required>
-                        <option value="">Select from Sending Profiles</option>
-                        <?php foreach ($profiles as $p): ?>
-                          <option value="<?php echo h($p['from_email']); ?>"
-                            <?php if ($campaign['from_email'] === $p['from_email']) echo 'selected'; ?>>
-                            <?php echo h($p['from_email'].' — '.$p['profile_name']); ?>
-                          </option>
-                        <?php endforeach; ?>
-                      </select>
-                    <?php endif; ?>
-                  </div>
-
-                  <div class="form-group">
-                    <label>Audience (List / segment)</label>
-                    <!-- audience now shows contact lists for selection -->
-                    <select name="audience">
-                      <option value="">Select a contact list or keep free text</option>
-                      <?php foreach ($contactLists as $cl):
-                        $val = 'list:'.$cl['id'];
-                        $selected = ($campaign['audience'] === $val) ? 'selected' : '';
-                      ?>
-                        <option value="<?php echo h($val); ?>" <?php echo $selected; ?>>
-                          <?php echo h($cl['name']).' — '.(int)$cl['contact_count'].' contacts'; ?>
-                        </option>
-                      <?php endforeach; ?>
-                      <option value="custom" <?php if ($campaign['audience'] === 'custom') echo 'selected'; ?>>Custom segment / manual</option>
-                    </select>
-                    <small class="hint">Choose one of your contact lists. If you need a text/segment, select "Custom" then edit audience in the campaign later.</small>
-                  </div>
-
-                  <div class="form-row">
-                    <div class="form-group">
-                      <label>Sender Name</label>
-                      <input type="text" name="sender_name" value="<?php echo h($campaign['sender_name'] ?? ''); ?>">
-                    </div>
-                    <div class="form-group">
-                      <label>&nbsp;</label>
-                      <div class="checkbox-row">
-                        <input type="checkbox" name="unsubscribe_enabled" id="unsubscribe_enabled" <?php if (!empty($campaign['unsubscribe_enabled'])) echo 'checked'; ?>>
-                        <label for="unsubscribe_enabled">Enable Unsubscribe Link</label>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="form-row">
-                    <div class="form-group">
-                      <label>&nbsp;</label>
-                      <small class="hint">If enabled, an unsubscribe tracking link will be injected into outgoing messages automatically. Recipients who click will be added to the unsubscribes list and blocked from future sends.</small>
-                    </div>
-                  </div>
-
-                </div>
-              </div>
-
-              <!-- RIGHT: Canvas -->
-              <div class="editor-right">
-                <div class="editor-canvas-top">
-                  <div class="canvas-header-left">
-                    <div class="subj">Subject: <?php echo $campaign['subject'] ? h($campaign['subject']) : 'Subject'; ?></div>
-                    <div class="pre">Preheader: <?php echo $campaign['preheader'] ? h($campaign['preheader']) : ''; ?></div>
-                  </div>
-                  <div class="canvas-header-right">
-                    <button class="btn btn-outline" type="button" id="previewBtn">Preview</button>
-                    <button class="btn btn-outline" type="button" id="saveAsTplBtn">Save</button>
-                    <!-- single Review button at top -->
-                  </div>
-                </div>
-
-                <div class="canvas-area" id="canvasArea" data-placeholder="Drag Module Here">
-                  <?php
-                    // initial canvas content will be hydrated by JS from campaign.html
-                    if ($campaign['html']) {
-                        echo '<!-- stored html will be loaded into blocks by JS -->';
-                    } else {
-                        echo '<div class="drag-placeholder">Drag Module Here</div>';
-                    }
-                  ?>
-                </div>
-
-                <div class="canvas-footer">
-                  <div style="max-width:780px; margin:0 auto;">
-                    <?php if (!empty($campaign['sender_name'])): ?>
-                      <?php echo h($campaign['sender_name']); ?>
-                    <?php else: ?>
-                      <!-- no address lines as requested; show nothing if no sender_name -->
-                    <?php endif; ?>
-                    <?php if (!empty($campaign['unsubscribe_enabled'])): ?>
-                      &nbsp;·&nbsp;<a href="#">Unsubscribe</a>
-                    <?php endif; ?>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Hidden html textarea (holds campaign html) -->
-            <textarea name="html" id="htmlField" style="display:none;"><?php echo h($campaign['html']); ?></textarea>
-
-            <!-- hidden bottom buttons kept for compatibility -->
-            <div style="display:none; margin-top:12px; text-align:right;">
-              <button type="submit" class="btn btn-outline">Save</button>
-<!-- continuing from the snippet above -->
-              <button type="submit" name="go_to_review" value="1" class="btn btn-primary">Review Details &amp; Send</button>
-            </div>
-          </form>
-
-          <!-- HTML Editor Modal (for Code module) -->
-          <div class="html-editor-backdrop" id="htmlEditorBackdrop" role="dialog" aria-modal="true">
-            <div class="html-editor-panel" role="document">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <div style="font-weight:600;">HTML Editor</div>
-                <button class="btn btn-outline" id="htmlEditorClose">✕</button>
-              </div>
-              <textarea id="htmlEditorTextarea"><?php echo h($campaign['html']); ?></textarea>
-              <div class="html-editor-actions">
-                <button class="btn btn-outline" id="htmlEditorCancel">Cancel</button>
-                <button class="btn btn-primary" id="htmlEditorSave">Save HTML</button>
+                <pre id="status-details" style="display:none; margin:10px 0 0 0; padding:10px; background:rgba(0,0,0,0.05); border-radius:4px; font-size:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-wrap:break-word;"></pre>
               </div>
             </div>
           </div>
 
-          <!-- Include SortableJS for drag & drop -->
-          <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+          <form method="post" id="jobForm">
+            <input type="hidden" name="action" value="save_job">
+            <input type="hidden" name="id" value="<?php echo (int)$job['id']; ?>">
+
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+              <div style="display:flex; gap:12px; align-items:center;">
+                <button class="btn btn-outline" type="submit">Save Configuration</button>
+              </div>
+              <div>
+                <a href="?page=list" class="btn btn-outline">Cancel</a>
+                <button class="btn btn-primary" type="button" id="startJobBtn">Start Extraction →</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">Job Settings</div>
+                  <div class="card-subtitle">Configure extraction parameters for this job.</div>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label>Job Name</label>
+                <input type="text" name="name" value="<?php echo h($job['name']); ?>" required>
+              </div>
+
+              <div class="form-group">
+                <label>Select Extraction Profile</label>
+                <select name="profile_id" id="profileSelect" required>
+                  <option value="">Select a profile...</option>
+                  <?php foreach ($profiles as $p): ?>
+                    <option value="<?php echo (int)$p['id']; ?>" 
+                      <?php if ($job['profile_id'] == $p['id']) echo 'selected'; ?>
+                      data-query="<?php echo h($p['search_query']); ?>"
+                      data-target="<?php echo (int)$p['target_count']; ?>">
+                      <?php echo h($p['profile_name']); ?> — Target: <?php echo (int)$p['target_count']; ?> emails
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+                <small class="hint">Choose a profile with serper.dev API configuration</small>
+              </div>
+
+              <div id="profileDetails" style="display: none; margin-top: 12px; padding: 12px; background: #f8f9fa; border-radius: 4px;">
+                <div style="font-weight: 600; margin-bottom: 8px;">Profile Details:</div>
+                <div id="profileQuery" style="color: var(--sg-muted);"></div>
+                <div id="profileTarget" style="color: var(--sg-muted); margin-top: 4px;"></div>
+              </div>
+
+              <div class="form-group">
+                <label>Target Email Count (Optional Override)</label>
+                <input type="number" name="target_count" min="1" max="10000" 
+                  value="<?php echo (int)($job['target_count'] ?? 0); ?>" 
+                  placeholder="Leave empty to use profile default">
+                <small class="hint">Override the target count for this specific job</small>
+              </div>
+
+              <div class="checkbox-row">
+                <input type="checkbox" name="start_immediately" id="startImmediately">
+                <label for="startImmediately">Start extraction immediately after saving</label>
+              </div>
+            </div>
+          </form>
 
           <script>
             (function(){
-              // Helpers
-              function $(sel, root){ return (root || document).querySelector(sel); }
-              function $all(sel, root){ return Array.from((root || document).querySelectorAll(sel)); }
+              var profileSelect = document.getElementById('profileSelect');
+              var profileDetails = document.getElementById('profileDetails');
+              var profileQuery = document.getElementById('profileQuery');
+              var profileTarget = document.getElementById('profileTarget');
+              var startJobBtn = document.getElementById('startJobBtn');
 
-              var reviewTop = document.getElementById('reviewTopBtn');
-              var form = document.getElementById('editorForm');
-              var saveBtnTop = document.getElementById('saveBtnTop');
-
-              // HTML Editor modal elems (declare early so handlers can reference them)
-              var htmlBackdrop = document.getElementById('htmlEditorBackdrop');
-              var htmlTextarea = document.getElementById('htmlEditorTextarea');
-              var htmlClose = document.getElementById('htmlEditorClose');
-              var htmlCancel = document.getElementById('htmlEditorCancel');
-              var htmlSave = document.getElementById('htmlEditorSave');
-
-              // Toast utility
-              function showToast(msg, type){
-                var t = document.getElementById('globalToast');
-                if(!t) return;
-                t.innerText = msg;
-                t.className = 'toast show ' + (type === 'error' ? 'error' : 'success');
-                setTimeout(function(){
-                  t.className = 'toast';
-                }, 2000);
-              }
-
-              // Save behavior (top save) - use AJAX to enable autosave UX
-              function doSaveAjax(callback){
-                syncCanvasToHtmlField();
-                var fd = new FormData(form);
-                // Ensure action=save_campaign present
-                fd.set('action', 'save_campaign');
-
-                fetch(window.location.pathname + window.location.search, {
-                  method: 'POST',
-                  body: fd,
-                  credentials: 'same-origin',
-                  headers: {
-                    'X-Requested-With': 'XMLHttpRequest'
-                  }
-                }).then(function(resp){
-                  if (!resp.ok) throw new Error('Save failed');
-                  return resp.json().catch(function(){ return {ok:1}; });
-                }).then(function(json){
-                  showToast('Saved', 'success');
-                  if (typeof callback === 'function') callback(null, json);
-                }).catch(function(err){
-                  showToast('Save error', 'error');
-                  // fallback to normal submit if desired
-                  if (confirm('Autosave failed, submit full form instead?')) {
-                    form.submit();
-                  }
-                  if (typeof callback === 'function') callback(err);
-                });
-              }
-
-              function doSave() {
-                doSaveAjax();
-              }
-              if (saveBtnTop) saveBtnTop.addEventListener('click', doSave);
-
-              // Autosave every 7 seconds (only on editor page)
-              var autosaveTimer = setInterval(function(){
-                // only run autosave if form exists and page is visible
-                if (document.visibilityState === 'visible') {
-                  doSaveAjax();
+              // Function to show status messages
+              function showStatus(type, title, message, details) {
+                var statusBox = document.getElementById('extraction-status');
+                var statusIcon = document.getElementById('status-icon');
+                var statusTitle = document.getElementById('status-title');
+                var statusMessage = document.getElementById('status-message');
+                var statusDetails = document.getElementById('status-details');
+                var statusDetailsToggle = document.getElementById('status-details-toggle');
+                
+                // Set colors based on type
+                if (type === 'success') {
+                  statusBox.style.backgroundColor = '#d4edda';
+                  statusBox.style.borderLeft = '4px solid #28a745';
+                  statusBox.style.color = '#155724';
+                  statusIcon.innerHTML = '✓';
+                  statusIcon.style.color = '#28a745';
+                } else if (type === 'error') {
+                  statusBox.style.backgroundColor = '#f8d7da';
+                  statusBox.style.borderLeft = '4px solid #dc3545';
+                  statusBox.style.color = '#721c24';
+                  statusIcon.innerHTML = '✗';
+                  statusIcon.style.color = '#dc3545';
+                } else if (type === 'info') {
+                  statusBox.style.backgroundColor = '#d1ecf1';
+                  statusBox.style.borderLeft = '4px solid #17a2b8';
+                  statusBox.style.color = '#0c5460';
+                  statusIcon.innerHTML = 'ℹ';
+                  statusIcon.style.color = '#17a2b8';
                 }
-              }, 7000);
-
-              // When user clicks Review: if HTML modal is open, automatically save modal contents first
-              function doReviewSubmit(){
-                // if modal open, persist modal content programmatically (avoid invoking handlers via click())
-                if (htmlBackdrop && htmlBackdrop.classList.contains('show')) {
-                  try {
-                    // Persist raw HTML into hidden field
-                    if (typeof htmlField !== 'undefined' && htmlField !== null) {
-                      htmlField.value = htmlTextarea.value;
-                    } else {
-                      // htmlField may be defined later; fallback to finding it now
-                      var hf = document.getElementById('htmlField');
-                      if (hf) hf.value = htmlTextarea.value;
-                    }
-                    // Rehydrate canvas from new HTML so syncCanvasToHtmlField picks latest content
-                    if (typeof loadHtmlIntoCanvas === 'function') {
-                      loadHtmlIntoCanvas(htmlTextarea.value);
-                    }
-                    // Close modal visually
-                    if (typeof closeHtmlEditor === 'function') {
-                      closeHtmlEditor();
-                    } else {
-                      htmlBackdrop.classList.remove('show');
-                      htmlBackdrop.style.display = 'none';
-                    }
-                  } catch (e) {
-                    // if anything goes wrong, gracefully continue to submit whatever we have
-                  }
-
-                  var hidden = document.createElement('input');
-                  hidden.type = 'hidden';
-                  hidden.name = 'go_to_review';
-                  hidden.value = '1';
-                  form.appendChild(hidden);
-                  // ensure latest HTML is synced
-                  syncCanvasToHtmlField();
-                  form.submit();
-                  return;
+                
+                statusTitle.textContent = title;
+                statusMessage.textContent = message;
+                
+                if (details) {
+                  statusDetails.textContent = details;
+                  statusDetailsToggle.style.display = 'block';
+                } else {
+                  statusDetailsToggle.style.display = 'none';
                 }
-                // otherwise normal submit
-                var hidden = document.createElement('input');
-                hidden.type = 'hidden';
-                hidden.name = 'go_to_review';
-                hidden.value = '1';
-                form.appendChild(hidden);
-                // ensure html saved from canvas
-                syncCanvasToHtmlField();
-                form.submit();
+                
+                statusBox.style.display = 'block';
+                statusBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
               }
-              if (reviewTop) reviewTop.addEventListener('click', doReviewSubmit);
 
-              // small tab UI (non-functional placeholders)
-              var tabs = document.querySelectorAll('.editor-left .tab');
-              tabs.forEach(function(t){
-                t.addEventListener('click', function(){
-                  tabs.forEach(function(x){ x.classList.remove('active'); });
-                  t.classList.add('active');
+              function updateProfileDetails() {
+                var selectedOption = profileSelect.options[profileSelect.selectedIndex];
+                if (selectedOption.value) {
+                  var query = selectedOption.getAttribute('data-query');
+                  var target = selectedOption.getAttribute('data-target');
+                  profileQuery.innerText = 'Query: ' + query;
+                  profileTarget.innerText = 'Target: ' + target + ' emails';
+                  profileDetails.style.display = '';
+                } else {
+                  profileDetails.style.display = 'none';
+                }
+              }
+
+              if (profileSelect) {
+                profileSelect.addEventListener('change', updateProfileDetails);
+                updateProfileDetails(); // Initial update
+              }
+
+              // Start job button handler
+              if (startJobBtn) {
+                startJobBtn.addEventListener('click', function(e) {
+                  e.preventDefault();
+                  console.log('START EXTRACTION BUTTON: Button clicked');
+                  console.log('START EXTRACTION BUTTON: Profile selected:', profileSelect.value);
+                  
+                  // Hide any previous status messages
+                  document.getElementById('extraction-status').style.display = 'none';
+                  
+                  if (!profileSelect.value) {
+                    console.log('START EXTRACTION BUTTON: ERROR - No profile selected');
+                    showStatus('error', 
+                      '✗ Error: No Profile Selected', 
+                      'Please select an extraction profile from the dropdown before starting the job.',
+                      'START_EXTRACTION: profile_id is empty or invalid');
+                    return;
+                  }
+                  
+                  if (confirm('Start extraction job now?')) {
+                    console.log('START EXTRACTION BUTTON: User confirmed, proceeding...');
+                    
+                    var jobForm = document.getElementById('jobForm');
+                    if (!jobForm) {
+                      console.log('START EXTRACTION BUTTON: ERROR - Job form not found');
+                      showStatus('error', 
+                        '✗ Error: Form Not Found', 
+                        'Unable to locate the job configuration form. Please refresh the page and try again.',
+                        'START_EXTRACTION: document.getElementById("jobForm") returned null');
+                      return;
+                    }
+                    
+                    console.log('START EXTRACTION BUTTON: Job form found');
+                    
+                    // Show loading message
+                    var selectedOption = profileSelect.options[profileSelect.selectedIndex];
+                    var profileName = selectedOption.text.split(' — ')[0];
+                    showStatus('info', 
+                      '⏳ Starting Extraction...', 
+                      'Saving job configuration and starting extraction with profile: ' + profileName,
+                      null);
+                    
+                    // Create hidden input to trigger start after save
+                    var startInput = document.createElement('input');
+                    startInput.type = 'hidden';
+                    startInput.name = 'start_immediately';
+                    startInput.value = '1';
+                    jobForm.appendChild(startInput);
+                    
+                    console.log('START EXTRACTION BUTTON: Added start_immediately=1 input');
+                    console.log('START EXTRACTION BUTTON: Submitting form...');
+                    
+                    // Submit the form (will save job and redirect to start)
+                    jobForm.submit();
+                    
+                    // Show success message (form submission will redirect, but show optimistic message)
+                    setTimeout(function() {
+                      showStatus('success', 
+                        '✓ Extraction Started Successfully!', 
+                        'Job has been saved and extraction is starting. Redirecting to job list...',
+                        null);
+                    }, 100);
+                    
+                  } else {
+                    console.log('START EXTRACTION BUTTON: User cancelled');
+                  }
                 });
-              });
-
-              var modulesGrid = document.getElementById('modulesGrid');
-              var modulesPane = document.getElementById('modulesPane');
-              var canvas = document.getElementById('canvasArea');
-              var htmlField = document.getElementById('htmlField');
-
-              function openHtmlEditor() {
-                htmlTextarea.value = htmlField.value || '';
-                htmlBackdrop.classList.add('show');
-                htmlBackdrop.style.display = 'flex';
-                htmlTextarea.focus();
+              } else {
+                console.log('START EXTRACTION BUTTON: ERROR - Button not found');
               }
-              function closeHtmlEditor() {
-                htmlBackdrop.classList.remove('show');
-                htmlBackdrop.style.display = 'none';
-              }
+            })();
+          </script>
 
-              // Build block markup for modules
-              function createBlockHtmlByModule(module) {
-                    switch(module) {
-                      case 'image':
-                        return '<div style="max-width:100%;text-align:center;"><img src="https://via.placeholder.com/600x200" alt="Image" style="max-width:100%;"></div>';
-                      case 'text':
-                        return '<div style="max-width:100%;font-size:15px;line-height:1.5;color:#333;"><p>Edit text by opening the Code module or double-click this block (use Code for advanced changes).</p></div>';
-                      case 'button':
-                        return '<div style="text-align:center;margin:16px;"><a href="#" style="background:var(--sg-blue);color:#fff;padding:10px;"></div>';
-                                                case 'columns':
-                        return '<div style="display:flex;gap:10px;"><div style="flex:1;background:#fafafa;padding:10px;">Column 1</div><div style="flex:1;background:#fafafa;padding:10px;">Column 2</div></div>';
-                      case 'imgtext':
-                        return '<div style="display:flex;gap:12px;align-items:center;"><img src="https://via.placeholder.com/160x100" style="width:160px;height:auto;"><div>Text next to image</div></div>';
-                      case 'code':
-                        // Removed the static "Add Code" placeholder from the default code module body
-                        return '<div class="code-module"><div class="code-module-header"><span></span><span class="tools"><button type="button" data-tool="edit" title="Edit code" style="background:transparent;border:none;color:#fff;cursor:pointer;">&lt;&gt;</button><button type="button" data-tool="delete" title="Delete" style="background:transparent;border:none;color:#fff;cursor:pointer;">🗑</button></span></div><div class="code-module-body"></div></div>';
-                      default:
-                        return '<div>Module: '+module+'</div>';
-                    }
-                  }
+        <?php } // End job check ?>
+        <?php } // End PDO check ?>
 
-                  // Create canvas block element (wrapper with remove button)
-                  // Accepts contentHtml or a module wrapper (like code-module)
-                  function makeCanvasBlock(contentHtml) {
-                    var wrapper = document.createElement('div');
-                    wrapper.className = 'canvas-block';
-                    var removeBtn = document.createElement('div');
-                    removeBtn.className = 'block-remove';
-                    removeBtn.title = 'Remove block';
-                    removeBtn.innerHTML = '✕';
-                    removeBtn.addEventListener('click', function(){
-                      // confirm removal
-                      if (confirm('Remove this block?')) {
-                        wrapper.remove();
-                        updatePlaceholderVisibility();
-                      }
-                    });
-
-                    var content = document.createElement('div');
-                    content.className = 'block-content';
-                    content.innerHTML = contentHtml || '';
-
-                    // If the block contains a code-module, wire up header tools and editing behavior
-                    var codeModuleEl = content.querySelector('.code-module');
-                    if (codeModuleEl) {
-                      // mark dataset for later use
-                      wrapper.dataset.module = 'code';
-
-                      var header = codeModuleEl.querySelector('.code-module-header');
-                      var body = codeModuleEl.querySelector('.code-module-body');
-
-                      // tool handlers
-                      header.addEventListener('click', function(e){
-                        // if clicked on tool buttons handle separately
-                        var t = e.target;
-                        if (t && t.getAttribute && t.getAttribute('data-tool') === 'delete') {
-                          if (confirm('Delete this code block?')) {
-                            wrapper.remove();
-                            updatePlaceholderVisibility();
-                          }
-                          return;
-                        }
-                        // open the block-level HTML editor for this code body
-                        openBlockEditor(body);
-                      });
-
-                      // support double-click edit for code body as well
-                      body.addEventListener('dblclick', function(){
-                        openBlockEditor(body);
-                      });
-                    } else {
-                      // double-click to edit via HTML editor (for general blocks)
-                      content.addEventListener('dblclick', function(){
-                        // open code editor with this block's HTML only
-                        htmlTextarea.value = content.innerHTML;
-                        htmlBackdrop.classList.add('show');
-                        htmlBackdrop.style.display = 'flex';
-                        var oneOff = function(e){
-                          e.preventDefault();
-                          content.innerHTML = htmlTextarea.value;
-                          htmlBackdrop.classList.remove('show');
-                          htmlBackdrop.style.display = 'none';
-                          htmlSave.removeEventListener('click', oneOff);
-                          if (defaultSaveHandler) {
-                            htmlSave.addEventListener('click', defaultSaveHandler);
-                          }
-                          syncCanvasToHtmlField();
-                        };
-                        // replace
-                        // replace handlers for this one-off edit
-                        if (defaultSaveHandler) htmlSave.removeEventListener('click', defaultSaveHandler);
-                        htmlSave.addEventListener('click', oneOff);
-                      });
-                    }
-
-                    wrapper.appendChild(removeBtn);
-                    wrapper.appendChild(content);
-                    return wrapper;
-                  }
-
-                  // Open block-level HTML editor (edits only the body of a code module or a block container)
-                  function openBlockEditor(bodyElement) {
-                    // set the textarea to the current innerHTML of the block body
-                    htmlTextarea.value = bodyElement.innerHTML;
-                    htmlBackdrop.classList.add('show');
-                    htmlBackdrop.style.display = 'flex';
-                    htmlTextarea.focus();
-
-                    // assign a one-off save handler that updates this bodyElement
-                    var oneOff = function(e){
-                      e.preventDefault();
-                      bodyElement.innerHTML = htmlTextarea.value;
-                      htmlBackdrop.classList.remove('show');
-                      htmlBackdrop.style.display = 'none';
-                      // restore global handler
-                      htmlSave.removeEventListener('click', oneOff);
-                      if (defaultSaveHandler) {
-                        htmlSave.addEventListener('click', defaultSaveHandler);
-                      }
-                      syncCanvasToHtmlField();
-                    };
-
-                    // ensure previous onclick is cleared and attach oneOff
-                    if (defaultSaveHandler) htmlSave.removeEventListener('click', defaultSaveHandler);
-                    htmlSave.addEventListener('click', oneOff);
-                  }
-
-                  // Sync: read all canvas blocks and set htmlField
-                  function syncCanvasToHtmlField() {
-                    // take innerHTML of all .block-content inside canvas, concatenate
-                    var blocks = canvas.querySelectorAll('.canvas-block .block-content');
-                    if (blocks.length === 0) {
-                      htmlField.value = '';
-                      return;
-                    }
-                    var html = '';
-                    blocks.forEach(function(b){
-                      // Check if this block contains a code-module
-                      var codeModule = b.querySelector('.code-module');
-                      if (codeModule) {
-                        // For code modules, extract only the body content (skip the header with emoji/buttons)
-                        var codeBody = codeModule.querySelector('.code-module-body');
-                        if (codeBody) {
-                          html += codeBody.innerHTML;
-                        } else {
-                          // Fallback: if body not found, use full block content to avoid data loss
-                          html += b.innerHTML;
-                        }
-                      } else {
-                        // For non-code modules, include the entire block content
-                        html += b.innerHTML;
-                      }
-                    });
-                    htmlField.value = html;
-                  }
-
-                  // Update placeholder if empty
-                  function updatePlaceholderVisibility() {
-                    var hasBlocks = canvas.querySelectorAll('.canvas-block').length > 0;
-                    var placeholder = canvas.querySelector('.drag-placeholder');
-                    if (!hasBlocks) {
-                      if (!placeholder) {
-                        var ph = document.createElement('div');
-                        ph.className = 'drag-placeholder';
-                        ph.innerText = 'Drag Module Here';
-                        canvas.appendChild(ph);
-                      }
-                    } else {
-                      if (placeholder) placeholder.remove();
-                    }
-                  }
-
-                  // Default html save handler for modal (saves entire canvas)
-                  function defaultHtmlSaveHandler(e){
-                    e.preventDefault();
-                    // set hidden field and update canvas preview
-                    htmlField.value = htmlTextarea.value;
-                    // rehydrate canvas blocks from new html (single big block)
-                    loadHtmlIntoCanvas(htmlTextarea.value);
-                    closeHtmlEditor();
-                  }
-                  var defaultSaveHandler = defaultHtmlSaveHandler;
-                  if (htmlSave) htmlSave.addEventListener('click', defaultSaveHandler);
-
-                  if (htmlClose) htmlClose.addEventListener('click', function(){ closeHtmlEditor(); });
-                  if (htmlCancel) htmlCancel.addEventListener('click', function(e){ e.preventDefault(); closeHtmlEditor(); });
-
-                  // Parse existing htmlField value into canvas blocks (split top-level nodes)
-                  function loadHtmlIntoCanvas(rawHtml) {
-                    canvas.innerHTML = ''; // clear
-                    if (!rawHtml || rawHtml.trim() === '') {
-                      updatePlaceholderVisibility();
-                      return;
-                    }
-                    var tmp = document.createElement('div');
-                    tmp.innerHTML = rawHtml;
-                    // if there are multiple top-level nodes, create a block for each
-                    var children = Array.from(tmp.childNodes).filter(function(n){
-                      // ignore empty text nodes
-                      return !(n.nodeType === 3 && !n.textContent.trim());
-                    });
-                    if (children.length === 0) {
-                      updatePlaceholderVisibility();
-                      return;
-                    }
-                    children.forEach(function(node){
-                      var html = (node.outerHTML !== undefined) ? node.outerHTML : node.textContent;
-                      var blockEl = makeCanvasBlock(html);
-                      canvas.appendChild(blockEl);
-                    });
-                    updatePlaceholderVisibility();
-                  }
-
-                  // Initialize Sortable for modules (pull: clone)
-                  var modulesSortable = Sortable.create(document.getElementById('modulesGrid'), {
-                    group: { name: 'modules', pull: 'clone', put: false },
-                    sort: false,
-                    animation: 150,
-                    onEnd: function (evt) {
-                      // modules grid end — clicks are handled separately
-                    }
-                  });
-
-                  // Initialize Sortable on canvas to accept modules and sort existing blocks
-                  var canvasSortable = Sortable.create(canvas, {
-                    group: { name: 'modules', pull: false, put: true },
-                    animation: 150,
-                    ghostClass: 'sortable-ghost',
-                    onAdd: function (evt) {
-                      // when an item is dragged from modules into canvas, evt.item is the clone element (module-tile)
-                      var dragged = evt.item;
-                      var module = dragged.getAttribute('data-module');
-                      // create a real block with contentHtml
-                      var contentHtml = createBlockHtmlByModule(module);
-                      var blockEl = makeCanvasBlock(contentHtml);
-                      // replace the dragged placeholder with the real block
-                      dragged.parentNode.replaceChild(blockEl, dragged);
-                      syncCanvasToHtmlField();
-
-                      // If the inserted module is code, open the block-level editor immediately
-                      if (module === 'code') {
-                        // find the block's body node and open block editor
-                        var body = blockEl.querySelector('.code-module-body');
-                        if (body) {
-                          // small delay to ensure DOM is ready
-                          setTimeout(function(){ openBlockEditor(body); }, 50);
-                        }
-                      }
-                    },
-                    onUpdate: function(evt){
-                      // reorder happened
-                      syncCanvasToHtmlField();
-                    },
-                    onRemove: function(evt){
-                      syncCanvasToHtmlField();
-                    }
-                  });
-
-                  // Also support clicking module tiles to insert at end
-                  $all('.module-tile').forEach(function(t){
-                    t.addEventListener('click', function(){
-                      var module = t.getAttribute('data-module');
-                      if (module === 'code') {
-                        // open full HTML editor (editing whole message)
-                        openHtmlEditor();
-                        // defaultSaveHandler already handles full save
-                        return;
-                      }
-                      var html = createBlockHtmlByModule(module);
-                      var block = makeCanvasBlock(html);
-                      // if placeholder exists, replace it
-                      var placeholder = canvas.querySelector('.drag-placeholder');
-                      if (placeholder) {
-                        placeholder.remove();
-                      }
-                      canvas.appendChild(block);
-                      // ensure block is sortable (Sortable automatically includes it)
-                      syncCanvasToHtmlField();
-                    });
-                  });
-
-                  // Hydrate initial html into canvas
-                  loadHtmlIntoCanvas(htmlField.value);
-
-                  // If no HTML and we want a code module shown by default, create it and open editor
-                  // (This matches the requested UX: when first inserting code or when campaign empty show code editor option)
-                  if ((!htmlField.value || htmlField.value.trim() === '') && canvas.querySelectorAll('.canvas-block').length === 0) {
-                    // leave placeholder visible; user will insert modules intentionally
-                  }
-
-                  // Keep canvas and htmlField in sync on form submit
-                  form.addEventListener('submit', function(){
-                    syncCanvasToHtmlField();
-                  });
-
-                  // Utility: preview and save as template placeholders (not implemented)
-                  var previewBtn = document.getElementById('previewBtn');
-                  var saveAsTplBtn = document.getElementById('saveAsTplBtn');
-                  if (previewBtn) previewBtn.addEventListener('click', function(){ alert('Preview not implemented in this demo.'); });
-                  if (saveAsTplBtn) saveAsTplBtn.addEventListener('click', function(){ alert('Save as template not implemented.'); });
-
-                  // ESC to close html modal
-                  document.addEventListener('keydown', function(e){
-                    if (e.key === 'Escape') {
-                      if (htmlBackdrop && htmlBackdrop.classList.contains('show')) closeHtmlEditor();
-                    }
-                  });
-
-                  // Accessibility: when dragging from modules, set aria-grabbed (basic)
-                                    $all('.module-tile').forEach(function(t){
-                    t.setAttribute('draggable', 'true');
-                  });
-
-                })();
-              </script>
-
-              <!-- Global toast element (used by autosave / success / error messages) -->
-              <div id="globalToast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
-
-            <?php } // End campaign check ?>
-            <?php } // End PDO check ?>
-
+      <?php elseif ($page === 'review'): ?>
           <?php elseif ($page === 'review'): ?>
             <?php
               if ($pdo === null) {
@@ -7799,208 +7733,270 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
               } else {
                   $id = (int)($_GET['id'] ?? 0);
-                  $campaign = get_campaign($pdo, $id);
-                  if (!$campaign) {
-                    echo "<p>Campaign not found.</p>";
+                  $job = get_job($pdo, $id);
+                  if (!$job) {
+                    echo "<p>Job not found.</p>";
                   } else {
-                    $stats = get_campaign_stats($pdo, $id);
-                    $delivered = max(1, (int)$stats['delivered']);
-                    $openRate  = $delivered ? round(($stats['open'] / $delivered) * 100, 1) : 0;
-                $clickRate = $delivered ? round(($stats['click'] / $delivered) * 100, 1) : 0;
-
-                // Per-profile aggregation for this campaign (PHP-side)
-                $profilesAll = get_profiles($pdo);
-                $profilesMap = [];
-                foreach ($profilesAll as $p) $profilesMap[(int)$p['id']] = $p;
-
-                $perProfile = [];
-                try {
-                    $stmtp = $pdo->prepare("SELECT event_type, details FROM events WHERE campaign_id = ?");
-                    $stmtp->execute([$id]);
-                    foreach ($stmtp as $row) {
-                        $etype = $row['event_type'];
-                        $details = json_decode($row['details'], true);
-                        if (!is_array($details)) continue;
-                        $pid = isset($details['profile_id']) ? (int)$details['profile_id'] : 0;
-                        if ($pid <= 0) continue;
-                        if (!isset($perProfile[$pid])) $perProfile[$pid] = ['sent'=>0,'delivered'=>0,'bounces'=>0,'unsubscribes'=>0,'clicks'=>0,'opens'=>0];
-                        // Count sent attempts: delivered + bounce + deferred
-                        if (in_array($etype, ['delivered','bounce','deferred'])) $perProfile[$pid]['sent']++;
-                        if ($etype === 'delivered') $perProfile[$pid]['delivered']++;
-                        if ($etype === 'bounce') $perProfile[$pid]['bounces']++;
-                        if ($etype === 'unsubscribe' || $etype === 'skipped_unsubscribe') $perProfile[$pid]['unsubscribes']++;
-                        if ($etype === 'click') $perProfile[$pid]['clicks']++;
-                        if ($etype === 'open') $perProfile[$pid]['opens']++;
+                    $stats = get_job_stats($pdo, $id);
+                    
+                    // Get profile information
+                    $profile = null;
+                    if (!empty($job['profile_id'])) {
+                        $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
+                        $profile_stmt->execute([$job['profile_id']]);
+                        $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
                     }
-                } catch (Exception $e) {}
+                    
+                    $extracted = (int)($job['progress_extracted'] ?? 0);
+                    $target = (int)($job['progress_total'] ?? $job['target_count'] ?? 0);
+                    $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
             ?>
-              <div class="page-title">Stats — <?php echo h($campaign['name']); ?></div>
-              <div class="page-subtitle">Delivery &amp; engagement metrics for your Single Send.</div>
+              <div class="page-title">Job Stats — <?php echo h($job['name']); ?></div>
+              <div class="page-subtitle">Extraction results and progress for this job.</div>
+
+              <!-- Error Alert Display - Shows Actual Error Message -->
+              <?php if (!empty($job['error_message'])): ?>
+              <div class="card" style="margin-bottom:20px; border-left:4px solid #dc3545; background:#f8d7da;">
+                <div style="padding:20px;">
+                  <h3 style="margin:0 0 15px 0; color:#721c24; font-size:20px;">⚠️ Extraction Failed - Complete Diagnostic Information</h3>
+                  
+                  <!-- Full Error Message + API Log Box -->
+                  <div style="background:#fff; padding:15px; border:1px solid #f5c6cb; border-radius:4px; margin:15px 0; max-height:400px; overflow-y:auto;">
+                    <strong style="display:block; margin-bottom:10px; color:#721c24;">Full Error Details + API Log:</strong>
+                    <pre style="color:#721c24; margin:0; padding:10px; background:#f9f9f9; border:1px solid #e0e0e0; border-radius:3px; font-family:monospace; font-size:13px; line-height:1.5; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars($job['error_message']); ?></pre>
+                  </div>
+                  
+                  <!-- Collapsible Error Code Meanings -->
+                  <details style="margin:15px 0; cursor:pointer;">
+                    <summary style="font-weight:bold; color:#721c24; cursor:pointer; padding:10px; background:#fef5f6; border-radius:3px; border:1px solid #f5c6cb;">📖 Error Code Meanings (Click to expand)</summary>
+                    <ul style="margin:10px 0 0 0; padding:10px 10px 10px 35px; background:#fff; border-radius:3px; color:#721c24;">
+                      <li style="margin:6px 0;"><strong>HTTP 401</strong> = Invalid or expired API key</li>
+                      <li style="margin:6px 0;"><strong>HTTP 429</strong> = Rate limit exceeded (too many requests)</li>
+                      <li style="margin:6px 0;"><strong>HTTP 500</strong> = serper.dev server error</li>
+                      <li style="margin:6px 0;"><strong>cURL error</strong> = Network connectivity problem</li>
+                      <li style="margin:6px 0;"><strong>Invalid JSON</strong> = Malformed API response</li>
+                      <li style="margin:6px 0;"><strong>Connection timeout</strong> = Server can't reach serper.dev (firewall/network issue)</li>
+                    </ul>
+                  </details>
+                  
+                  <div style="margin:15px 0;">
+                    <strong style="display:block; margin-bottom:8px; color:#721c24;">🔧 Troubleshooting Steps:</strong>
+                    <ol style="margin:0; padding-left:25px; color:#721c24;">
+                      <li style="margin:5px 0;">Copy the full error details shown above</li>
+                      <li style="margin:5px 0;">Verify your API key at <a href="https://serper.dev/dashboard" target="_blank" style="color:#721c24; text-decoration:underline;">serper.dev/dashboard</a></li>
+                      <li style="margin:5px 0;">Test your search query at <a href="https://serper.dev/playground" target="_blank" style="color:#721c24; text-decoration:underline;">serper.dev/playground</a></li>
+                      <li style="margin:5px 0;">Check your API usage and remaining quota</li>
+                      <li style="margin:5px 0;">Verify your server has internet connectivity to serper.dev</li>
+                      <li style="margin:5px 0;">Check error.log file on server for additional technical details</li>
+                    </ol>
+                  </div>
+                </div>
+              </div>
+              <?php endif; ?>
 
               <div class="card" style="margin-bottom:18px;">
                 <div class="card-header">
                   <div>
                     <div class="card-title">Summary</div>
                   </div>
-                  <a href="?page=list" class="btn btn-outline">← Back to Single Sends</a>
+                  <a href="?page=list" class="btn btn-outline">← Back to Jobs</a>
                 </div>
                 <div class="form-row">
                   <div class="form-group">
-                    <label>Subject</label>
-                    <div><?php echo h($campaign['subject']); ?></div>
+                    <label>Profile</label>
+                    <div><?php echo $profile ? h($profile['profile_name']) : 'N/A'; ?></div>
                   </div>
                   <div class="form-group">
-                    <label>Sent at</label>
-                    <div><?php echo $campaign['sent_at'] ? h($campaign['sent_at']) : '<span class="hint">Not sent</span>'; ?></div>
+                    <label>Search Query</label>
+                    <div><?php echo $profile ? h($profile['search_query']) : 'N/A'; ?></div>
+                  </div>
+                  <div class="form-group">
+                    <label>Started at</label>
+                    <div><?php echo $job['started_at'] ? h($job['started_at']) : '<span class="hint">Not started</span>'; ?></div>
+                  </div>
+                  <div class="form-group">
+                    <label>Completed at</label>
+                    <div><?php echo $job['completed_at'] ? h($job['completed_at']) : '<span class="hint">Not completed</span>'; ?></div>
                   </div>
                 </div>
               </div>
 
-              <!-- Real-time Campaign Progress -->
-              <?php 
-                $progress = get_campaign_progress($pdo, $id);
-                if ($progress['status'] === 'queued' || $progress['status'] === 'sending' || ($campaign['status'] === 'sending' && $progress['total'] > 0)):
-              ?>
-              <div class="card" style="margin-bottom:18px;" id="progressCard">
+              <!-- Last API Response Details (Debug Info) -->
+              <?php if (!empty($job['error_message']) && strpos($job['error_message'], 'API LOG:') !== false): ?>
+              <div class="card" style="margin-bottom:18px;">
                 <div class="card-header">
                   <div>
-                    <div class="card-title">Campaign Progress</div>
-                    <div class="card-subtitle">Real-time sending progress (updates automatically)</div>
+                    <div class="card-title">🔍 Last API Response</div>
+                    <div class="card-subtitle">Diagnostic information from the last API call attempt</div>
                   </div>
                 </div>
                 <div style="padding:16px;">
-                  <div style="margin-bottom:12px; font-size:18px; font-weight:600;">
-                    <span id="progressText"><?php echo $progress['sent']; ?> / <?php echo $progress['total']; ?> sent (<?php echo $progress['percentage']; ?>%)</span>
+                  <?php
+                    // Parse error message to extract API log details
+                    $errorLines = explode("\n", $job['error_message']);
+                    $httpCode = null;
+                    $responseLength = null;
+                    $responsePreview = null;
+                    
+                    foreach ($errorLines as $line) {
+                      if (preg_match('/HTTP Code:\s*(\d+)/', $line, $matches)) {
+                        $httpCode = $matches[1];
+                      }
+                      if (preg_match('/Response length:\s*([\d,]+)\s*bytes/', $line, $matches)) {
+                        $responseLength = $matches[1];
+                      }
+                      if (preg_match('/First \d+ chars of response:\s*(.+)/', $line, $matches)) {
+                        $responsePreview = $matches[1];
+                      }
+                      if (preg_match('/FULL ERROR RESPONSE:\s*(.+)/', $line, $matches)) {
+                        $responsePreview = $matches[1];
+                      }
+                    }
+                  ?>
+                  
+                  <div class="form-row">
+                    <?php if ($httpCode): ?>
+                    <div class="form-group">
+                      <label>HTTP Status Code</label>
+                      <div style="font-family:monospace; font-size:14px; font-weight:600; color:<?php echo ($httpCode == '200') ? '#15803d' : '#dc2626'; ?>;">
+                        <?php echo h($httpCode); ?>
+                        <?php 
+                          if ($httpCode == '200') echo ' <span style="color:#15803d;">✓ OK</span>';
+                          elseif ($httpCode == '401') echo ' <span style="color:#dc2626;">❌ Unauthorized</span>';
+                          elseif ($httpCode == '429') echo ' <span style="color:#dc2626;">❌ Rate Limit</span>';
+                          else echo ' <span style="color:#dc2626;">❌ Error</span>';
+                        ?>
+                      </div>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <?php if ($responseLength): ?>
+                    <div class="form-group">
+                      <label>Response Size</label>
+                      <div style="font-family:monospace; font-size:14px;"><?php echo h($responseLength); ?> bytes</div>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <div class="form-group">
+                      <label>Extraction Time</label>
+                      <div style="font-family:monospace; font-size:14px;">
+                        <?php 
+                          if ($job['started_at'] && $job['completed_at']) {
+                            $start = new DateTime($job['started_at']);
+                            $end = new DateTime($job['completed_at']);
+                            $diff = $start->diff($end);
+                            echo $diff->s . ' seconds';
+                          } else {
+                            echo '<span class="hint">N/A</span>';
+                          }
+                        ?>
+                      </div>
+                    </div>
                   </div>
-                  <div style="background:#E4E7EB; border-radius:4px; height:24px; overflow:hidden; position:relative;">
-                    <div id="progressBar" style="background:linear-gradient(90deg, #1A82E2, #3B9EF3); height:100%; width:<?php echo $progress['percentage']; ?>%; transition:width 0.3s;"></div>
+                  
+                  <?php if ($responsePreview): ?>
+                  <div style="margin-top:16px;">
+                    <label style="display:block; margin-bottom:8px; font-weight:600;">API Response Preview:</label>
+                    <pre style="background:#f9f9f9; border:1px solid #e0e0e0; border-radius:4px; padding:12px; margin:0; font-size:12px; line-height:1.4; max-height:200px; overflow-y:auto; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars(substr($responsePreview, 0, 1000)); ?></pre>
                   </div>
-                  <div style="margin-top:8px; color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($progress['status']); ?></div>
+                  <?php endif; ?>
+                  
+                  <div style="margin-top:16px; padding:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:4px; font-size:13px; color:#1e40af;">
+                    <strong>💡 Tip:</strong> Use the "Check Connection" button in Job Profiles to test your API key and search query before running extraction.
+                  </div>
                 </div>
               </div>
               <?php endif; ?>
 
-              <!-- Simplified header stats matching requested layout -->
-              <div class="header-stats">
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['target']; ?></div>
-                  <div class="stat-label">Emails Triggered</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['delivered']; ?></div>
-                  <div class="stat-label">Delivered</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['open']; ?></div>
-                  <div class="stat-label">Unique Opens</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['click']; ?></div>
-                  <div class="stat-label">Unique Clicks</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['bounce']; ?></div>
-                  <div class="stat-label">Bounces</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['unsubscribe']; ?></div>
-                  <div class="stat-label">Unsubscribes</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo (int)$stats['spam']; ?></div>
-                  <div class="stat-label">Spam Reports</div>
-                </div>
-              </div>
-
-              <div style="margin-bottom:18px;">
-                <!-- Placeholder for chart (not implemented) -->
-                <div style="background:#fff;border:1px solid var(--sg-border);border-radius:6px;height:320px;"></div>
-              </div>
-
-              <div class="card" style="margin-bottom:18px;">
+              <!-- Real-time Job Progress -->
+              <?php 
+                $jobStatus = $job['status'];
+                if ($jobStatus === 'queued' || $jobStatus === 'extracting'):
+              ?>
+              <div class="card" style="margin-bottom:18px;" id="progressCard">
                 <div class="card-header">
                   <div>
-                    <div class="card-title">By Sending Profile (this campaign)</div>
-                    <div class="card-subtitle">Counts of sends, delivered, bounces and unsubscribes per profile for this campaign.</div>
+                    <div class="card-title">Extraction Progress</div>
+                    <div class="card-subtitle">Real-time extraction progress (updates automatically)</div>
                   </div>
                 </div>
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Profile</th>
-                      <th>From Email</th>
-                      <th>Sent Attempts</th>
-                      <th>Delivered</th>
-                      <th>Bounces</th>
-                      <th>Unsubscribes</th>
-                      <th>Opens</th>
-                      <th>Clicks</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php if (empty($perProfile)): ?>
-                      <tr>
-                        <td colspan="8" style="text-align:center; padding:16px; color:var(--sg-muted);">No per-profile events found for this campaign.</td>
-                      </tr>
-                    <?php else: ?>
-                      <?php foreach ($perProfile as $pid => $vals):
-                        $pf = $profilesMap[$pid] ?? ['profile_name'=>'Profile #'.$pid,'from_email'=>''];
-                      ?>
-                        <tr>
-                          <td><?php echo h($pf['profile_name']); ?></td>
-                          <td><?php echo h($pf['from_email']); ?></td>
-                          <td><?php echo (int)$vals['sent']; ?></td>
-                          <td><?php echo (int)$vals['delivered']; ?></td>
-                          <td><?php echo (int)$vals['bounces']; ?></td>
-                          <td><?php echo (int)$vals['unsubscribes']; ?></td>
-                          <td><?php echo (int)$vals['opens']; ?></td>
-                          <td><?php echo (int)$vals['clicks']; ?></td>
-                        </tr>
-                      <?php endforeach; ?>
-                    <?php endif; ?>
-                  </tbody>
-                </table>
+                <div style="padding:16px;">
+                  <div style="margin-bottom:12px; font-size:18px; font-weight:600;">
+                    <span id="progressText"><?php echo $extracted; ?> / <?php echo $target; ?> extracted (<?php echo $progress; ?>%)</span>
+                  </div>
+                  <div style="background:#E4E7EB; border-radius:4px; height:24px; overflow:hidden; position:relative;">
+                    <div id="progressBar" style="background:linear-gradient(90deg, #1A82E2, #3B9EF3); height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
+                  </div>
+                  <div style="margin-top:8px; color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($jobStatus); ?></div>
+                </div>
+              </div>
+              <?php endif; ?>
+
+              <!-- Simplified header stats for extraction -->
+              <div class="header-stats">
+                <div class="stat-item">
+                  <div class="stat-num"><?php echo $target; ?></div>
+                  <div class="stat-label">Target Emails</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-num"><?php echo $extracted; ?></div>
+                  <div class="stat-label">Extracted</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-num"><?php echo $progress; ?>%</div>
+                  <div class="stat-label">Progress</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-num"><?php echo $jobStatus === 'completed' ? 'Complete' : ucfirst($jobStatus); ?></div>
+                  <div class="stat-label">Status</div>
+                </div>
               </div>
 
               <div class="card">
                 <div class="card-header">
                   <div>
-                    <div class="card-title">Raw Events</div>
-                    <div class="card-subtitle">Last 50 events (demo).</div>
+                    <div class="card-title">Extracted Emails</div>
+                    <div class="card-subtitle">List of all emails extracted for this job (most recent first).</div>
+                  </div>
+                  <div>
+                    <a href="?page=list" class="btn btn-outline">Download CSV</a>
                   </div>
                 </div>
                 <table class="table">
                   <thead>
                     <tr>
-                      <th>Time</th>
-                      <th>Type</th>
-                      <th>Details</th>
+                      <th>Email</th>
+                      <th>Source Query</th>
+                      <th>Extracted At</th>
                     </tr>
                   </thead>
                   <tbody>
                     <?php
-                      $stmt = $pdo->prepare("SELECT * FROM events WHERE campaign_id=? ORDER BY created_at DESC LIMIT 50");
+                      $stmt = $pdo->prepare("SELECT * FROM extracted_emails WHERE job_id = ? ORDER BY extracted_at DESC LIMIT 100");
                       $stmt->execute([$id]);
-                      $evs = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                      if (empty($evs)):
+                      $emails = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                      if (empty($emails)):
                     ?>
                       <tr>
                         <td colspan="3" style="text-align:center; padding:16px; color:var(--sg-muted);">
-                          No events yet.
+                          No emails extracted yet.
                         </td>
                       </tr>
                     <?php else: ?>
-                      <?php foreach ($evs as $ev):
-                        $dt = h($ev['created_at']);
-                        $type = strtoupper($ev['event_type']);
-                        $details = $ev['details'] ? h($ev['details']) : '—';
-                      ?>
+                      <?php foreach ($emails as $em): ?>
                         <tr>
-                          <td><?php echo $dt; ?></td>
-                          <td><?php echo $type; ?></td>
-                          <td><code style="font-size:11px;"><?php echo $details; ?></code></td>
+                          <td><?php echo h($em['email']); ?></td>
+                          <td><?php echo h($em['source'] ?? 'N/A'); ?></td>
+                          <td><?php echo h($em['extracted_at']); ?></td>
                         </tr>
                       <?php endforeach; ?>
+                      <?php if (count($emails) >= 100): ?>
+                        <tr>
+                          <td colspan="3" style="text-align:center; padding:12px; color:var(--sg-muted);">
+                            Showing first 100 results. Export to CSV for full list.
+                          </td>
+                        </tr>
+                      <?php endif; ?>
                     <?php endif; ?>
                   </tbody>
                 </table>
@@ -8076,337 +8072,27 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
 
           <?php elseif ($page === 'contacts'): ?>
             <?php
-              if ($pdo === null) {
-                  echo '<div class="page-title">Database Error</div>';
-                  echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-              } else {
-                  $listId   = isset($_GET['list_id']) ? (int)$_GET['list_id'] : 0;
-                  $showCreate = isset($_GET['show_create']);
+              // Contacts feature not available in email extraction system
+              // Redirect to jobs list
+              header('Location: ?page=list');
+              exit;
             ?>
-
-            <?php if ($listId === 0): ?>
-              <?php
-                $lists = get_contact_lists($pdo);
-              ?>
-              <div class="page-title">Contact Lists</div>
-              <div class="page-subtitle">Manage lists and segments used by your Single Sends, like SendGrid Contacts.</div>
-
-              <div class="card">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">Lists</div>
-                    <div class="card-subtitle">Global list and individual marketing lists.</div>
-                  </div>
-                  <div style="display:flex; gap:8px;">
-                    <a href="?page=contacts&show_create=1" class="btn btn-outline">Create</a>
-                    <?php if (!empty($lists)): ?>
-                      <a href="?page=contacts&list_id=<?php echo (int)$lists[0]['id']; ?>" class="btn btn-primary">Add Contacts</a>
-                    <?php endif; ?>
-                  </div>
-                </div>
-
-                                <?php if (empty($lists)): ?>
-                  <div class="card" style="margin-top:12px;">
-                    <div class="hint">No contact lists found. Create one to start adding contacts.</div>
-                  </div>
-                <?php else: ?>
-                  <table class="table">
-                    <thead>
-                      <tr>
-                        <th>List Name</th>
-                        <th>Type</th>
-                        <th>Contacts</th>
-                        <th>Created</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <?php foreach ($lists as $l): ?>
-                        <tr>
-                          <td><a href="?page=contacts&list_id=<?php echo (int)$l['id']; ?>"><?php echo h($l['name']); ?></a></td>
-                          <td><?php echo h($l['type']); ?></td>
-                          <td><?php echo (int)$l['contact_count']; ?></td>
-                          <td><?php echo h($l['created_at']); ?></td>
-                          <td>
-                            <a class="btn-mini" href="?page=contacts&list_id=<?php echo (int)$l['id']; ?>">View</a>
-                            <form method="post" style="display:inline;">
-                              <input type="hidden" name="action" value="delete_contact_list">
-                              <input type="hidden" name="list_id" value="<?php echo (int)$l['id']; ?>">
-                              <button type="submit" class="btn-mini" onclick="return confirm('Delete this list and its contacts?');">Delete</button>
-                            </form>
-                          </td>
-                        </tr>
-                      <?php endforeach; ?>
-                    </tbody>
-                  </table>
-                <?php endif; ?>
-              </div>
-
-              <?php if ($showCreate): ?>
-                <div class="modal-backdrop" id="createListModal">
-                  <div class="modal-panel">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                      <div style="font-weight:600;">Create Contact List</div>
-                      <button class="btn btn-outline" onclick="document.getElementById('createListModal').style.display='none'">✕</button>
-                    </div>
-                    <form method="post">
-                      <input type="hidden" name="action" value="create_contact_list">
-                      <div class="form-group">
-                        <label>List name</label>
-                        <input type="text" name="list_name" required>
-                      </div>
-                      <div style="display:flex; gap:8px; justify-content:flex-end;">
-                        <a href="?page=contacts" class="btn btn-outline">Cancel</a>
-                        <button class="btn btn-primary" type="submit">Create</button>
-                      </div>
-                    </form>
-                  </div>
-                </div>
-                <script>document.getElementById('createListModal').style.display='flex';</script>
-              <?php endif; ?>
-
-            <?php else: ?>
-              <?php
-                $list = get_contact_list($pdo, $listId);
-                if (!$list) {
-                  echo "<p>List not found.</p>";
-                } else {
-                  $contacts = get_contacts_for_list($pdo, $listId);
-              ?>
-                <div class="page-title">Contacts — <?php echo h($list['name']); ?></div>
-                <div class="page-subtitle">Manage recipients in this list (manual add or CSV upload).</div>
-
-                <div class="card">
-                  <div class="card-header">
-                    <div>
-                      <div class="card-title">Add Contacts</div>
-                      <div class="card-subtitle">Manual add or upload a CSV file (first column header 'email' is recommended).</div>
-                    </div>
-                    <div style="display:flex; gap:8px;">
-                      <a href="?page=contacts" class="btn btn-outline">← Back to Lists</a>
-                    </div>
-                  </div>
-
-                  <form method="post" style="margin-bottom:12px;">
-                    <input type="hidden" name="action" value="add_contact_manual">
-                    <input type="hidden" name="list_id" value="<?php echo (int)$listId; ?>">
-                    <div class="form-row">
-                      <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" required>
-                      </div>
-                      <div class="form-group">
-                        <input type="text" name="first_name" placeholder="First name">
-                      </div>
-                      <div class="form-group">
-                        <label>Last name</label>
-                        <input type="text" name="last_name" placeholder="Last name">
-                      </div>
-                    </div>
-                    <div style="display:flex; gap:8px; justify-content:flex-end;">
-                      <button type="submit" class="btn btn-primary">Add Contact</button>
-                    </div>
-                  </form>
-
-                  <form method="post" enctype="multipart/form-data" style="margin-top:12px;">
-                    <input type="hidden" name="action" value="upload_contacts_csv">
-                    <input type="hidden" name="list_id" value="<?php echo (int)$listId; ?>">
-                    <div class="form-row">
-                      <div class="form-group">
-                        <label>Upload CSV</label>
-                        <input type="file" name="csv_file" accept=".csv,text/csv">
-                        <small class="hint">CSV should contain an 'email' column or have emails in first column.</small>
-                      </div>
-                    </div>
-                    <div style="display:flex; gap:8px; justify-content:flex-end;">
-                      <button class="btn btn-outline" type="submit">Upload</button>
-                    </div>
-                  </form>
-                </div>
-
-                <div class="card">
-                  <div class="card-header">
-                    <div>
-                      <div class="card-title">Contacts (<?php echo count($contacts); ?>)</div>
-                    </div>
-                    <div>
-                      <form method="get" style="display:inline;">
-                        <input type="hidden" name="page" value="contacts">
-                        <input type="hidden" name="list_id" value="<?php echo (int)$listId; ?>">
-                        <input type="text" name="q" placeholder="Search email or name" style="padding:6px 8px;">
-                        <button class="btn btn-outline" type="submit">Search</button>
-                      </form>
-                    </div>
-                  </div>
-
-                  <?php if (empty($contacts)): ?>
-                    <div class="hint" style="padding:16px;">No contacts in this list yet.</div>
-                  <?php else: ?>
-                    <table class="table">
-                      <thead>
-                        <tr>
-                          <th>Email</th>
-                          <th>Name</th>
-                          <th>Added</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <?php foreach ($contacts as $ct): ?>
-                          <tr>
-                            <td><?php echo h($ct['email']); ?></td>
-                            <td><?php echo h(trim($ct['first_name'] . ' ' . $ct['last_name'])); ?></td>
-                            <td><?php echo h($ct['created_at']); ?></td>
-                          </tr>
-                        <?php endforeach; ?>
-                      </tbody>
-                    </table>
-                  <?php endif; ?>
-                </div>
-              <?php } // End else block for if (!$list) ?>
-
-            <?php endif; ?> <!-- End if ($listId === 0) -->
-            <?php } // End if($pdo === null) else block for contacts ?>
 
           <?php elseif ($page === 'activity'): ?>
             <?php
-              if ($pdo === null) {
-                  echo '<div class="page-title">Database Error</div>';
-                  echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-              } else {
-                  // Activity page showing unified unsubscribes and bounces
-                  $stmt = $pdo->query("SELECT * FROM events WHERE event_type IN ('unsubscribe','bounce','skipped_unsubscribe','profile_disabled') ORDER BY created_at DESC LIMIT 200");
-                  $acts = $stmt->fetchAll(PDO::FETCH_ASSOC);
+              // Activity page not available in email extraction system
+              // Redirect to jobs list
+              header('Location: ?page=list');
+              exit;
             ?>
-            <div class="page-title">Activity</div>
-            <div class="page-subtitle">Recent unsubscribes, bounces, and profile disables.</div>
-
-            <div class="card">
-              <div class="card-header">
-                <div>
-                  <div class="card-title">Recent Activity</div>
-                  <div class="card-subtitle">Click an event to view details (emails, errors).</div>
-                </div>
-                <div>
-                  <a href="?page=list" class="btn btn-outline">← Single Sends</a>
-                </div>
-              </div>
-
-              <div style="display:flex; gap:8px; margin-bottom:10px;">
-                <form method="post" onsubmit="return confirm('Delete ALL unsubscribes?');">
-                  <input type="hidden" name="action" value="delete_unsubscribes">
-                  <button class="btn btn-outline" type="submit">Clear Unsubscribes</button>
-                </form>
-                <form method="post" onsubmit="return confirm('Delete ALL bounce events?');">
-                  <input type="hidden" name="action" value="delete_bounces">
-                  <button class="btn btn-outline" type="submit">Clear Bounces</button>
-                </form>
-              </div>
-
-              <?php if (empty($acts)): ?>
-                <div class="hint" style="padding:16px;">No recent unsubscribes or bounces.</div>
-              <?php else: ?>
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Type</th>
-                      <th>Summary</th>
-                      <th>Details</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php foreach ($acts as $a): 
-                      $details = json_decode($a['details'], true);
-                      $summary = '';
-                      if ($a['event_type'] === 'bounce') {
-                        $summary = isset($details['rcpt']) ? h($details['rcpt']) : 'Bounce';
-                      } elseif ($a['event_type'] === 'unsubscribe' || $a['event_type'] === 'skipped_unsubscribe') {
-                        $summary = isset($details['rcpt']) ? h($details['rcpt']) : 'Unsubscribe';
-                      } elseif ($a['event_type'] === 'profile_disabled') {
-                        $summary = 'Profile ' . (isset($details['profile_id']) ? h($details['profile_id']) : '');
-                      }
-                    ?>
-                      <tr>
-                        <td><?php echo h($a['created_at']); ?></td>
-                        <td><?php echo h(ucfirst($a['event_type'])); ?></td>
-                        <td><?php echo $summary; ?></td>
-                        <td><code style="font-size:11px;"><?php echo h($a['details']); ?></code></td>
-                      </tr>
-                    <?php endforeach; ?>
-                  </tbody>
-                </table>
-              <?php endif; ?>
-            </div>
-            <?php } // End PDO check for activity ?>
 
           <?php elseif ($page === 'tracking'): ?>
             <?php
-            // Handle tracking settings update
-            if (isset($_POST['action']) && $_POST['action'] === 'save_tracking_settings') {
-                $openTracking = isset($_POST['open_tracking_enabled']) ? '1' : '0';
-                $clickTracking = isset($_POST['click_tracking_enabled']) ? '1' : '0';
-                
-                set_setting($pdo, 'open_tracking_enabled', $openTracking);
-                set_setting($pdo, 'click_tracking_enabled', $clickTracking);
-                
-                echo '<div style="padding:12px; margin-bottom:16px; background:var(--sg-success-light); color:var(--sg-success); border-radius:6px; border:1px solid var(--sg-success);">✓ Tracking settings saved successfully</div>';
-            }
-            
-            $openTrackingEnabled = get_setting($pdo, 'open_tracking_enabled', '1') === '1';
-            $clickTrackingEnabled = get_setting($pdo, 'click_tracking_enabled', '1') === '1';
+              // Tracking page not available in email extraction system
+              // Redirect to jobs list
+              header('Location: ?page=list');
+              exit;
             ?>
-            
-            <div class="page-title">Tracking Settings</div>
-            <div class="page-subtitle">Global tracking configuration for all campaigns</div>
-
-            <div class="card">
-              <div class="card-header">
-                <div>
-                  <div class="card-title">Email Tracking</div>
-                  <div class="card-subtitle">Configure open and click tracking for all campaigns globally</div>
-                </div>
-              </div>
-
-              <form method="post">
-                <input type="hidden" name="action" value="save_tracking_settings">
-                
-                <div class="form-row">
-                  <div class="form-group">
-                    <label style="font-weight:600;">Open Tracking</label>
-                    <div class="checkbox-row">
-                      <input type="checkbox" name="open_tracking_enabled" id="open_tracking_enabled" <?php if ($openTrackingEnabled) echo 'checked'; ?>>
-                      <label for="open_tracking_enabled">Enable Open Tracking</label>
-                    </div>
-                    <small class="hint">Track when recipients open your emails using an invisible tracking pixel. This applies to all campaigns globally.</small>
-                  </div>
-                </div>
-
-                <div class="form-row">
-                  <div class="form-group">
-                    <label style="font-weight:600;">Click Tracking</label>
-                    <div class="checkbox-row">
-                      <input type="checkbox" name="click_tracking_enabled" id="click_tracking_enabled" <?php if ($clickTrackingEnabled) echo 'checked'; ?>>
-                      <label for="click_tracking_enabled">Enable Click Tracking</label>
-                    </div>
-                    <small class="hint">Track when recipients click links in your emails by wrapping URLs with tracking redirects. This applies to all campaigns globally.</small>
-                  </div>
-                </div>
-
-                <div style="margin-top:20px;">
-                  <button type="submit" class="btn btn-primary">Save Tracking Settings</button>
-                </div>
-              </form>
-
-              <div style="margin-top:32px; padding-top:24px; border-top:1px solid var(--sg-border);">
-                <div style="font-weight:600; margin-bottom:12px;">How Tracking Works</div>
-                <div style="color:var(--sg-text-muted); line-height:1.6;">
-                  <p><strong>Open Tracking:</strong> Adds a 1x1 pixel invisible image to detect when emails are opened.</p>
-                  <p><strong>Click Tracking:</strong> Wraps all links in your emails with tracking redirects to record clicks before sending users to the original destination.</p>
-                  <p style="margin-bottom:0;"><strong>Note:</strong> These settings apply globally to all campaigns. When disabled, no tracking code will be injected into outgoing emails.</p>
-                </div>
-              </div>
-            </div>
-
           <?php else: ?>
             <p>Unknown page.</p>
           <?php endif; ?>
@@ -8524,6 +8210,143 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
         });
 
       })();
+      
+      // Test Connection Button Handler
+      (function() {
+        const testBtn = document.getElementById('testConnectionBtn');
+        const resultDiv = document.getElementById('connectionTestResult');
+        const apiKeyInput = document.getElementById('profile_api_key');
+        const searchQueryInput = document.getElementById('profile_search_query');
+        
+        if (testBtn && resultDiv && apiKeyInput && searchQueryInput) {
+          testBtn.addEventListener('click', function() {
+            const apiKey = apiKeyInput.value.trim();
+            const searchQuery = searchQueryInput.value.trim();
+            
+            if (!apiKey) {
+              resultDiv.style.display = 'block';
+              resultDiv.style.background = '#fee';
+              resultDiv.style.color = '#c00';
+              resultDiv.style.border = '1px solid #fcc';
+              resultDiv.innerHTML = '❌ Please enter an API key';
+              return;
+            }
+            
+            if (!searchQuery) {
+              resultDiv.style.display = 'block';
+              resultDiv.style.background = '#fee';
+              resultDiv.style.color = '#c00';
+              resultDiv.style.border = '1px solid #fcc';
+              resultDiv.innerHTML = '❌ Please enter a search query';
+              return;
+            }
+            
+            // Show loading state
+            testBtn.disabled = true;
+            testBtn.innerHTML = '⏳ Testing...';
+            resultDiv.style.display = 'block';
+            resultDiv.style.background = '#eff6ff';
+            resultDiv.style.color = '#1e40af';
+            resultDiv.style.border = '1px solid #bfdbfe';
+            resultDiv.innerHTML = '⏳ Connecting to serper.dev...';
+            
+            // Test connection
+            fetch('?action=test_connection', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+              body: 'api_key=' + encodeURIComponent(apiKey) + '&search_query=' + encodeURIComponent(searchQuery)
+            })
+            .then(r => r.json())
+            .then(data => {
+              testBtn.disabled = false;
+              testBtn.innerHTML = '🔌 Test Connection';
+              
+              if (data.success) {
+                resultDiv.style.background = '#f0fdf4';
+                resultDiv.style.color = '#15803d';
+                resultDiv.style.border = '1px solid #bbf7d0';
+                resultDiv.innerHTML = 
+                  '<strong>✓ Connection Successful!</strong><br>' +
+                  '<small>HTTP ' + data.http_code + ' | ' +
+                  data.elapsed_ms + 'ms | ' +
+                  data.result_count + ' results</small>';
+              } else {
+                resultDiv.style.background = '#fee';
+                resultDiv.style.color = '#c00';
+                resultDiv.style.border = '1px solid #fcc';
+                resultDiv.innerHTML = 
+                  '<strong>❌ Connection Failed</strong><br>' +
+                  '<small>' + (data.error || 'Unknown error') + '</small>' +
+                  (data.http_code ? '<br><small>HTTP ' + data.http_code + ' | ' + data.elapsed_ms + 'ms</small>' : '');
+              }
+            })
+            .catch(err => {
+              testBtn.disabled = false;
+              testBtn.innerHTML = '🔌 Test Connection';
+              resultDiv.style.background = '#fee';
+              resultDiv.style.color = '#c00';
+              resultDiv.style.border = '1px solid #fcc';
+              resultDiv.innerHTML = '❌ Network error: ' + err.message;
+            });
+          });
+        }
+      })();
+      
+      // Test connection for profile in list
+      function testProfileConnection(profileId) {
+        const statusDiv = document.getElementById('profile-conn-status-' + profileId);
+        if (!statusDiv) return;
+        
+        // Show loading state
+        statusDiv.style.display = 'block';
+        statusDiv.style.padding = '8px';
+        statusDiv.style.borderRadius = '4px';
+        statusDiv.style.background = '#eff6ff';
+        statusDiv.style.color = '#1e40af';
+        statusDiv.style.border = '1px solid #bfdbfe';
+        statusDiv.innerHTML = '⏳ Testing connection...';
+        
+        // Test connection
+        fetch('?action=test_connection', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'profile_id=' + profileId
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            statusDiv.style.background = '#f0fdf4';
+            statusDiv.style.color = '#15803d';
+            statusDiv.style.border = '1px solid #bbf7d0';
+            statusDiv.innerHTML = 
+              '<strong>✓ Connection OK</strong> | HTTP ' + data.http_code + ' | ' +
+              data.elapsed_ms + 'ms | ' + data.result_count + ' results';
+          } else {
+            statusDiv.style.background = '#fee';
+            statusDiv.style.color = '#c00';
+            statusDiv.style.border = '1px solid #fcc';
+            statusDiv.innerHTML = 
+              '<strong>❌ Failed:</strong> ' + (data.error || 'Unknown error') +
+              (data.http_code ? ' | HTTP ' + data.http_code : '');
+          }
+          
+          // Auto-hide after 10 seconds
+          setTimeout(() => {
+            statusDiv.style.display = 'none';
+          }, 10000);
+        })
+        .catch(err => {
+          statusDiv.style.background = '#fee';
+          statusDiv.style.color = '#c00';
+          statusDiv.style.border = '1px solid #fcc';
+          statusDiv.innerHTML = '❌ Network error: ' + err.message;
+          
+          // Auto-hide after 10 seconds
+          setTimeout(() => {
+            statusDiv.style.display = 'none';
+          }, 10000);
+        });
+      }
     </script>
 
     </body>
