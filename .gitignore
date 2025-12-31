@@ -1,0 +1,25 @@
+# Temporary files
+/tmp/
+*.log
+
+# Email extraction data
+/tmp/email_extraction/
+
+# PHP temporary files
+*.tmp
+*.cache
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
