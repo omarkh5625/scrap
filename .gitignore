@@ -1,0 +1,3 @@
+php_errors.log
+*.lock
+worker_logs/
