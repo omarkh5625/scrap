@@ -1004,6 +1004,7 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $attempts = 0;
         $maxAttempts = $workers * 5; // Allow multiple rounds per worker
         $pageOffset = 0;
+        $allApiErrors = []; // Track all API errors across all rounds
         
         // Store diagnostic info in database (fallback when error_log not available)
         $diagMsg = "DIAGNOSTIC: Loop vars: extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}\n";
@@ -1072,6 +1073,8 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             
             // Process results from all workers
             $roundEmails = 0;
+            $apiErrors = []; // Track API errors for debugging
+            
             foreach ($curlHandles as $idx => $ch) {
                 $response = curl_multi_getcontent($ch);
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -1081,16 +1084,21 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                 
                 if ($curlError) {
                     error_log("PARALLEL_EXTRACTION: Worker {$idx} - CURL ERROR: {$curlError}");
+                    $apiErrors[] = "Worker {$idx}: CURL Error - {$curlError}";
                 }
                 
                 if ($httpCode === 200 && $response) {
                     $data = json_decode($response, true);
                     if ($data === null) {
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - JSON decode failed! Response: " . substr($response, 0, 500));
+                        $apiErrors[] = "Worker {$idx}: JSON decode failed - Response: " . substr($response, 0, 200);
                     } elseif (!isset($data['organic'])) {
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - No 'organic' field in response. Keys: " . implode(', ', array_keys($data)));
                         if (isset($data['error'])) {
                             error_log("PARALLEL_EXTRACTION: Worker {$idx} - API ERROR: " . json_encode($data['error']));
+                            $apiErrors[] = "Worker {$idx}: API Error - " . json_encode($data['error']);
+                        } else {
+                            $apiErrors[] = "Worker {$idx}: No organic results field in response";
                         }
                     } else {
                         $organicCount = count($data['organic']);
@@ -1129,7 +1137,27 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                         }
                     }
                 } else {
-                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode} or empty response");
+                    // Non-200 HTTP response
+                    $httpMessage = "";
+                    switch ($httpCode) {
+                        case 401:
+                            $httpMessage = "Unauthorized - Invalid or expired API key";
+                            break;
+                        case 429:
+                            $httpMessage = "Rate limit exceeded - Too many API requests";
+                            break;
+                        case 500:
+                            $httpMessage = "Internal server error on serper.dev";
+                            break;
+                        case 0:
+                            $httpMessage = "Connection failed - Network/firewall issue";
+                            break;
+                        default:
+                            $httpMessage = "HTTP error {$httpCode}";
+                    }
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - {$httpMessage}");
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - Response preview: " . substr($response, 0, 500));
+                    $apiErrors[] = "Worker {$idx}: {$httpMessage} (HTTP {$httpCode}) - Response: " . substr($response, 0, 200);
                 }
                 
                 curl_multi_remove_handle($multiHandle, $ch);
@@ -1137,6 +1165,11 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             }
             
             curl_multi_close($multiHandle);
+            
+            // Collect API errors from this round
+            if (!empty($apiErrors)) {
+                $allApiErrors = array_merge($allApiErrors, $apiErrors);
+            }
             
             error_log("PARALLEL_EXTRACTION: Round {$attempts} - extracted {$roundEmails} emails (total: {$extractedCount}/{$targetCount})");
             
@@ -1159,22 +1192,72 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$attempts} attempts with {$workers} workers");
             
             $errorMsg = "No emails found in search results after {$attempts} API calls.\n\n";
+            $errorMsg .= "=== JOB CONFIGURATION ===\n";
             $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
             $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
-            $errorMsg .= "Business Only Filter: " . ($businessOnly ? "Enabled" : "Disabled") . "\n";
+            $errorMsg .= "Filter Mode: {$filterMode}\n";
+            if (!empty($emailDomains)) {
+                $errorMsg .= "Target Domains: " . implode(', ', $emailDomains) . "\n";
+            }
             $errorMsg .= "Workers Used: {$workers}\n";
             $errorMsg .= "API Calls Made: {$attempts}\n\n";
-            $errorMsg .= "Possible reasons:\n";
+            
+            $errorMsg .= "=== POSSIBLE REASONS ===\n";
             $errorMsg .= "1. The search query returns no results with email addresses\n";
-            $errorMsg .= "2. All emails filtered out (Business Only excludes gmail.com, yahoo.com, etc.)\n";
-            $errorMsg .= "3. API key may be invalid or rate limited\n";
-            $errorMsg .= "4. Network connectivity issues\n\n";
-            $errorMsg .= "Suggestions:\n";
-            $errorMsg .= "- Try a more specific search query (e.g., 'company contact email')\n";
-            $errorMsg .= "- Try a different location or industry\n";
-            $errorMsg .= "- Disable 'Business Only' filter to include all emails\n";
-            $errorMsg .= "- Check server error.log for API response details\n";
-            $errorMsg .= "- Verify API key at serper.dev/dashboard\n";
+            if ($filterMode === 'business_only') {
+                $errorMsg .= "2. Business Only filter is excluding all found emails (excludes gmail.com, yahoo.com, etc.)\n";
+            } elseif ($filterMode === 'include' && !empty($emailDomains)) {
+                $errorMsg .= "2. Include filter is too restrictive - no emails found from: " . implode(', ', $emailDomains) . "\n";
+            } elseif ($filterMode === 'exclude' && !empty($emailDomains)) {
+                $errorMsg .= "2. Exclude filter removed all emails (excluding: " . implode(', ', $emailDomains) . ")\n";
+            }
+            $errorMsg .= "3. API key may be invalid or rate limited (check HTTP codes in API Log below)\n";
+            $errorMsg .= "4. Network connectivity issues to serper.dev\n";
+            $errorMsg .= "5. Search query is too specific or targets wrong audience\n\n";
+            
+            $errorMsg .= "=== TROUBLESHOOTING STEPS ===\n";
+            $errorMsg .= "1. Test API Connection: Use the 'Test Connection' button in the profile\n";
+            $errorMsg .= "2. Verify API Key: Check at https://serper.dev/dashboard\n";
+            $errorMsg .= "3. Adjust Filter Mode:\n";
+            if ($filterMode === 'business_only') {
+                $errorMsg .= "   - Try 'All Emails' mode to see if any emails are found\n";
+                $errorMsg .= "   - Or use 'Include Only' with specific domains like gmail.com, yahoo.com\n";
+            } elseif ($filterMode === 'include') {
+                $errorMsg .= "   - Add more domains to the Include list\n";
+                $errorMsg .= "   - Or switch to 'All Emails' mode temporarily\n";
+            }
+            $errorMsg .= "4. Improve Search Query:\n";
+            $errorMsg .= "   - Add keywords like 'contact', 'email', 'support'\n";
+            $errorMsg .= "   - Try more general terms (e.g., 'real estate California' instead of 'luxury real estate Newport Beach')\n";
+            $errorMsg .= "5. Check Server Error Log: Look for API response details\n\n";
+            
+            $errorMsg .= "=== HTTP STATUS CODE REFERENCE ===\n";
+            $errorMsg .= "200 OK = Success\n";
+            $errorMsg .= "401 Unauthorized = Invalid/expired API key\n";
+            $errorMsg .= "429 Too Many Requests = Rate limit exceeded\n";
+            $errorMsg .= "500 Internal Server Error = serper.dev server issue\n";
+            $errorMsg .= "Connection timeout = Network/firewall blocking serper.dev\n\n";
+            
+            // Include API error log if we have errors
+            if (!empty($allApiErrors)) {
+                $errorMsg .= "=== API ERRORS ENCOUNTERED ===\n";
+                $errorMsg .= "The following errors were encountered during extraction:\n\n";
+                // Limit to last 10 errors to avoid overwhelming the error message
+                $recentErrors = array_slice($allApiErrors, -10);
+                foreach ($recentErrors as $error) {
+                    $errorMsg .= "  • " . $error . "\n";
+                }
+                if (count($allApiErrors) > 10) {
+                    $errorMsg .= "\n(Showing last 10 of " . count($allApiErrors) . " errors. Check error.log for complete list)\n";
+                }
+                $errorMsg .= "\n";
+            }
+            
+            $errorMsg .= "=== NEXT STEPS ===\n";
+            $errorMsg .= "1. Check the 'Test Connection' button in Job Profiles to verify API connectivity\n";
+            $errorMsg .= "2. Review the API errors above to identify the issue\n";
+            $errorMsg .= "3. Check server error.log for detailed API responses from all workers\n";
+            $errorMsg .= "   Look for lines starting with 'PARALLEL_EXTRACTION: Worker' to see HTTP codes and response data.\n";
             
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
             $stmt->execute([$errorMsg, $jobId]);
