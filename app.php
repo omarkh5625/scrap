@@ -2207,17 +2207,7 @@ class Router {
         
         error_log("=== Worker Stopped: {$workerName} (processed {$itemsProcessed} items) ===");
     }
-                // If dedicated to a specific job and no work found, check if job is complete
-                $jobDetails = Job::getById($jobId);
-                if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
-                    echo "Job {$jobId} is complete or not found. Exiting.\n";
-                    break;
-                }
-            }
-            
-            sleep($pollingInterval);
-        }
-    }
+    
     
     private static function handleSetup(): void {
         if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {

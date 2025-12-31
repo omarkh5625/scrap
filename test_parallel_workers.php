@@ -45,11 +45,13 @@ $testStartTime = microtime(true);
 
 // Spawn workers using proc_open (similar to the production code)
 $processes = [];
+$nullDevice = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN' ? 'NUL' : '/dev/null';
+
 for ($i = 1; $i <= $testWorkerCount; $i++) {
     $descriptors = [
         0 => ['pipe', 'r'],
-        1 => ['file', '/dev/null', 'w'],
-        2 => ['file', '/dev/null', 'w']
+        1 => ['file', $nullDevice, 'w'],
+        2 => ['file', $nullDevice, 'w']
     ];
     
     $process = proc_open([PHP_BINARY, $workerScript, "worker-{$i}"], $descriptors, $pipes, null, null, ['bypass_shell' => true]);
