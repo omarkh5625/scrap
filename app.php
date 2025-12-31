@@ -5431,11 +5431,14 @@ if ($action === 'save_rotation') {
 
 // Test API Connection Action
 if ($action === 'test_connection') {
-    // Disable HTML error output for this AJAX request
-    ini_set('display_errors', 0);
+    // Completely suppress all output/errors before JSON
+    @ini_set('display_errors', 0);
+    @error_reporting(0);
     
-    // Prevent any output before JSON
-    if (ob_get_level()) ob_clean();
+    // Clear ALL output buffers
+    while (ob_get_level()) @ob_end_clean();
+    @ob_start();
+    
     header('Content-Type: application/json; charset=utf-8');
     
     try {
@@ -5455,11 +5458,13 @@ if ($action === 'test_connection') {
         }
         
         if (empty($api_key)) {
+            @ob_end_clean();
             echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
             exit;
         }
         
         if (empty($search_query)) {
+            @ob_end_clean();
             echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
             exit;
         }
@@ -5487,6 +5492,7 @@ if ($action === 'test_connection') {
         $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
         
         if ($curl_error) {
+            @ob_end_clean();
             echo json_encode([
                 'success' => false,
                 'error' => 'Connection error: ' . $curl_error,
@@ -5502,6 +5508,7 @@ if ($action === 'test_connection') {
             $data = json_decode($response, true);
             $result_count = isset($data['organic']) ? count($data['organic']) : 0;
             
+            @ob_end_clean();
             echo json_encode([
                 'success' => true,
                 'message' => '✓ Connection successful!',
@@ -5511,6 +5518,7 @@ if ($action === 'test_connection') {
                 'response_preview' => $response_preview
             ], JSON_UNESCAPED_UNICODE);
         } else {
+            @ob_end_clean();
             echo json_encode([
                 'success' => false,
                 'error' => 'API returned HTTP ' . $http_code,
@@ -5520,6 +5528,7 @@ if ($action === 'test_connection') {
             ], JSON_UNESCAPED_UNICODE);
         }
     } catch (Exception $e) {
+        @ob_end_clean();
         echo json_encode([
             'success' => false,
             'error' => 'Internal error: ' . $e->getMessage()
