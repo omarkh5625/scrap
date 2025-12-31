@@ -920,14 +920,19 @@ class JobManager {
                 'max_run_time' => 300
             ];
             
-            $governor = new WorkerGovernor($jobId);
+            // Get the desired number of workers from job options
+            $desiredWorkers = isset($job['options']['max_workers']) ? 
+                min((int)$job['options']['max_workers'], Config::MAX_WORKERS_PER_JOB) : 
+                Config::MIN_WORKERS_PER_JOB;
+            
+            $governor = new WorkerGovernor($jobId, $desiredWorkers);
             $job['worker_governor'] = $governor;
             $job['status'] = 'running';
             $job['started_at'] = time();
             
-            // Spawn initial workers with full configuration
+            // Spawn all requested workers with full configuration
             $workersSpawned = 0;
-            for ($i = 0; $i < Config::MIN_WORKERS_PER_JOB; $i++) {
+            for ($i = 0; $i < $desiredWorkers; $i++) {
                 $workerId = Utils::generateId('worker_');
                 try {
                     $governor->spawnWorker($workerId, $workerConfig);
@@ -951,7 +956,7 @@ class JobManager {
             $job['workers_running'] = $workersSpawned;
             
             $this->saveJob($jobId);
-            Utils::logMessage('INFO', "Job started: {$jobId} with {$workersSpawned} workers");
+            Utils::logMessage('INFO', "Job started: {$jobId} with {$workersSpawned}/{$desiredWorkers} workers");
             
             return true;
         } catch (Exception $e) {
@@ -1062,10 +1067,15 @@ class JobManager {
                 // Restore worker governor if it doesn't exist
                 if (!$job['worker_governor']) {
                     try {
-                        $governor = new WorkerGovernor($jobId);
+                        // Get the desired number of workers from job options
+                        $desiredWorkers = isset($job['options']['max_workers']) ? 
+                            min((int)$job['options']['max_workers'], Config::MAX_WORKERS_PER_JOB) : 
+                            Config::MIN_WORKERS_PER_JOB;
+                        
+                        $governor = new WorkerGovernor($jobId, $desiredWorkers);
                         $this->jobs[$jobId]['worker_governor'] = $governor;
                         
-                        // Respawn minimum workers with full configuration
+                        // Respawn workers up to desired count with full configuration
                         $workerConfig = [
                             'job_id' => $jobId,
                             'api_key' => $job['api_key'],
@@ -1075,7 +1085,9 @@ class JobManager {
                         ];
                         
                         $currentWorkers = count($governor->getWorkers());
-                        $neededWorkers = Config::MIN_WORKERS_PER_JOB - $currentWorkers;
+                        $neededWorkers = $desiredWorkers - $currentWorkers;
+                        
+                        Utils::logMessage('INFO', "Restoring job {$jobId}: spawning {$neededWorkers} workers to reach {$desiredWorkers} total");
                         
                         for ($i = 0; $i < $neededWorkers; $i++) {
                             $workerId = Utils::generateId('worker_');
