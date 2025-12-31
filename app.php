@@ -79,8 +79,8 @@ set_exception_handler(function($exception) {
 $configFile = __DIR__ . '/config.php';
 $configExists = file_exists($configFile);
 
-// If config doesn't exist and not installing, show installation wizard
-if (!$configExists && (!isset($_GET['action']) || $_GET['action'] !== 'install')) {
+// If config doesn't exist and not installing or testing connection, show installation wizard
+if (!$configExists && (!isset($_GET['action']) || ($_GET['action'] !== 'install' && $_GET['action'] !== 'test_connection'))) {
     // Show installation wizard
     include_once 'install_wizard.php';
     exit;
@@ -255,6 +255,120 @@ if (PHP_SAPI === 'cli' && isset($argv) && count($argv) > 1) {
     }
 }
 
+///////////////////////
+//  EARLY API HANDLERS (before session)
+///////////////////////
+// Handle test_connection API endpoint early to avoid session/auth overhead
+// This must run before session_start() to prevent any output buffering issues
+if (isset($_GET['action']) && $_GET['action'] === 'test_connection') {
+    // Suppress display of errors but keep logging enabled
+    @ini_set('display_errors', 0);
+    @ini_set('log_errors', 1);  // Keep logging enabled for debugging
+    // Don't suppress error_reporting completely - still log errors
+    
+    // Clear ALL output buffers that might exist
+    while (ob_get_level()) @ob_end_clean();
+    @ob_start();
+    
+    header('Content-Type: application/json; charset=utf-8');
+    
+    try {
+        // Accept parameters from both POST (direct API calls) and GET (profile list)
+        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : (isset($_GET['profile_id']) ? (int)$_GET['profile_id'] : 0);
+        $api_key = trim($_POST['api_key'] ?? $_GET['api_key'] ?? '');
+        $search_query = trim($_POST['search_query'] ?? $_GET['search_query'] ?? '');
+        
+        // If profile_id provided, fetch from database
+        if ($profile_id > 0 && $pdo !== null) {
+            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
+            $stmt->execute([$profile_id]);
+            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($profile) {
+                $api_key = $profile['api_key'];
+                $search_query = $profile['search_query'];
+            }
+        }
+        
+        if (empty($api_key)) {
+            @ob_end_clean();
+            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        if (empty($search_query)) {
+            @ob_end_clean();
+            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // Test API call
+        $start_time = microtime(true);
+        $ch = curl_init('https://google.serper.dev/search');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'X-API-KEY: ' . $api_key,
+            'Content-Type: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+            'q' => $search_query,
+            'num' => 10
+        ]));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+        
+        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
+        
+        if ($curl_error) {
+            @ob_end_clean();
+            echo json_encode([
+                'success' => false,
+                'error' => 'Connection error: ' . $curl_error,
+                'http_code' => 0,
+                'elapsed_ms' => $elapsed_time
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $response_preview = substr($response, 0, 500);
+        
+        if ($http_code === 200) {
+            $data = json_decode($response, true);
+            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
+            
+            @ob_end_clean();
+            echo json_encode([
+                'success' => true,
+                'message' => '✓ Connection successful!',
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'result_count' => $result_count,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        } else {
+            @ob_end_clean();
+            echo json_encode([
+                'success' => false,
+                'error' => 'API returned HTTP ' . $http_code,
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    } catch (Exception $e) {
+        @ob_end_clean();
+        echo json_encode([
+            'success' => false,
+            'error' => 'Internal error: ' . $e->getMessage()
+        ], JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
 session_start();
 
 ///////////////////////
@@ -391,6 +505,8 @@ if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_lo
             $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_extracted INT NOT NULL DEFAULT 0");
             $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_total INT NOT NULL DEFAULT 0");
             $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_status VARCHAR(50) DEFAULT 'draft'");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS active_workers INT NOT NULL DEFAULT 0");
+            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT NULL");
         } catch (Exception $e) {}
 
         // Update rotation settings for extraction
@@ -827,113 +943,309 @@ function spawn_extraction_worker(PDO $pdo, int $jobId): bool {
 }
 
 /**
- * Perform email extraction for a job (called from fastcgi_finish_request or background worker)
- * This is the core extraction logic, similar to send_campaign_real in the old system
+ * Perform parallel email extraction using multiple workers
+ * Each worker makes independent API calls to maximize speed
  */
-function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
-    error_log("PERFORM_EXTRACTION: ========== STARTING for job_id={$jobId} ==========");
-    error_log("PERFORM_EXTRACTION: Job data: " . json_encode($job));
-    error_log("PERFORM_EXTRACTION: Profile data: " . json_encode($profile));
+function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
+    error_log("PARALLEL_EXTRACTION: ========== STARTING for job_id={$jobId} ==========");
+    error_log("PARALLEL_EXTRACTION: Job data: " . json_encode($job));
+    error_log("PARALLEL_EXTRACTION: Profile data: " . json_encode($profile));
     
     try {
         // Update status to extracting
-        error_log("PERFORM_EXTRACTION: Updating job status to 'extracting'");
         $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
         $stmt->execute([$jobId]);
-        error_log("PERFORM_EXTRACTION: Job status updated successfully");
         
         // Get extraction parameters
         $apiKey = $profile['api_key'] ?? '';
         $searchQuery = $profile['search_query'] ?? '';
         $country = $profile['country'] ?? '';
-        $businessOnly = !empty($profile['business_only']);
-        $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)($profile['target_count'] ?? 100);
+        $businessOnly = !empty($profile['filter_business_only']);
+        $targetCount = (int)($profile['target_count'] ?? 100);  // Always use profile's target
+        $workers = max(1, (int)($profile['workers'] ?? 4));
         
-        error_log("PERFORM_EXTRACTION: Parameters - apiKey=" . (empty($apiKey) ? 'EMPTY' : 'SET') . ", searchQuery='{$searchQuery}', country='{$country}', businessOnly=" . ($businessOnly ? 'YES' : 'NO') . ", targetCount={$targetCount}");
+        error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}'");
+        
+        // Set active_workers count EARLY so UI shows workers are starting
+        $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, active_workers = ? WHERE id = ?");
+        $stmt->execute([$targetCount, $workers, $jobId]);
+        error_log("PARALLEL_EXTRACTION: Set active_workers={$workers} for job {$jobId}");
         
         if (empty($apiKey) || empty($searchQuery)) {
-            error_log("PERFORM_EXTRACTION: ERROR - API key or search query is missing");
             throw new Exception("API key or search query is missing");
         }
         
-        // Call serper.dev API to extract emails
-        error_log("PERFORM_EXTRACTION: Calling extract_emails_serper()...");
-        $result = extract_emails_serper($apiKey, $searchQuery, $country, $businessOnly, $targetCount);
-        error_log("PERFORM_EXTRACTION: extract_emails_serper() returned: success=" . ($result['success'] ? 'YES' : 'NO'));
+        // Each worker requests a fixed optimal number of results per API call
+        // This ensures we get enough results to find emails regardless of target count
+        // serper.dev returns max 100 results per call, so we use 50-100 for efficiency
+        $resultsPerWorkerCall = 100; // Fixed optimal value for best results
         
-        if (isset($result['log']) && is_array($result['log'])) {
-            foreach ($result['log'] as $logEntry) {
-                error_log("PERFORM_EXTRACTION: API LOG: " . $logEntry);
-            }
-        }
+        error_log("PARALLEL_EXTRACTION: Each worker will request {$resultsPerWorkerCall} results per call");
         
-        if (!$result['success']) {
-            // Mark job as failed and store error message
-            $errorMsg = $result['error'] ?? 'Unknown error';
-            error_log("PERFORM_EXTRACTION: Extraction failed: {$errorMsg}");
-            error_log("PERFORM_EXTRACTION: Full error details: " . json_encode($result));
-            // Store complete error message + full API log for UI display
-            $apiLog = isset($result['log']) ? implode("\n", $result['log']) : '';
-            $fullError = $errorMsg . "\n\n--- API Log ---\n" . $apiLog;
-            
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
-            $stmt->execute([$fullError, $jobId]);
-            error_log("PERFORM_EXTRACTION: Job {$jobId} extraction failed: " . implode('; ', $result['log'] ?? []));
-            throw new Exception("API extraction failed: {$errorMsg}");
-        }
-        
-        $extractedEmails = $result['emails'] ?? [];
         $extractedCount = 0;
-        error_log("PERFORM_EXTRACTION: Got " . count($extractedEmails) . " emails from serper.dev");
+        $attempts = 0;
+        $maxAttempts = $workers * 5; // Allow multiple rounds per worker
+        $pageOffset = 0;
         
-        // Store extracted emails in database
-        foreach ($extractedEmails as $emailData) {
-            try {
-                $stmt = $pdo->prepare("INSERT INTO extracted_emails (job_id, email, source, extracted_at) VALUES (?, ?, ?, NOW())");
-                $stmt->execute([
-                    $jobId,
-                    $emailData['email'],
-                    $emailData['source'] ?? ''
-                ]);
-                $extractedCount++;
-                
-                // Update progress every 10 emails
-                if ($extractedCount % 10 === 0) {
-                    $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
-                    $stmt->execute([$extractedCount, $jobId]);
-                    error_log("PERFORM_EXTRACTION: Progress update - {$extractedCount} emails extracted so far");
-                }
-            } catch (Exception $e) {
-                // Skip duplicate emails (unique constraint violation)
-                error_log("PERFORM_EXTRACTION: Skipping duplicate email: " . ($emailData['email'] ?? 'unknown'));
-                continue;
+        // Store diagnostic info in database (fallback when error_log not available)
+        $diagMsg = "DIAGNOSTIC: Loop vars: extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}\n";
+        $diagMsg .= "DIAGNOSTIC: Condition: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")";
+        $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+        $stmt->execute([$diagMsg, $jobId]);
+        
+        error_log("PARALLEL_EXTRACTION: Loop variables - extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}");
+        error_log("PARALLEL_EXTRACTION: While condition check: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")");
+        
+        // Parallel extraction loop - all workers work simultaneously
+        while ($extractedCount < $targetCount && $attempts < $maxAttempts) {
+            // Update diagnostic in database
+            $diagMsg .= "\nDIAGNOSTIC: Round {$attempts} started";
+            $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+            $stmt->execute([$diagMsg, $jobId]);
+            
+            error_log("PARALLEL_EXTRACTION: ===== ROUND {$attempts} START =====");
+            $workerResults = [];
+            
+            // Spawn all workers in parallel using curl_multi
+            for ($workerNum = 0; $workerNum < $workers && $extractedCount < $targetCount; $workerNum++) {
+                $workerResults[] = [
+                    'worker_id' => $workerNum,
+                    'page' => $pageOffset + $workerNum
+                ];
             }
+            
+            // Execute all API calls in parallel
+            $multiHandle = curl_multi_init();
+            $curlHandles = [];
+            
+            foreach ($workerResults as $idx => $workerInfo) {
+                $ch = curl_init();
+                $payload = [
+                    'q' => $searchQuery,
+                    'num' => $resultsPerWorkerCall,
+                    'page' => $workerInfo['page']
+                ];
+                
+                if ($country !== '') {
+                    $payload['gl'] = $country;
+                }
+                
+                curl_setopt($ch, CURLOPT_URL, 'https://google.serper.dev/search');
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                    'X-API-KEY: ' . $apiKey,
+                    'Content-Type: application/json'
+                ]);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+                
+                curl_multi_add_handle($multiHandle, $ch);
+                $curlHandles[$idx] = $ch;
+            }
+            
+            // Execute all requests in parallel
+            $running = null;
+            do {
+                curl_multi_exec($multiHandle, $running);
+                curl_multi_select($multiHandle);
+            } while ($running > 0);
+            
+            // Process results from all workers
+            $roundEmails = 0;
+            foreach ($curlHandles as $idx => $ch) {
+                $response = curl_multi_getcontent($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError = curl_error($ch);
+                
+                error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode}, Response length: " . strlen($response));
+                
+                if ($curlError) {
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - CURL ERROR: {$curlError}");
+                }
+                
+                if ($httpCode === 200 && $response) {
+                    $data = json_decode($response, true);
+                    if ($data === null) {
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - JSON decode failed! Response: " . substr($response, 0, 500));
+                    } elseif (!isset($data['organic'])) {
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - No 'organic' field in response. Keys: " . implode(', ', array_keys($data)));
+                        if (isset($data['error'])) {
+                            error_log("PARALLEL_EXTRACTION: Worker {$idx} - API ERROR: " . json_encode($data['error']));
+                        }
+                    } else {
+                        $organicCount = count($data['organic']);
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Found {$organicCount} organic results");
+                        
+                        $emails = extract_emails_from_results($data['organic'], $businessOnly);
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results");
+                        
+                        // Insert emails into database
+                        foreach ($emails as $emailData) {
+                            if ($extractedCount >= $targetCount) break;
+                            
+                            try {
+                                $stmt = $pdo->prepare("INSERT IGNORE INTO extracted_emails (job_id, email, source, extracted_at) VALUES (?, ?, ?, NOW())");
+                                $stmt->execute([
+                                    $jobId,
+                                    $emailData['email'],
+                                    $emailData['source'] ?? ''
+                                ]);
+                                
+                                if ($stmt->rowCount() > 0) {
+                                    $extractedCount++;
+                                    $roundEmails++;
+                                    
+                                    // Update progress every 5 emails for responsiveness
+                                    if ($extractedCount % 5 === 0) {
+                                        $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
+                                        $stmt->execute([$extractedCount, $jobId]);
+                                    }
+                                }
+                            } catch (Exception $e) {
+                                // Skip duplicates
+                                error_log("PARALLEL_EXTRACTION: Worker {$idx} - Duplicate email: " . $emailData['email']);
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode} or empty response");
+                }
+                
+                curl_multi_remove_handle($multiHandle, $ch);
+                curl_close($ch);
+            }
+            
+            curl_multi_close($multiHandle);
+            
+            error_log("PARALLEL_EXTRACTION: Round {$attempts} - extracted {$roundEmails} emails (total: {$extractedCount}/{$targetCount})");
+            
+            // If no emails extracted in this round, stop
+            if ($roundEmails === 0) {
+                error_log("PARALLEL_EXTRACTION: No new emails found, stopping");
+                break;
+            }
+            
+            $attempts++;
+            $pageOffset += $workers;
+        }
+        
+        // Update final worker count
+        $stmt = $pdo->prepare("UPDATE jobs SET active_workers = 0 WHERE id = ?");
+        $stmt->execute([$jobId]);
+        
+        // Check if we extracted any emails
+        if ($extractedCount === 0) {
+            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$attempts} attempts with {$workers} workers");
+            
+            $errorMsg = "No emails found in search results after {$attempts} API calls.\n\n";
+            $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
+            $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
+            $errorMsg .= "Business Only Filter: " . ($businessOnly ? "Enabled" : "Disabled") . "\n";
+            $errorMsg .= "Workers Used: {$workers}\n";
+            $errorMsg .= "API Calls Made: {$attempts}\n\n";
+            $errorMsg .= "Possible reasons:\n";
+            $errorMsg .= "1. The search query returns no results with email addresses\n";
+            $errorMsg .= "2. All emails filtered out (Business Only excludes gmail.com, yahoo.com, etc.)\n";
+            $errorMsg .= "3. API key may be invalid or rate limited\n";
+            $errorMsg .= "4. Network connectivity issues\n\n";
+            $errorMsg .= "Suggestions:\n";
+            $errorMsg .= "- Try a more specific search query (e.g., 'company contact email')\n";
+            $errorMsg .= "- Try a different location or industry\n";
+            $errorMsg .= "- Disable 'Business Only' filter to include all emails\n";
+            $errorMsg .= "- Check server error.log for API response details\n";
+            $errorMsg .= "- Verify API key at serper.dev/dashboard\n";
+            
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
+            $stmt->execute([$errorMsg, $jobId]);
+            error_log("PARALLEL_EXTRACTION: Job {$jobId} failed with 0 emails - detailed error message stored in database");
+            return; // Exit gracefully without throwing exception (detailed error already stored in DB)
         }
         
         // Mark job as completed
-        error_log("PERFORM_EXTRACTION: Marking job as completed");
-        $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW() WHERE id = ?");
+        $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW(), active_workers = 0 WHERE id = ?");
         $stmt->execute([$extractedCount, $jobId]);
         
-        error_log("PERFORM_EXTRACTION: Job {$jobId} completed successfully. Extracted {$extractedCount} emails.");
-        error_log("PERFORM_EXTRACTION: ========== FINISHED ==========");
+        error_log("PARALLEL_EXTRACTION: Job {$jobId} completed. Extracted {$extractedCount} emails using {$workers} parallel workers.");
         
     } catch (Throwable $e) {
-        // Mark job as failed
-        error_log("PERFORM_EXTRACTION: EXCEPTION CAUGHT - " . $e->getMessage());
-        error_log("PERFORM_EXTRACTION: Exception file: " . $e->getFile() . " line: " . $e->getLine());
-        error_log("PERFORM_EXTRACTION: Stack trace: " . $e->getTraceAsString());
-        
+        error_log("PARALLEL_EXTRACTION: EXCEPTION - " . $e->getMessage());
+        error_log("PARALLEL_EXTRACTION: Stack trace - " . $e->getTraceAsString());
         try {
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', error_message = ? WHERE id = ?");
-            $stmt->execute([$e->getMessage(), $jobId]);
-            error_log("PERFORM_EXTRACTION: Job marked as draft due to error");
+            // Store the detailed exception message with context
+            $errorDetails = "System Exception: " . $e->getMessage() . "\n\n";
+            $errorDetails .= "Location: " . $e->getFile() . " (Line " . $e->getLine() . ")\n\n";
+            $errorDetails .= "This is a system-level error. Common causes:\n";
+            $errorDetails .= "1. Invalid or expired API key\n";
+            $errorDetails .= "2. No internet connectivity from server\n";
+            $errorDetails .= "3. Database connection issue\n";
+            $errorDetails .= "4. Missing required profile fields\n\n";
+            $errorDetails .= "Check server error.log for full stack trace and details.\n";
+            
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
+            $stmt->execute([$errorDetails, $jobId]);
         } catch (Exception $e2) {
-            error_log("PERFORM_EXTRACTION: Failed to mark job as draft: " . $e2->getMessage());
+            error_log("PARALLEL_EXTRACTION: Failed to save error message - " . $e2->getMessage());
         }
-        error_log("PERFORM_EXTRACTION: Job {$jobId} extraction error: " . $e->getMessage());
-        throw $e;
+        // Don't re-throw - allow graceful exit so error message stays in DB
     }
+}
+
+/**
+ * Extract emails from search result array
+ */
+function extract_emails_from_results(array $results, bool $businessOnly = true): array {
+    $emails = [];
+    $emailSet = []; // Use associative array for O(1) duplicate checking
+    $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
+    
+    foreach ($results as $result) {
+        $text = '';
+        if (isset($result['snippet'])) $text .= ' ' . $result['snippet'];
+        if (isset($result['title'])) $text .= ' ' . $result['title'];
+        if (isset($result['link'])) $text .= ' ' . $result['link'];
+        
+        if (preg_match_all($emailPattern, $text, $matches)) {
+            foreach ($matches[0] as $email) {
+                $email = strtolower($email);
+                
+                $atPos = strpos($email, '@');
+                if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
+                    continue;
+                }
+                
+                if ($businessOnly) {
+                    $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
+                    $domain = substr($email, $atPos + 1);
+                    if (in_array($domain, $freeProviders)) {
+                        continue;
+                    }
+                }
+                
+                // Check if email already in set (O(1) lookup)
+                if (!isset($emailSet[$email])) {
+                    $emailSet[$email] = true;
+                    $emails[] = [
+                        'email' => $email,
+                        'source' => $result['link'] ?? ''
+                    ];
+                }
+            }
+        }
+    }
+    
+    return $emails;
+}
+
+/**
+ * Perform email extraction for a job (called from fastcgi_finish_request or background worker)
+ * This is the core extraction logic, similar to send_campaign_real in the old system
+ */
+function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
+    // Use new parallel extraction system
+    perform_parallel_extraction($pdo, $jobId, $job, $profile);
 }
 
 /**
@@ -2394,12 +2706,19 @@ function get_job_stats(PDO $pdo, int $id) {
 
     try {
         // Get job details from jobs table
-        $stmt = $pdo->prepare("SELECT target_count, progress_extracted, progress_total FROM jobs WHERE id = ? LIMIT 1");
+        // Get job and profile info to get target from profile
+        $stmt = $pdo->prepare("
+            SELECT j.progress_extracted, j.progress_total, j.profile_id, p.target_count
+            FROM jobs j
+            LEFT JOIN job_profiles p ON j.profile_id = p.id
+            WHERE j.id = ? 
+            LIMIT 1
+        ");
         $stmt->execute([$id]);
         $job = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if ($job) {
-            $stats['target'] = (int)($job['target_count'] ?? 0);
+            $stats['target'] = (int)($job['target_count'] ?? 0);  // From profile
             $stats['progress_extracted'] = (int)($job['progress_extracted'] ?? 0);
             $stats['progress_total'] = (int)($job['progress_total'] ?? 0);
         }
@@ -4311,21 +4630,58 @@ function process_imap_bounces(PDO $pdo) {
 ///////////////////////
 if (isset($_GET['api']) && $_GET['api'] === 'progress' && isset($_GET['campaign_id'])) {
     header('Content-Type: application/json');
-    $campaignId = (int)$_GET['campaign_id'];
-    $progress = get_campaign_progress($pdo, $campaignId);
-    $stats = get_campaign_stats($pdo, $campaignId);
+    $jobId = (int)$_GET['campaign_id']; // Using campaign_id for backwards compatibility
     
-    echo json_encode([
-        'success' => true,
-        'progress' => $progress,
-        'stats' => [
-            'delivered' => $stats['delivered'],
-            'bounce' => $stats['bounce'],
-            'open' => $stats['open'],
-            'click' => $stats['click'],
-            'unsubscribe' => $stats['unsubscribe']
-        ]
-    ]);
+    try {
+        // Try to get job progress first (for extraction jobs)
+        $stmt = $pdo->prepare("SELECT progress_extracted, progress_total, progress_status, status, active_workers FROM jobs WHERE id = ?");
+        $stmt->execute([$jobId]);
+        $job = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($job) {
+            // This is an extraction job
+            $extracted = (int)($job['progress_extracted'] ?? 0);
+            $total = (int)($job['progress_total'] ?? 0);
+            $activeWorkers = (int)($job['active_workers'] ?? 0);
+            
+            echo json_encode([
+                'success' => true,
+                'progress' => [
+                    'sent' => $extracted,
+                    'extracted' => $extracted,
+                    'total' => $total,
+                    'status' => $job['progress_status'] ?? 'draft',
+                    'campaign_status' => $job['status'] ?? 'draft',
+                    'job_status' => $job['status'] ?? 'draft',
+                    'percentage' => $total > 0 ? round(($extracted / $total) * 100, 1) : 0,
+                    'active_workers' => $activeWorkers
+                ],
+                'stats' => [
+                    'extracted' => $extracted,
+                    'active_workers' => $activeWorkers
+                ]
+            ]);
+            exit;
+        }
+        
+        // Fallback to campaign progress (for email campaigns)
+        $progress = get_campaign_progress($pdo, $jobId);
+        $stats = get_campaign_stats($pdo, $jobId);
+        
+        echo json_encode([
+            'success' => true,
+            'progress' => $progress,
+            'stats' => [
+                'delivered' => $stats['delivered'],
+                'bounce' => $stats['bounce'],
+                'open' => $stats['open'],
+                'click' => $stats['click'],
+                'unsubscribe' => $stats['unsubscribe']
+            ]
+        ]);
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+    }
     exit;
 }
 
@@ -4443,7 +4799,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'campaign_stats' && isset($_GET['i
 ///////////////////////
 //  ACTIONS
 ///////////////////////
-$action = $_POST['action'] ?? null;
+// Check both POST and GET for action parameter (API endpoints use GET, forms use POST)
+$action = $_POST['action'] ?? $_GET['action'] ?? null;
 $page   = $_GET['page'] ?? 'list';
 
 if ($action === 'check_connection_profile') {
@@ -4678,50 +5035,30 @@ if ($action === 'save_job' || $action === 'save_campaign') {
     $id        = (int)($_POST['id'] ?? 0);
     $name      = trim($_POST['name'] ?? '');
     $profile_id = (int)($_POST['profile_id'] ?? 0);
-    $target_count = (int)($_POST['target_count'] ?? 0);
     $start_immediately = isset($_POST['start_immediately']) && $_POST['start_immediately'];
     
-    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, target_count={$target_count}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
+    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
 
     try {
-        if ($target_count > 0) {
-            $stmt = $pdo->prepare("
-                UPDATE jobs
-                SET name = ?, profile_id = ?, target_count = ?
-                WHERE id = ?
-            ");
-            $stmt->execute([$name, $profile_id, $target_count, $id]);
-            error_log("SAVE_JOB ACTION: Job {$id} updated with target_count");
-        } else {
-            $stmt = $pdo->prepare("
-                UPDATE jobs
-                SET name = ?, profile_id = ?
-                WHERE id = ?
-            ");
-            $stmt->execute([$name, $profile_id, $id]);
-            error_log("SAVE_JOB ACTION: Job {$id} updated without target_count");
-        }
+        $stmt = $pdo->prepare("
+            UPDATE jobs
+            SET name = ?, profile_id = ?
+            WHERE id = ?
+        ");
+        $stmt->execute([$name, $profile_id, $id]);
+        error_log("SAVE_JOB ACTION: Job {$id} updated");
         
         // Verify save was successful
-        $verify = $pdo->prepare("SELECT id, name, profile_id, target_count, status FROM jobs WHERE id = ?");
+        $verify = $pdo->prepare("SELECT id, name, profile_id, status FROM jobs WHERE id = ?");
         $verify->execute([$id]);
         $saved_job = $verify->fetch(PDO::FETCH_ASSOC);
         error_log("SAVE_JOB ACTION: Verified job after save: " . json_encode($saved_job));
         
         // Check if should start immediately
         if ($start_immediately) {
-            error_log("SAVE_JOB ACTION: start_immediately flag detected, auto-submitting to start_job action");
-            // Auto-submit form to start_job action in hidden iframe (no visible intermediate page)
-            echo '<iframe name="hiddenFrame" style="display:none;"></iframe>';
-            echo '<form id="startForm" method="POST" action="?page=list" target="hiddenFrame">';
-            echo '<input type="hidden" name="action" value="start_job">';
-            echo '<input type="hidden" name="job_id" value="' . (int)$id . '">';
-            echo '</form>';
-            echo '<script>';
-            echo 'console.log("SAVE_JOB: Auto-submitting start_job form for job_id=' . (int)$id . '");';
-            echo 'document.getElementById("startForm").submit();';
-            echo 'setTimeout(function() { window.location.href = "?page=list"; }, 500);';
-            echo '</script>';
+            error_log("SAVE_JOB ACTION: start_immediately flag detected, redirecting to start_job");
+            // Redirect to start_job action directly (more reliable than iframe)
+            header("Location: ?action=start_job&job_id=" . (int)$id);
             exit;
         } else {
             error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
@@ -4797,8 +5134,8 @@ if ($action === 'start_job') {
                 error_log("START_JOB ACTION: Profile fetched: " . ($profile ? "YES (id=" . $profile['id'] . ")" : "NO"));
                 
                 if ($profile) {
-                    // Use target from job or profile
-                    $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)$profile['target_count'];
+                    // Use target from profile only
+                    $targetCount = (int)$profile['target_count'];
                     
                     // Update job status to extracting immediately (like old "sending" status)
                     $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting', progress_total = ?, started_at = NOW() WHERE id = ?");
@@ -5429,113 +5766,6 @@ if ($action === 'save_rotation') {
     exit;
 }
 
-// Test API Connection Action
-if ($action === 'test_connection') {
-    // Completely suppress all output/errors before JSON
-    @ini_set('display_errors', 0);
-    @error_reporting(0);
-    
-    // Clear ALL output buffers
-    while (ob_get_level()) @ob_end_clean();
-    @ob_start();
-    
-    header('Content-Type: application/json; charset=utf-8');
-    
-    try {
-        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : 0;
-        $api_key = trim($_POST['api_key'] ?? '');
-        $search_query = trim($_POST['search_query'] ?? '');
-        
-        // If profile_id provided, fetch from database
-        if ($profile_id > 0) {
-            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
-            $stmt->execute([$profile_id]);
-            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($profile) {
-                $api_key = $profile['api_key'];
-                $search_query = $profile['search_query'];
-            }
-        }
-        
-        if (empty($api_key)) {
-            @ob_end_clean();
-            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        if (empty($search_query)) {
-            @ob_end_clean();
-            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        // Test API call
-        $start_time = microtime(true);
-        $ch = curl_init('https://google.serper.dev/search');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'X-API-KEY: ' . $api_key,
-            'Content-Type: application/json'
-        ]);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
-            'q' => $search_query,
-            'num' => 10
-        ]));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        
-        $response = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curl_error = curl_error($ch);
-        curl_close($ch);
-        
-        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
-        
-        if ($curl_error) {
-            @ob_end_clean();
-            echo json_encode([
-                'success' => false,
-                'error' => 'Connection error: ' . $curl_error,
-                'http_code' => 0,
-                'elapsed_ms' => $elapsed_time
-            ], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        $response_preview = substr($response, 0, 500);
-        
-        if ($http_code === 200) {
-            $data = json_decode($response, true);
-            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
-            
-            @ob_end_clean();
-            echo json_encode([
-                'success' => true,
-                'message' => '✓ Connection successful!',
-                'http_code' => $http_code,
-                'elapsed_ms' => $elapsed_time,
-                'result_count' => $result_count,
-                'response_preview' => $response_preview
-            ], JSON_UNESCAPED_UNICODE);
-        } else {
-            @ob_end_clean();
-            echo json_encode([
-                'success' => false,
-                'error' => 'API returned HTTP ' . $http_code,
-                'http_code' => $http_code,
-                'elapsed_ms' => $elapsed_time,
-                'response_preview' => $response_preview
-            ], JSON_UNESCAPED_UNICODE);
-        }
-    } catch (Exception $e) {
-        @ob_end_clean();
-        echo json_encode([
-            'success' => false,
-            'error' => 'Internal error: ' . $e->getMessage()
-        ], JSON_UNESCAPED_UNICODE);
-    }
-    exit;
-}
 
 if ($action === 'save_profile') {
     $profile_id   = (int)($_POST['profile_id'] ?? 0);
@@ -5548,18 +5778,13 @@ if ($action === 'save_profile') {
     $active       = isset($_POST['active']) ? 1 : 0;
     
     // Workers field - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
+    // This determines how many parallel API calls will be made simultaneously
     $profile_workers = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
     
     // OPTIONAL logging for monitoring (NOT a limit)
     if ($profile_workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Job profile saved with $profile_workers workers (NOT an error)");
+        error_log("Info: Job profile saved with $profile_workers parallel workers (NOT an error)");
     }
-    
-    // Emails per worker field - controls maximum number of emails each worker extracts
-    $profile_emails_per_worker = max(MIN_EMAILS_PER_WORKER, min(MAX_EMAILS_PER_WORKER, (int)($_POST['emails_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER)));
-    
-    // Cycle delay in milliseconds - delay between worker processing cycles
-    $profile_cycle_delay_ms = max(MIN_CYCLE_DELAY_MS, min(MAX_CYCLE_DELAY_MS, (int)($_POST['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS)));
 
     try {
         if ($profile_id > 0) {
@@ -5567,13 +5792,13 @@ if ($action === 'save_profile') {
                 UPDATE job_profiles SET
                   profile_name=?, api_key=?, search_query=?, target_count=?, 
                   filter_business_only=?, country=?, active=?,
-                  workers=?, emails_per_worker=?, cycle_delay_ms=?
+                  workers=?
                 WHERE id=?
             ");
             $stmt->execute([
                 $profile_name, $api_key, $search_query, $target_count,
                 $filter_business_only, $country, $active,
-                $profile_workers, $profile_emails_per_worker, $profile_cycle_delay_ms,
+                $profile_workers,
                 $profile_id
             ]);
         } else {
@@ -5581,13 +5806,13 @@ if ($action === 'save_profile') {
                 INSERT INTO job_profiles
                   (profile_name, api_key, search_query, target_count,
                    filter_business_only, country, active,
-                   workers, emails_per_worker, cycle_delay_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                   workers)
+                VALUES (?,?,?,?,?,?,?,?)
             ");
             $stmt->execute([
                 $profile_name, $api_key, $search_query, $target_count,
                 $filter_business_only, $country, $active,
-                $profile_workers, $profile_emails_per_worker, $profile_cycle_delay_ms
+                $profile_workers
             ]);
         }
     } catch (Exception $e) {
@@ -6855,24 +7080,14 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
             <label for="rot_enabled">Enable Profile Rotation</label>
           </div>
           <div class="form-group">
-            <label>Workers</label>
+            <label>Workers (Parallel API Calls)</label>
             <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo (int)($rotationSettings['workers'] ?? DEFAULT_WORKERS); ?>">
-            <small class="hint">⚠️ NO LIMIT - accepts ANY number (1, 100, 500, 1000+). Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical volume, 10-50 for high volume.</small>
-          </div>
-          <div class="form-group">
-            <label>Emails Per Worker</label>
-            <input type="number" name="emails_per_worker" min="<?php echo MIN_EMAILS_PER_WORKER; ?>" max="<?php echo MAX_EMAILS_PER_WORKER; ?>" value="<?php echo (int)($rotationSettings['emails_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER); ?>">
-            <small class="hint">Number of emails each worker extracts (<?php echo MIN_EMAILS_PER_WORKER; ?>-<?php echo MAX_EMAILS_PER_WORKER; ?>, default: <?php echo DEFAULT_EMAILS_PER_WORKER; ?>). Controls distribution granularity across workers.</small>
+            <small class="hint">⚠️ NO LIMIT - Higher = faster extraction. Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical, 10-50 for high volume.</small>
           </div>
           <div class="form-group">
             <small class="hint" style="display:block; margin-top:8px;">
               When enabled, jobs will rotate through all active extraction profiles. 
-              Configure individual profiles with Workers to control parallel extraction speed.
-              <?php if (function_exists('pcntl_fork')): ?>
-                <br><strong style="color:#4CAF50;">✓ Parallel Mode Available:</strong> Multiple workers will extract in parallel for maximum speed.
-              <?php else: ?>
-                <br><strong style="color:#ff9800;">⚠ Sequential Mode:</strong> PHP pcntl extension not available. Workers will process sequentially.
-              <?php endif; ?>
+              All workers make simultaneous API calls for maximum extraction speed.
             </small>
           </div>
           <button class="btn btn-primary" type="submit">Save Settings</button>
@@ -6957,14 +7172,9 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
             <label for="pf_business">Business Emails Only (filter out free providers)</label>
           </div>
           <div class="form-group">
-            <label>Workers</label>
+            <label>Workers (Parallel API Calls)</label>
             <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)$editProfile['workers'] : DEFAULT_WORKERS; ?>">
-            <small class="hint">Number of parallel extraction workers</small>
-          </div>
-          <div class="form-group">
-            <label>Emails Per Worker</label>
-            <input type="number" name="emails_per_worker" min="<?php echo MIN_EMAILS_PER_WORKER; ?>" max="<?php echo MAX_EMAILS_PER_WORKER; ?>" value="<?php echo $editProfile ? (int)$editProfile['emails_per_worker'] : DEFAULT_EMAILS_PER_WORKER; ?>">
-            <small class="hint">Emails per worker cycle</small>
+            <small class="hint">Number of parallel API calls. Higher = faster extraction. Recommended: 4-10</small>
           </div>
           <div class="checkbox-row">
             <input type="checkbox" name="active" id="pf_active" <?php if (!$editProfile || $editProfile['active']) echo 'checked'; ?>>
@@ -7374,14 +7584,6 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                 <div style="font-weight: 600; margin-bottom: 8px;">Profile Details:</div>
                 <div id="profileQuery" style="color: var(--sg-muted);"></div>
                 <div id="profileTarget" style="color: var(--sg-muted); margin-top: 4px;"></div>
-              </div>
-
-              <div class="form-group">
-                <label>Target Email Count (Optional Override)</label>
-                <input type="number" name="target_count" min="1" max="10000" 
-                  value="<?php echo (int)($job['target_count'] ?? 0); ?>" 
-                  placeholder="Leave empty to use profile default">
-                <small class="hint">Override the target count for this specific job</small>
               </div>
 
               <div class="checkbox-row">
@@ -7911,6 +8113,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               <!-- Real-time Job Progress -->
               <?php 
                 $jobStatus = $job['status'];
+                $activeWorkers = (int)($job['active_workers'] ?? 0);
                 if ($jobStatus === 'queued' || $jobStatus === 'extracting'):
               ?>
               <div class="card" style="margin-bottom:18px;" id="progressCard">
@@ -7927,7 +8130,12 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   <div style="background:#E4E7EB; border-radius:4px; height:24px; overflow:hidden; position:relative;">
                     <div id="progressBar" style="background:linear-gradient(90deg, #1A82E2, #3B9EF3); height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
                   </div>
-                  <div style="margin-top:8px; color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($jobStatus); ?></div>
+                  <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
+                    <div style="color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($jobStatus); ?></div>
+                    <div style="color:#1A82E2; font-size:13px; font-weight:600;" id="workerStatus">
+                      <span id="activeWorkerCount"><?php echo $activeWorkers; ?></span> worker<?php echo $activeWorkers !== 1 ? 's' : ''; ?> active
+                    </div>
+                  </div>
                 </div>
               </div>
               <?php endif; ?>
@@ -8010,6 +8218,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   var progressBar = document.getElementById('progressBar');
                   var progressText = document.getElementById('progressText');
                   var progressStatus = document.getElementById('progressStatus');
+                  var workerCount = document.getElementById('activeWorkerCount');
                   
                   if (progressCard) {
                     // Poll progress API every 2 seconds
@@ -8026,33 +8235,29 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                               progressBar.style.width = prog.percentage + '%';
                             }
                             
-                            // Update progress text
+                            // Update progress text (for extraction jobs)
                             if (progressText) {
-                              progressText.textContent = prog.sent + ' / ' + prog.total + ' sent (' + prog.percentage + '%)';
+                              var extractedCount = prog.extracted || prog.sent || 0;
+                              progressText.textContent = extractedCount + ' / ' + prog.total + ' extracted (' + prog.percentage + '%)';
                             }
                             
                             // Update status
                             if (progressStatus) {
-                              progressStatus.textContent = 'Status: ' + prog.status.charAt(0).toUpperCase() + prog.status.slice(1);
+                              progressStatus.textContent = 'Status: ' + (prog.job_status || prog.status || 'extracting').charAt(0).toUpperCase() + (prog.job_status || prog.status || 'extracting').slice(1);
                             }
                             
-                            // Update stats in header
-                            var statItems = document.querySelectorAll('.stat-item .stat-num');
-                            if (statItems.length >= 7) {
-                              // statItems[0] is Emails Triggered (don't update)
-                              if (statItems[1]) statItems[1].textContent = stats.delivered || 0;
-                              if (statItems[2]) statItems[2].textContent = stats.open || 0;
-                              if (statItems[3]) statItems[3].textContent = stats.click || 0;
-                              if (statItems[4]) statItems[4].textContent = stats.bounce || 0;
-                              if (statItems[5]) statItems[5].textContent = stats.unsubscribe || 0;
-                              // statItems[6] is Spam Reports (don't update from this API)
+                            // Update active worker count
+                            if (workerCount && typeof prog.active_workers !== 'undefined') {
+                              workerCount.textContent = prog.active_workers;
+                              var workerStatus = document.getElementById('workerStatus');
+                              if (workerStatus) {
+                                workerStatus.style.color = prog.active_workers > 0 ? '#1A82E2' : '#6B778C';
+                              }
                             }
                             
-                            // Stop polling and reload page if campaign is completed
-                            // Check both progress_status (completed) and campaign status (sent)
-                            if (prog.status === 'completed' || prog.campaign_status === 'sent') {
+                            // Stop polling and reload page if job is completed
+                            if (prog.job_status === 'completed' || prog.campaign_status === 'completed') {
                               clearInterval(pollInterval);
-                              // Reload page after 2 seconds to show final "sent" status
                               setTimeout(function(){
                                 window.location.reload();
                               }, 2000);
@@ -8256,7 +8461,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
               headers: {'Content-Type': 'application/x-www-form-urlencoded'},
               body: 'api_key=' + encodeURIComponent(apiKey) + '&search_query=' + encodeURIComponent(searchQuery)
             })
-            .then(r => r.json())
+            .then(r => {
+              // Check if response is OK and is JSON
+              if (!r.ok) {
+                throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+              }
+              const contentType = r.headers.get('content-type');
+              if (!contentType || !contentType.includes('application/json')) {
+                // Response is not JSON, likely an error page
+                return r.text().then(text => {
+                  throw new Error('Server returned non-JSON response. Check server logs for errors.');
+                });
+              }
+              return r.json();
+            })
             .then(data => {
               testBtn.disabled = false;
               testBtn.innerHTML = '🔌 Test Connection';
@@ -8312,7 +8530,20 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
           headers: {'Content-Type': 'application/x-www-form-urlencoded'},
           body: 'profile_id=' + profileId
         })
-        .then(r => r.json())
+        .then(r => {
+          // Check if response is OK and is JSON
+          if (!r.ok) {
+            throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+          }
+          const contentType = r.headers.get('content-type');
+          if (!contentType || !contentType.includes('application/json')) {
+            // Response is not JSON, likely an error page
+            return r.text().then(text => {
+              throw new Error('Server returned non-JSON response. Check server logs for errors.');
+            });
+          }
+          return r.json();
+        })
         .then(data => {
           if (data.success) {
             statusDiv.style.background = '#f0fdf4';
