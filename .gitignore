@@ -1,0 +1,18 @@
+# PHP error logs
+php_errors.log
+error_log
+
+# Test files
+test_*.log
+test_worker_script*.php
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
