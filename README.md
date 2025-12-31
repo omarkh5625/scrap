@@ -61,16 +61,36 @@ When encountering database connection issues:
 
 ### Email Volume vs Workers
 
+**IMPORTANT**: Default settings are conservative to work with standard MySQL configurations (max_connections ~151).
+
 The system automatically calculates optimal worker count:
 
-- 1,000 emails → 50 workers (20 emails/worker)
-- 10,000 emails → 500 workers (20 emails/worker)
-- 100,000 emails → 1,000 workers (100 emails/worker, capped)
+- 1,000 emails → 10 workers (100 emails/worker)
+- 10,000 emails → 100 workers (100 emails/worker, capped at AUTO_MAX_WORKERS)
+- 100,000 emails → 100 workers (1000 emails/worker, capped)
+
+**Note**: Fewer workers doesn't mean slower processing! Workers process multiple emails in batches and reuse connections efficiently. 100 workers can handle large-scale extractions without overwhelming the database.
+
+### Increasing Worker Count (Advanced)
+
+If you've increased MySQL `max_connections` (see MYSQL_TUNING.md), you can increase worker limits in `app.php`:
+
+```php
+// In Worker class
+private const AUTO_MAX_WORKERS = 100;        // Increase to 500-800 if max_connections = 1000
+private const WORKERS_PER_1000_EMAILS = 10;  // Increase to 20-30 if max_connections = 1000
+```
+
+**Warning**: Don't increase workers without first increasing MySQL max_connections!
 
 ### Performance Expectations
 
+With default settings (100 max workers):
 - **Single Worker**: ~2-5 emails/second
-- **50 Workers**: ~100-250 emails/second
+- **10 Workers**: ~20-50 emails/second
+- **100 Workers**: ~200-500 emails/second
+
+With increased settings (500 workers, requires MySQL tuning):
 - **500 Workers**: ~1000-2500 emails/second
 
 Actual performance depends on:
@@ -78,17 +98,56 @@ Actual performance depends on:
 - Network latency
 - API rate limits
 - Deep scraping settings
+- MySQL max_connections configuration
 
 ## Troubleshooting
 
 ### "Too many connections" Error
 
-If you see this error despite the retry logic:
+**This is the most common issue.** It means the number of workers exceeds MySQL's connection limit.
 
-1. **Increase MySQL max_connections**:
+**SOLUTION (Choose ONE)**:
+
+**Option 1: Use Default Settings (Recommended for most users)**
+- The system now defaults to 100 max workers, which works with standard MySQL configurations
+- No changes needed - this should work out of the box
+- For 10,000 emails: 100 workers will be spawned (safe for default MySQL)
+
+**Option 2: Increase MySQL max_connections (For advanced users)**
+
+If you need more workers for faster processing:
+
+1. **Check current limit**:
    ```sql
-   SET GLOBAL max_connections = 1000;
+   SHOW VARIABLES LIKE 'max_connections';
    ```
+
+2. **Increase temporarily**:
+   ```sql
+   SET GLOBAL max_connections = 500;
+   ```
+
+3. **Increase permanently** (edit MySQL config):
+   ```ini
+   [mysqld]
+   max_connections = 500
+   ```
+   Then restart MySQL.
+
+4. **Increase worker limits** in `app.php`:
+   ```php
+   // In Worker class (around line 1377)
+   private const AUTO_MAX_WORKERS = 300;        // Increase from 100 to 300
+   private const WORKERS_PER_1000_EMAILS = 20;  // Increase from 10 to 20
+   ```
+
+**Option 3: Reduce Workers Further**
+
+If still getting errors, reduce even more:
+```php
+private const AUTO_MAX_WORKERS = 50;         // Very conservative
+private const WORKERS_PER_1000_EMAILS = 5;   // Very conservative
+```
 
 2. **Check current connections**:
    ```sql
@@ -127,17 +186,27 @@ Check logs in `/php_errors.log` for:
 
 ### Connection Retry Strategy
 
-Exponential backoff with 30% random jitter:
+Exponential backoff with 30% random jitter (increased delays for "Too many connections" errors):
 
 ```
-Attempt 1: Wait 100ms + jitter (0-30ms)     = 100-130ms
-Attempt 2: Wait 200ms + jitter (0-60ms)     = 200-260ms
-Attempt 3: Wait 400ms + jitter (0-120ms)    = 400-520ms
-Attempt 4: Wait 800ms + jitter (0-240ms)    = 800-1040ms
-Attempt 5: Wait 1600ms + jitter (0-480ms)   = 1600-2080ms
+Normal connection errors:
+Attempt 1: Wait 500ms + jitter (0-150ms)     = 500-650ms
+Attempt 2: Wait 1000ms + jitter (0-300ms)    = 1000-1300ms
+Attempt 3: Wait 2000ms + jitter (0-600ms)    = 2000-2600ms
+Attempt 4: Wait 4000ms + jitter (0-1200ms)   = 4000-5200ms
+Attempt 5: Wait 8000ms + jitter (0-2400ms)   = 8000-10400ms (capped at 10s)
+
+"Too many connections" errors (doubled delays):
+Attempt 1: Wait 1000ms + jitter              = 1000-1300ms
+Attempt 2: Wait 2000ms + jitter              = 2000-2600ms
+Attempt 3: Wait 4000ms + jitter              = 4000-5200ms
+Attempt 4: Wait 8000ms + jitter              = 8000-10400ms (capped at 10s)
+Attempt 5: Wait 10000ms + jitter             = 10000-13000ms (capped at 10s)
 ```
 
-Maximum retry delay is capped at 5 seconds. The 30% jitter prevents thundering herd problem where all workers retry simultaneously.
+Maximum retry delay is capped at 10 seconds. The 30% jitter prevents thundering herd problem where all workers retry simultaneously.
+
+**Note**: Longer delays give other workers time to finish and release connections.
 
 ### Batch Processing
 

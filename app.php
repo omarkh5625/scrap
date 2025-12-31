@@ -89,8 +89,8 @@ class Database {
     
     // Connection pooling configuration
     private const MAX_RETRY_ATTEMPTS = 5;
-    private const INITIAL_RETRY_DELAY_MS = 100;
-    private const MAX_RETRY_DELAY_MS = 5000;
+    private const INITIAL_RETRY_DELAY_MS = 500; // Increased from 100ms to give more time for connections to free up
+    private const MAX_RETRY_DELAY_MS = 10000; // Increased from 5s to 10s for "Too many connections" scenarios
     private const JITTER_PERCENTAGE = 0.3; // 30% jitter to prevent thundering herd
     
     // MySQL error codes for connection issues
@@ -170,6 +170,11 @@ class Database {
                         self::MAX_RETRY_DELAY_MS
                     );
                     
+                    // For "Too many connections" errors, use longer delays
+                    if ($isTooManyConnections) {
+                        $delay = min($delay * 2, self::MAX_RETRY_DELAY_MS); // Double the delay for 1040 errors
+                    }
+                    
                     // Add jitter to prevent thundering herd (configurable percentage)
                     // Use random_int for better randomness distribution
                     try {
@@ -181,25 +186,45 @@ class Database {
                     $delay += $jitter;
                     
                     // Provide more specific error message for "Too many connections"
-                    $errorType = $isTooManyConnections ? "Too many connections (1040)" : "Connection error";
-                    error_log("⚠️ Database {$errorType} (attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}): " . 
-                             $e->getMessage() . " - Retrying in " . round($delay / 1000, 2) . "s");
+                    if ($isTooManyConnections) {
+                        error_log("🚨 CRITICAL: Too many database connections (1040) - attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}");
+                        error_log("   This usually means you need to:");
+                        error_log("   1. Increase MySQL max_connections (currently likely ~151)");
+                        error_log("   2. Reduce number of workers (see AUTO_MAX_WORKERS in Worker class)");
+                        error_log("   Retrying in " . round($delay / 1000, 2) . "s...");
+                    } else {
+                        error_log("⚠️ Database connection error (attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}): " . 
+                                 $e->getMessage() . " - Retrying in " . round($delay / 1000, 2) . "s");
+                    }
                     
                     // Wait before retry (convert ms to microseconds)
                     usleep($delay * 1000);
                 } else {
-                    error_log("✗ Database connection failed after " . self::MAX_RETRY_ATTEMPTS . " attempts");
+                    if ($isTooManyConnections) {
+                        error_log("✗✗✗ CRITICAL: Database connection exhausted after " . self::MAX_RETRY_ATTEMPTS . " attempts");
+                        error_log("    You MUST increase MySQL max_connections or reduce AUTO_MAX_WORKERS");
+                    } else {
+                        error_log("✗ Database connection failed after " . self::MAX_RETRY_ATTEMPTS . " attempts");
+                    }
                 }
             }
         }
         
-        // All retries exhausted - throw exception instead of die()
-        $errorMessage = 'Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts';
+        // All retries exhausted - throw exception with helpful message
         if ($lastError) {
-            $errorMessage .= ': ' . $lastError->getMessage();
-            throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+            $errorInfo = $lastError->errorInfo ?? [];
+            $errorCode = $errorInfo[1] ?? 0;
+            
+            if ($errorCode === self::ERROR_TOO_MANY_CONNECTIONS) {
+                $errorMessage = "Database connection failed after " . self::MAX_RETRY_ATTEMPTS . " attempts: Too many connections (1040). " .
+                               "SOLUTION: Increase MySQL max_connections (see MYSQL_TUNING.md) or reduce AUTO_MAX_WORKERS constant.";
+                throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+            } else {
+                $errorMessage = 'Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts: ' . $lastError->getMessage();
+                throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+            }
         } else {
-            throw new PDOException($errorMessage . ': Unknown error');
+            throw new PDOException('Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts: Unknown error');
         }
     }
     
@@ -1374,30 +1399,36 @@ class Job {
 class Worker {
     // Configuration constants
     private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
-    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
-    private const OPTIMAL_RESULTS_PER_WORKER = 20; // 50 workers per 1000 emails = 20 emails per worker
-    private const WORKERS_PER_1000_EMAILS = 50; // Required: 50 workers for every 1000 emails
+    
+    // Worker configuration - CRITICAL: Tuned to prevent database connection exhaustion
+    // Default MySQL max_connections is typically 151. With overhead, safe limit is ~100 concurrent workers.
+    private const AUTO_MAX_WORKERS = 100; // Maximum workers to spawn (reduced from 1000 to prevent connection exhaustion)
+    private const WORKERS_PER_1000_EMAILS = 10; // Conservative: 10 workers per 1000 emails (reduced from 50)
+    private const OPTIMAL_RESULTS_PER_WORKER = 100; // 10 workers per 1000 emails = 100 emails per worker
     
     /**
      * Calculate optimal worker count based on job size
-     * Formula: 50 workers per 1000 emails
-     * Target: Process 1,000,000 emails in ≤10 minutes
-     * Automatically determines the best number of workers for maximum performance
+     * Formula: 10 workers per 1000 emails (conservative to prevent DB connection exhaustion)
      * 
-     * Examples:
-     * - 1,000 emails = 50 workers
-     * - 10,000 emails = 500 workers
-     * - 100,000 emails = 1,000 workers (capped at AUTO_MAX_WORKERS)
-     * - 1,000,000 emails = 1,000 workers (calculated 50,000, but capped at AUTO_MAX_WORKERS)
+     * IMPORTANT: This is tuned for typical MySQL configurations (max_connections ~151)
+     * If you have increased MySQL max_connections (e.g., to 1000), you can increase:
+     * - AUTO_MAX_WORKERS (e.g., to 500-800)
+     * - WORKERS_PER_1000_EMAILS (e.g., to 20-30)
+     * 
+     * Examples with current settings:
+     * - 1,000 emails = 10 workers
+     * - 10,000 emails = 100 workers (capped at AUTO_MAX_WORKERS)
+     * - 100,000 emails = 100 workers (capped)
+     * 
+     * Each worker processes multiple emails, so fewer workers doesn't mean slower processing.
+     * Workers are more efficient with larger batches due to connection reuse.
      */
     public static function calculateOptimalWorkerCount(int $maxResults): int {
-        // Calculate based on the formula: 50 workers per 1000 emails
-        // Example: 1000 emails = 50 workers, 10,000 emails = 500 workers, 1,000,000 emails = 50,000 workers
+        // Calculate based on conservative formula to prevent connection exhaustion
         $calculatedWorkers = (int)ceil(($maxResults / 1000) * self::WORKERS_PER_1000_EMAILS);
         
-        // Cap at maximum workers to avoid resource exhaustion
-        // Note: For 1M emails, this would require 50,000 workers which exceeds AUTO_MAX_WORKERS
-        // In that case, workers will be capped and each will process more emails
+        // Cap at maximum workers to prevent exceeding MySQL max_connections
+        // This is critical - spawning 500+ workers will exhaust most MySQL configurations
         $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
         
         // Ensure at least 1 worker
