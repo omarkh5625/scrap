@@ -598,25 +598,53 @@ class WorkerGovernor {
 // Email storage file
 \$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
 
-// Helper function to save email
+// Helper function to save email with proper file locking
 function saveEmail(\$emailFile, \$emailData) {
     if (!file_exists(dirname(\$emailFile))) {
         @mkdir(dirname(\$emailFile), 0755, true);
     }
     
+    // Open file for reading and writing with exclusive lock
+    \$fp = fopen(\$emailFile, 'c+');
+    if (!\$fp) {
+        return false;
+    }
+    
+    // Get exclusive lock - wait if another worker is writing
+    if (!flock(\$fp, LOCK_EX)) {
+        fclose(\$fp);
+        return false;
+    }
+    
+    // Read existing data
+    \$fileSize = filesize(\$emailFile);
     \$data = ['emails' => [], 'total' => 0, 'last_updated' => time()];
-    if (file_exists(\$emailFile)) {
-        \$existing = json_decode(file_get_contents(\$emailFile), true);
-        if (\$existing) {
-            \$data = \$existing;
+    
+    if (\$fileSize > 0) {
+        \$content = fread(\$fp, \$fileSize);
+        if (\$content) {
+            \$existing = json_decode(\$content, true);
+            if (\$existing && isset(\$existing['emails'])) {
+                \$data = \$existing;
+            }
         }
     }
     
+    // Append new email
     \$data['emails'][] = \$emailData;
     \$data['total'] = count(\$data['emails']);
     \$data['last_updated'] = time();
     
-    file_put_contents(\$emailFile, json_encode(\$data), LOCK_EX);
+    // Write back to file (truncate and rewrite)
+    ftruncate(\$fp, 0);
+    rewind(\$fp);
+    fwrite(\$fp, json_encode(\$data, JSON_PRETTY_PRINT));
+    
+    // Release lock and close
+    flock(\$fp, LOCK_UN);
+    fclose(\$fp);
+    
+    return true;
 }
 
 // Serper API search function
