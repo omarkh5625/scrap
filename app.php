@@ -27,11 +27,11 @@ define('CONFIG_START', true);
 
 // Database configuration (filled by setup wizard)
 $DB_CONFIG = [
-    'host' => 'localhost',
-    'database' => 'send_serp',
-    'username' => 'send_serp',
-    'password' => '0165625092Oo@',
-    'installed' => true
+    'host' => '',
+    'database' => '',
+    'username' => '',
+    'password' => '',
+    'installed' => false
 ];
 
 define('CONFIG_END', true);
@@ -102,12 +102,6 @@ class Database {
             $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'email_filter'");
             if ($stmt->rowCount() === 0) {
                 self::$pdo->exec("ALTER TABLE jobs ADD COLUMN email_filter VARCHAR(50) AFTER country");
-            }
-            
-            // Migration: Add error_message column to jobs table if it doesn't exist
-            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'error_message'");
-            if ($stmt->rowCount() === 0) {
-                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN error_message TEXT DEFAULT NULL AFTER progress");
             }
             
             // Migration: Create emails table if it doesn't exist (rename from results)
@@ -263,7 +257,6 @@ class Database {
                     email_filter VARCHAR(50),
                     status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
                     progress INT DEFAULT 0,
-                    error_message TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -429,13 +422,13 @@ class Database {
         $filePath = __FILE__;
         $content = file_get_contents($filePath);
         
-        $newConfig = "\$DB_CONFIG = [
-    'host' => 'localhost',
-    'database' => 'send_serp',
-    'username' => 'send_serp',
-    'password' => '0165625092Oo@',
-    'installed' => true
-];";
+        $newConfig = "\$DB_CONFIG = [\n";
+        $newConfig .= "    'host' => '" . addslashes($host) . "',\n";
+        $newConfig .= "    'database' => '" . addslashes($db) . "',\n";
+        $newConfig .= "    'username' => '" . addslashes($user) . "',\n";
+        $newConfig .= "    'password' => '" . addslashes($pass) . "',\n";
+        $newConfig .= "    'installed' => true\n";
+        $newConfig .= "];";
         
         $pattern = '/\$DB_CONFIG\s*=\s*\[.*?\];/s';
         $content = preg_replace($pattern, $newConfig, $content);
@@ -1055,12 +1048,6 @@ class Job {
         $db = Database::connect();
         $stmt = $db->prepare("UPDATE jobs SET status = ?, progress = ? WHERE id = ?");
         $stmt->execute([$status, $progress, $jobId]);
-    }
-    
-    public static function setError(int $jobId, string $errorMessage): void {
-        $db = Database::connect();
-        $stmt = $db->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
-        $stmt->execute([$errorMessage, $jobId]);
     }
     
     public static function getResults(int $jobId): array {
@@ -2470,24 +2457,11 @@ class Router {
                             break;
                         }
                         
-                        // CHECK: Verify proc_open is available BEFORE creating job
-                        if (!function_exists('proc_open') || in_array('proc_open', explode(',', ini_get('disable_functions')))) {
-                            $errorMsg = 'proc_open is not available on this server. Parallel worker processing requires proc_open to be enabled in PHP configuration. Please contact your hosting provider to enable proc_open function.';
-                            error_log("Job creation failed: {$errorMsg}");
-                            header('Content-Type: application/json');
-                            echo json_encode([
-                                'success' => false, 
-                                'error' => $errorMsg
-                            ]);
-                            break;
-                        }
-                        
                         // Create job - this should be fast (< 100ms)
                         $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
                         
                         // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
                         // This divides the work among workers so they search in parallel without duplication
-                        // NOTE: This will mark job as "running" - we'll update to "failed" if workers don't spawn
                         self::createQueueItems($jobId, $workerCount);
                         
                         // Return success IMMEDIATELY to prevent UI hanging
@@ -3977,39 +3951,15 @@ class Router {
     }
     */
     
-    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): int {
-        error_log("autoSpawnWorkers: Spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
+    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): void {
+        error_log("autoSpawnWorkers: Force-spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
         
-        // Use proc_open for parallel processing (compatible with cPanel)
-        if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
-            error_log("autoSpawnWorkers: Using proc_open for PARALLEL processing");
-            $spawnedCount = self::spawnWorkersViaProcOpen($workerCount, $jobId);
-            
-            if ($spawnedCount === 0 && $jobId) {
-                // No workers spawned - mark job as failed
-                $errorMsg = "Failed to spawn any workers using proc_open. Check server logs for details.";
-                error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
-                Job::updateStatus($jobId, 'failed', 0);
-                Job::setError($jobId, $errorMsg);
-            } elseif ($spawnedCount < $workerCount && $jobId) {
-                // Some workers failed to spawn - log warning but continue
-                error_log("autoSpawnWorkers: WARNING - Only {$spawnedCount}/{$workerCount} workers spawned successfully");
-            }
-            
-            error_log("autoSpawnWorkers: Completed - {$spawnedCount}/{$workerCount} workers spawned");
-            return $spawnedCount;
-        } else {
-            $errorMsg = "proc_open is not available. Please enable proc_open in PHP configuration for parallel worker processing.";
-            error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
-            
-            // Mark job as failed with clear error message
-            if ($jobId) {
-                Job::updateStatus($jobId, 'failed', 0);
-                Job::setError($jobId, $errorMsg);
-            }
-            
-            throw new Exception($errorMsg);
-        }
+        // FORCE direct background processing - most reliable method
+        // This always works regardless of hosting environment
+        error_log("autoSpawnWorkers: Using FORCED direct background processing (most reliable)");
+        self::processWorkersInBackground($workerCount, $jobId);
+        
+        error_log("autoSpawnWorkers: Completed - workers are now processing in background");
     }
     
     private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
@@ -4045,7 +3995,7 @@ class Router {
         }
     }
     
-    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): int {
+    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): void {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
@@ -4103,7 +4053,6 @@ class Router {
         }
         
         error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
-        return $spawnedCount;
     }
     
     private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
@@ -4331,8 +4280,21 @@ class Router {
                 $workerName = $worker['name'];
                 $job = $worker['queue_item'];
                 
-                // NOTE: Don't check target here - let all workers process their assigned queue items
-                // Target check happens after all workers complete their initial assignments
+                // Check if job has reached target email count before processing
+                if ($jobId) {
+                    $jobDetails = Job::getById($jobId);
+                    if ($jobDetails) {
+                        $emailsCollected = Job::getEmailCount($jobId);
+                        $maxResults = (int)$jobDetails['max_results'];
+                        
+                        if ($emailsCollected >= $maxResults) {
+                            error_log("processWorkersInBackground: Worker {$workerName} - Job {$jobId} reached target ({$emailsCollected}/{$maxResults}), skipping");
+                            Worker::checkAndUpdateJobCompletion($jobId);
+                            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                            continue;
+                        }
+                    }
+                }
                 
                 error_log("processWorkersInBackground: Worker {$workerName} processing assigned queue item");
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
@@ -4344,7 +4306,7 @@ class Router {
                     $totalProcessed++;
                     error_log("processWorkersInBackground: Worker {$workerName} completed queue item (total processed: {$totalProcessed})");
                     
-                    // After processing, try to get another queue item (only if target not yet reached)
+                    // Check if target reached after processing
                     if ($jobId) {
                         $jobDetails = Job::getById($jobId);
                         if ($jobDetails) {
@@ -4352,31 +4314,20 @@ class Router {
                             $maxResults = (int)$jobDetails['max_results'];
                             
                             if ($emailsCollected >= $maxResults) {
-                                error_log("processWorkersInBackground: Job {$jobId} reached target after worker {$workerName} ({$emailsCollected}/{$maxResults})");
+                                error_log("processWorkersInBackground: Job {$jobId} reached target after worker {$workerName} completed");
                                 Worker::checkAndUpdateJobCompletion($jobId);
-                                $worker['queue_item'] = null; // Don't get more items
-                            } else {
-                                // Try to get another queue item for this worker
-                                $nextQueueItem = Worker::getNextJob($jobId);
-                                if ($nextQueueItem) {
-                                    $worker['queue_item'] = $nextQueueItem;
-                                    error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
-                                } else {
-                                    $worker['queue_item'] = null;
-                                    error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
-                                }
                             }
                         }
+                    }
+                    
+                    // Try to get another queue item for this worker
+                    $nextQueueItem = Worker::getNextJob($jobId);
+                    if ($nextQueueItem) {
+                        $worker['queue_item'] = $nextQueueItem;
+                        error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
                     } else {
-                        // No job ID specified, try to get another queue item
-                        $nextQueueItem = Worker::getNextJob($jobId);
-                        if ($nextQueueItem) {
-                            $worker['queue_item'] = $nextQueueItem;
-                            error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
-                        } else {
-                            $worker['queue_item'] = null;
-                            error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
-                        }
+                        $worker['queue_item'] = null;
+                        error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
                     }
                     
                 } catch (Exception $e) {
