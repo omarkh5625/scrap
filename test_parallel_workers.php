@@ -23,9 +23,13 @@ echo "  - Workers to spawn: {$testWorkerCount}\n";
 echo "  - Log file: {$logFile}\n\n";
 
 // Create test worker script that logs start and end times
+// NOTE: This is a test-only script - in production, workers are CLI processes
+// that directly run the main application code, not separate script files
 $workerScript = __DIR__ . '/test_worker_script.php';
-file_put_contents($workerScript, '<?php
-// Input validation: ensure worker ID is alphanumeric
+
+// Secure worker script content with input validation
+$workerScriptContent = '<?php
+// Input validation: ensure worker ID is alphanumeric plus dash/underscore
 $workerId = $argv[1] ?? "unknown";
 if (!preg_match("/^[a-zA-Z0-9_-]+$/", $workerId)) {
     exit(1); // Exit silently if invalid worker ID
@@ -35,15 +39,19 @@ $logFile = __DIR__ . "/test_parallel_workers.log";
 
 // Log start time
 $startTime = microtime(true);
-file_put_contents($logFile, sprintf("[%s] Worker %s STARTED at %.4f\n", date("Y-m-d H:i:s"), $workerId, $startTime), FILE_APPEND);
+file_put_contents($logFile, sprintf("[%s] Worker %s STARTED at %.4f\n", date("Y-m-d H:i:s"), $workerId, $startTime), FILE_APPEND | LOCK_EX);
 
 // Simulate work (2 seconds)
 sleep(2);
 
 // Log end time
 $endTime = microtime(true);
-file_put_contents($logFile, sprintf("[%s] Worker %s FINISHED at %.4f (duration: %.2f sec)\n", date("Y-m-d H:i:s"), $workerId, $endTime, $endTime - $startTime), FILE_APPEND);
-');
+file_put_contents($logFile, sprintf("[%s] Worker %s FINISHED at %.4f (duration: %.2f sec)\n", date("Y-m-d H:i:s"), $workerId, $endTime, $endTime - $startTime), FILE_APPEND | LOCK_EX);
+';
+
+// Write worker script with restricted permissions
+file_put_contents($workerScript, $workerScriptContent);
+chmod($workerScript, 0700); // Owner can read/write/execute only
 
 echo "Phase 1: Testing proc_open parallel execution...\n";
 $testStartTime = microtime(true);
@@ -155,11 +163,16 @@ if (count($endTimes) === $testWorkerCount) {
     }
 }
 
-// Cleanup
+// Cleanup - remove temporary test files
 unlink($workerScript);
-// Keep log file for inspection
+
+// Also remove log file after test
+// Note: Commented out to allow inspection, uncomment for automatic cleanup
+// unlink($logFile);
+
 echo "\n=== Test Complete ===\n";
 echo "Log file saved: {$logFile}\n";
+echo "(To enable automatic cleanup of log files, uncomment the unlink() line in the script)\n";
 
 if ($testPassed) {
     echo "\n✓✓✓ PARALLEL EXECUTION TEST PASSED! ✓✓✓\n";

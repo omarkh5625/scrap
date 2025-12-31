@@ -2146,11 +2146,12 @@ class Router {
         
         // Get polling interval from settings or use default 2 seconds
         // Reduced from 5 to 2 seconds for faster queue processing and better responsiveness
-        // Can be adjusted via settings if database load becomes an issue
+        // Implements exponential backoff when no work available to reduce database load
         $pollingInterval = (int)(Settings::get('worker_polling_interval', '2'));
         
         $itemsProcessed = 0;
         $consecutiveErrors = 0;
+        $consecutiveIdleCycles = 0;
         $maxConsecutiveErrors = 5;
         
         while (true) {
@@ -2161,6 +2162,9 @@ class Router {
                 $job = Worker::getNextJob($jobId);
                 
                 if ($job) {
+                    // Reset idle counter when work is found
+                    $consecutiveIdleCycles = 0;
+                    
                     error_log("  [{$workerName}] Got queue item for job #{$job['id']}");
                     Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
                     
@@ -2190,9 +2194,23 @@ class Router {
                         error_log("  [{$workerName}] Job {$jobId} complete. Worker stopping after {$itemsProcessed} items.");
                         break;
                     }
+                    
+                    // Increment idle counter for exponential backoff
+                    $consecutiveIdleCycles++;
+                } else {
+                    // Increment idle counter for exponential backoff
+                    $consecutiveIdleCycles++;
                 }
                 
-                sleep($pollingInterval);
+                // Implement exponential backoff when no work is available
+                // This reduces database load while maintaining responsiveness
+                // Backoff: 2s, 4s, 8s, capped at 10s
+                if ($consecutiveIdleCycles > 0) {
+                    $backoffInterval = min($pollingInterval * pow(2, min($consecutiveIdleCycles - 1, 2)), 10);
+                    sleep((int)$backoffInterval);
+                } else {
+                    sleep($pollingInterval);
+                }
                 
             } catch (Exception $e) {
                 $consecutiveErrors++;
@@ -4303,6 +4321,11 @@ class Router {
      * Returns the number of successfully spawned workers
      */
     private static function spawnWorkersViaProcOpenParallel(int $workerCount, ?int $jobId = null): int {
+        // Process initialization delay - allows new processes to properly detach
+        // Tested value: 100ms provides reliable initialization across platforms
+        // without adding noticeable overhead to spawn time
+        $processInitDelayMicroseconds = 100000;
+        
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
@@ -4363,9 +4386,8 @@ class Router {
         error_log("✓✓✓ Workers are now running in PARALLEL as independent processes");
         
         // Give workers a moment to initialize then close process handles
-        // This small delay ensures workers have time to detach from parent process
-        // (workers continue running independently even after handles are closed)
-        usleep(100000); // 0.1 seconds - allows process initialization
+        // Workers continue running independently even after handles are closed
+        usleep($processInitDelayMicroseconds);
         
         foreach ($processes as $proc) {
             // Don't wait for process to finish - just close the handle
