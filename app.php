@@ -5428,6 +5428,81 @@ if ($action === 'save_rotation') {
     exit;
 }
 
+// Test API Connection Action
+if ($action === 'test_connection') {
+    header('Content-Type: application/json');
+    
+    $api_key = trim($_POST['api_key'] ?? '');
+    $search_query = trim($_POST['search_query'] ?? '');
+    
+    if (empty($api_key)) {
+        echo json_encode(['success' => false, 'error' => 'API key is required']);
+        exit;
+    }
+    
+    if (empty($search_query)) {
+        echo json_encode(['success' => false, 'error' => 'Search query is required']);
+        exit;
+    }
+    
+    // Test API call
+    $start_time = microtime(true);
+    $ch = curl_init('https://google.serper.dev/search');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'X-API-KEY: ' . $api_key,
+        'Content-Type: application/json'
+    ]);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+        'q' => $search_query,
+        'num' => 10
+    ]));
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($ch);
+    curl_close($ch);
+    
+    $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
+    
+    if ($curl_error) {
+        echo json_encode([
+            'success' => false,
+            'error' => 'Connection error: ' . $curl_error,
+            'http_code' => 0,
+            'elapsed_ms' => $elapsed_time
+        ]);
+        exit;
+    }
+    
+    $response_preview = substr($response, 0, 500);
+    
+    if ($http_code === 200) {
+        $data = json_decode($response, true);
+        $result_count = isset($data['organic']) ? count($data['organic']) : 0;
+        
+        echo json_encode([
+            'success' => true,
+            'message' => '✓ Connection successful!',
+            'http_code' => $http_code,
+            'elapsed_ms' => $elapsed_time,
+            'result_count' => $result_count,
+            'response_preview' => $response_preview
+        ]);
+    } else {
+        echo json_encode([
+            'success' => false,
+            'error' => 'API returned HTTP ' . $http_code,
+            'http_code' => $http_code,
+            'elapsed_ms' => $elapsed_time,
+            'response_preview' => $response_preview
+        ]);
+    }
+    exit;
+}
+
 if ($action === 'save_profile') {
     $profile_id   = (int)($_POST['profile_id'] ?? 0);
     $profile_name = trim($_POST['profile_name'] ?? '');
@@ -6816,13 +6891,21 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
           </div>
           <div class="form-group">
             <label>Serper.dev API Key</label>
-            <input type="text" name="api_key" required value="<?php echo $editProfile ? h($editProfile['api_key']) : ''; ?>">
+            <input type="text" name="api_key" id="profile_api_key" required value="<?php echo $editProfile ? h($editProfile['api_key']) : ''; ?>">
             <small class="hint">Your Serper.dev API key for email extraction</small>
           </div>
           <div class="form-group">
             <label>Search Query</label>
-            <textarea name="search_query" rows="3" required><?php echo $editProfile ? h($editProfile['search_query']) : ''; ?></textarea>
+            <textarea name="search_query" id="profile_search_query" rows="3" required><?php echo $editProfile ? h($editProfile['search_query']) : ''; ?></textarea>
             <small class="hint">e.g., "real estate agents california"</small>
+          </div>
+          
+          <!-- Test Connection Button & Result -->
+          <div class="form-group">
+            <button type="button" class="btn btn-outline" id="testConnectionBtn" style="width:100%;">
+              🔌 Test Connection
+            </button>
+            <div id="connectionTestResult" style="margin-top:10px; display:none; padding:12px; border-radius:4px; font-size:13px;"></div>
           </div>
           <div class="form-group">
             <label>Target Email Count</label>
@@ -7703,6 +7786,93 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                 </div>
               </div>
 
+              <!-- Last API Response Details (Debug Info) -->
+              <?php if (!empty($job['error_message']) && strpos($job['error_message'], 'API LOG:') !== false): ?>
+              <div class="card" style="margin-bottom:18px;">
+                <div class="card-header">
+                  <div>
+                    <div class="card-title">🔍 Last API Response</div>
+                    <div class="card-subtitle">Diagnostic information from the last API call attempt</div>
+                  </div>
+                </div>
+                <div style="padding:16px;">
+                  <?php
+                    // Parse error message to extract API log details
+                    $errorLines = explode("\n", $job['error_message']);
+                    $httpCode = null;
+                    $responseLength = null;
+                    $responsePreview = null;
+                    
+                    foreach ($errorLines as $line) {
+                      if (preg_match('/HTTP Code:\s*(\d+)/', $line, $matches)) {
+                        $httpCode = $matches[1];
+                      }
+                      if (preg_match('/Response length:\s*([\d,]+)\s*bytes/', $line, $matches)) {
+                        $responseLength = $matches[1];
+                      }
+                      if (preg_match('/First \d+ chars of response:\s*(.+)/', $line, $matches)) {
+                        $responsePreview = $matches[1];
+                      }
+                      if (preg_match('/FULL ERROR RESPONSE:\s*(.+)/', $line, $matches)) {
+                        $responsePreview = $matches[1];
+                      }
+                    }
+                  ?>
+                  
+                  <div class="form-row">
+                    <?php if ($httpCode): ?>
+                    <div class="form-group">
+                      <label>HTTP Status Code</label>
+                      <div style="font-family:monospace; font-size:14px; font-weight:600; color:<?php echo ($httpCode == '200') ? '#15803d' : '#dc2626'; ?>;">
+                        <?php echo h($httpCode); ?>
+                        <?php 
+                          if ($httpCode == '200') echo ' <span style="color:#15803d;">✓ OK</span>';
+                          elseif ($httpCode == '401') echo ' <span style="color:#dc2626;">❌ Unauthorized</span>';
+                          elseif ($httpCode == '429') echo ' <span style="color:#dc2626;">❌ Rate Limit</span>';
+                          else echo ' <span style="color:#dc2626;">❌ Error</span>';
+                        ?>
+                      </div>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <?php if ($responseLength): ?>
+                    <div class="form-group">
+                      <label>Response Size</label>
+                      <div style="font-family:monospace; font-size:14px;"><?php echo h($responseLength); ?> bytes</div>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <div class="form-group">
+                      <label>Extraction Time</label>
+                      <div style="font-family:monospace; font-size:14px;">
+                        <?php 
+                          if ($job['started_at'] && $job['completed_at']) {
+                            $start = new DateTime($job['started_at']);
+                            $end = new DateTime($job['completed_at']);
+                            $diff = $start->diff($end);
+                            echo $diff->s . ' seconds';
+                          } else {
+                            echo '<span class="hint">N/A</span>';
+                          }
+                        ?>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <?php if ($responsePreview): ?>
+                  <div style="margin-top:16px;">
+                    <label style="display:block; margin-bottom:8px; font-weight:600;">API Response Preview:</label>
+                    <pre style="background:#f9f9f9; border:1px solid #e0e0e0; border-radius:4px; padding:12px; margin:0; font-size:12px; line-height:1.4; max-height:200px; overflow-y:auto; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars(substr($responsePreview, 0, 1000)); ?></pre>
+                  </div>
+                  <?php endif; ?>
+                  
+                  <div style="margin-top:16px; padding:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:4px; font-size:13px; color:#1e40af;">
+                    <strong>💡 Tip:</strong> Use the "Check Connection" button in Job Profiles to test your API key and search query before running extraction.
+                  </div>
+                </div>
+              </div>
+              <?php endif; ?>
+
               <!-- Real-time Job Progress -->
               <?php 
                 $jobStatus = $job['status'];
@@ -8004,6 +8174,87 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
           });
         });
 
+      })();
+      
+      // Test Connection Button Handler
+      (function() {
+        const testBtn = document.getElementById('testConnectionBtn');
+        const resultDiv = document.getElementById('connectionTestResult');
+        const apiKeyInput = document.getElementById('profile_api_key');
+        const searchQueryInput = document.getElementById('profile_search_query');
+        
+        if (testBtn && resultDiv && apiKeyInput && searchQueryInput) {
+          testBtn.addEventListener('click', function() {
+            const apiKey = apiKeyInput.value.trim();
+            const searchQuery = searchQueryInput.value.trim();
+            
+            if (!apiKey) {
+              resultDiv.style.display = 'block';
+              resultDiv.style.background = '#fee';
+              resultDiv.style.color = '#c00';
+              resultDiv.style.border = '1px solid #fcc';
+              resultDiv.innerHTML = '❌ Please enter an API key';
+              return;
+            }
+            
+            if (!searchQuery) {
+              resultDiv.style.display = 'block';
+              resultDiv.style.background = '#fee';
+              resultDiv.style.color = '#c00';
+              resultDiv.style.border = '1px solid #fcc';
+              resultDiv.innerHTML = '❌ Please enter a search query';
+              return;
+            }
+            
+            // Show loading state
+            testBtn.disabled = true;
+            testBtn.innerHTML = '⏳ Testing...';
+            resultDiv.style.display = 'block';
+            resultDiv.style.background = '#eff6ff';
+            resultDiv.style.color = '#1e40af';
+            resultDiv.style.border = '1px solid #bfdbfe';
+            resultDiv.innerHTML = '⏳ Connecting to serper.dev...';
+            
+            // Test connection
+            fetch('?action=test_connection', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+              body: 'api_key=' + encodeURIComponent(apiKey) + '&search_query=' + encodeURIComponent(searchQuery)
+            })
+            .then(r => r.json())
+            .then(data => {
+              testBtn.disabled = false;
+              testBtn.innerHTML = '🔌 Test Connection';
+              
+              if (data.success) {
+                resultDiv.style.background = '#f0fdf4';
+                resultDiv.style.color = '#15803d';
+                resultDiv.style.border = '1px solid #bbf7d0';
+                resultDiv.innerHTML = 
+                  '<strong>✓ Connection Successful!</strong><br>' +
+                  '<small>HTTP ' + data.http_code + ' | ' +
+                  data.elapsed_ms + 'ms | ' +
+                  data.result_count + ' results</small>';
+              } else {
+                resultDiv.style.background = '#fee';
+                resultDiv.style.color = '#c00';
+                resultDiv.style.border = '1px solid #fcc';
+                resultDiv.innerHTML = 
+                  '<strong>❌ Connection Failed</strong><br>' +
+                  '<small>' + (data.error || 'Unknown error') + '</small>' +
+                  (data.http_code ? '<br><small>HTTP ' + data.http_code + ' | ' + data.elapsed_ms + 'ms</small>' : '');
+              }
+            })
+            .catch(err => {
+              testBtn.disabled = false;
+              testBtn.innerHTML = '🔌 Test Connection';
+              resultDiv.style.background = '#fee';
+              resultDiv.style.color = '#c00';
+              resultDiv.style.border = '1px solid #fcc';
+              resultDiv.innerHTML = '❌ Network error: ' + err.message;
+            });
+          });
+        }
       })();
     </script>
 
