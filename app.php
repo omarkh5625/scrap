@@ -966,6 +966,11 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
         error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}'");
         
+        // Set active_workers count EARLY so UI shows workers are starting
+        $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, active_workers = ? WHERE id = ?");
+        $stmt->execute([$targetCount, $workers, $jobId]);
+        error_log("PARALLEL_EXTRACTION: Set active_workers={$workers} for job {$jobId}");
+        
         if (empty($apiKey) || empty($searchQuery)) {
             throw new Exception("API key or search query is missing");
         }
@@ -976,10 +981,6 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $resultsPerWorkerCall = 100; // Fixed optimal value for best results
         
         error_log("PARALLEL_EXTRACTION: Each worker will request {$resultsPerWorkerCall} results per call");
-        
-        // Use a shared tracking table for worker coordination
-        $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, active_workers = ? WHERE id = ?");
-        $stmt->execute([$targetCount, $workers, $jobId]);
         
         $extractedCount = 0;
         $attempts = 0;
@@ -8213,25 +8214,6 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                             // Stop polling and reload page if job is completed
                             if (prog.job_status === 'completed' || prog.campaign_status === 'completed') {
                               clearInterval(pollInterval);
-                              setTimeout(function(){
-                                window.location.reload();
-                              }, 2000);
-                            }
-                          }
-                        })
-                        .catch(function(err){
-                          console.error('Progress poll error:', err);
-                        });
-                    }, 2000);
-                  }
-                })();
-              </script>
-                            
-                            // Stop polling and reload page if campaign is completed
-                            // Check both progress_status (completed) and campaign status (sent)
-                            if (prog.status === 'completed' || prog.campaign_status === 'sent') {
-                              clearInterval(pollInterval);
-                              // Reload page after 2 seconds to show final "sent" status
                               setTimeout(function(){
                                 window.location.reload();
                               }, 2000);
