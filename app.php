@@ -5430,75 +5430,96 @@ if ($action === 'save_rotation') {
 
 // Test API Connection Action
 if ($action === 'test_connection') {
-    header('Content-Type: application/json');
+    // Prevent any output before JSON
+    ob_clean();
+    header('Content-Type: application/json; charset=utf-8');
     
-    $api_key = trim($_POST['api_key'] ?? '');
-    $search_query = trim($_POST['search_query'] ?? '');
-    
-    if (empty($api_key)) {
-        echo json_encode(['success' => false, 'error' => 'API key is required']);
-        exit;
-    }
-    
-    if (empty($search_query)) {
-        echo json_encode(['success' => false, 'error' => 'Search query is required']);
-        exit;
-    }
-    
-    // Test API call
-    $start_time = microtime(true);
-    $ch = curl_init('https://google.serper.dev/search');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'X-API-KEY: ' . $api_key,
-        'Content-Type: application/json'
-    ]);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
-        'q' => $search_query,
-        'num' => 10
-    ]));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curl_error = curl_error($ch);
-    curl_close($ch);
-    
-    $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
-    
-    if ($curl_error) {
-        echo json_encode([
-            'success' => false,
-            'error' => 'Connection error: ' . $curl_error,
-            'http_code' => 0,
-            'elapsed_ms' => $elapsed_time
-        ]);
-        exit;
-    }
-    
-    $response_preview = substr($response, 0, 500);
-    
-    if ($http_code === 200) {
-        $data = json_decode($response, true);
-        $result_count = isset($data['organic']) ? count($data['organic']) : 0;
+    try {
+        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : 0;
+        $api_key = trim($_POST['api_key'] ?? '');
+        $search_query = trim($_POST['search_query'] ?? '');
         
-        echo json_encode([
-            'success' => true,
-            'message' => '✓ Connection successful!',
-            'http_code' => $http_code,
-            'elapsed_ms' => $elapsed_time,
-            'result_count' => $result_count,
-            'response_preview' => $response_preview
+        // If profile_id provided, fetch from database
+        if ($profile_id > 0) {
+            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
+            $stmt->execute([$profile_id]);
+            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($profile) {
+                $api_key = $profile['api_key'];
+                $search_query = $profile['search_query'];
+            }
+        }
+        
+        if (empty($api_key)) {
+            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        if (empty($search_query)) {
+            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // Test API call
+        $start_time = microtime(true);
+        $ch = curl_init('https://google.serper.dev/search');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'X-API-KEY: ' . $api_key,
+            'Content-Type: application/json'
         ]);
-    } else {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+            'q' => $search_query,
+            'num' => 10
+        ]));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+        
+        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
+        
+        if ($curl_error) {
+            echo json_encode([
+                'success' => false,
+                'error' => 'Connection error: ' . $curl_error,
+                'http_code' => 0,
+                'elapsed_ms' => $elapsed_time
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $response_preview = substr($response, 0, 500);
+        
+        if ($http_code === 200) {
+            $data = json_decode($response, true);
+            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
+            
+            echo json_encode([
+                'success' => true,
+                'message' => '✓ Connection successful!',
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'result_count' => $result_count,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        } else {
+            echo json_encode([
+                'success' => false,
+                'error' => 'API returned HTTP ' . $http_code,
+                'http_code' => $http_code,
+                'elapsed_ms' => $elapsed_time,
+                'response_preview' => $response_preview
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    } catch (Exception $e) {
         echo json_encode([
             'success' => false,
-            'error' => 'API returned HTTP ' . $http_code,
-            'http_code' => $http_code,
-            'elapsed_ms' => $elapsed_time,
-            'response_preview' => $response_preview
-        ]);
+            'error' => 'Internal error: ' . $e->getMessage()
+        ], JSON_UNESCAPED_UNICODE);
     }
     exit;
 }
@@ -6865,6 +6886,7 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                   <?php endif; ?>
                 </div>
                 <div class="profile-actions">
+                  <button type="button" class="btn-mini" onclick="testProfileConnection(<?php echo (int)$p['id']; ?>)">🔌 Test</button>
                   <a href="?page=list&edit_profile=<?php echo (int)$p['id']; ?>" class="btn-mini">Edit</a>
                   <form method="post" style="display:inline;">
                     <input type="hidden" name="action" value="delete_profile">
@@ -8256,6 +8278,62 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
           });
         }
       })();
+      
+      // Test connection for profile in list
+      function testProfileConnection(profileId) {
+        const statusDiv = document.getElementById('profile-conn-status-' + profileId);
+        if (!statusDiv) return;
+        
+        // Show loading state
+        statusDiv.style.display = 'block';
+        statusDiv.style.padding = '8px';
+        statusDiv.style.borderRadius = '4px';
+        statusDiv.style.background = '#eff6ff';
+        statusDiv.style.color = '#1e40af';
+        statusDiv.style.border = '1px solid #bfdbfe';
+        statusDiv.innerHTML = '⏳ Testing connection...';
+        
+        // Test connection
+        fetch('?action=test_connection', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'profile_id=' + profileId
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            statusDiv.style.background = '#f0fdf4';
+            statusDiv.style.color = '#15803d';
+            statusDiv.style.border = '1px solid #bbf7d0';
+            statusDiv.innerHTML = 
+              '<strong>✓ Connection OK</strong> | HTTP ' + data.http_code + ' | ' +
+              data.elapsed_ms + 'ms | ' + data.result_count + ' results';
+          } else {
+            statusDiv.style.background = '#fee';
+            statusDiv.style.color = '#c00';
+            statusDiv.style.border = '1px solid #fcc';
+            statusDiv.innerHTML = 
+              '<strong>❌ Failed:</strong> ' + (data.error || 'Unknown error') +
+              (data.http_code ? ' | HTTP ' + data.http_code : '');
+          }
+          
+          // Auto-hide after 10 seconds
+          setTimeout(() => {
+            statusDiv.style.display = 'none';
+          }, 10000);
+        })
+        .catch(err => {
+          statusDiv.style.background = '#fee';
+          statusDiv.style.color = '#c00';
+          statusDiv.style.border = '1px solid #fcc';
+          statusDiv.innerHTML = '❌ Network error: ' + err.message;
+          
+          // Auto-hide after 10 seconds
+          setTimeout(() => {
+            statusDiv.style.display = 'none';
+          }, 10000);
+        });
+      }
     </script>
 
     </body>
