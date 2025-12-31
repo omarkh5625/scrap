@@ -1842,7 +1842,9 @@ class Worker {
         // Update overall job progress
         self::updateJobProgress($jobId);
         
-        echo "Job chunk completed! Processed {$processed} emails\n";
+        $elapsedTime = round(microtime(true) - $workerStartTime, 2);
+        echo "Job chunk completed! Processed {$processed} emails in {$elapsedTime}s\n";
+        error_log("✓ Worker processJob COMPLETED in parallel: jobId={$jobId}, PID={$processId}, emails={$processed}, time={$elapsedTime}s, rate=" . round($processed / max($elapsedTime, 0.01), 1) . " emails/s");
         
         // Mark worker as idle
         self::updateHeartbeat($workerId, 'idle', null, 0, 0);
@@ -2141,6 +2143,7 @@ class Router {
         }
         
         // Regular worker mode (polls for jobs)
+        $workerStartTime = microtime(true);
         echo "=== PHP Email Extraction System Worker ===\n";
         
         $workerName = $argv[1] ?? 'worker-' . uniqid();
@@ -2148,6 +2151,8 @@ class Router {
         $jobId = isset($argv[2]) && is_numeric($argv[2]) ? (int)$argv[2] : null;
         
         echo "Worker: {$workerName}\n";
+        echo "Started at: " . date('Y-m-d H:i:s') . "\n";
+        echo "Process ID: " . getmypid() . "\n";
         if ($jobId !== null) {
             echo "Dedicated to Job ID: {$jobId}\n";
         }
@@ -2163,10 +2168,20 @@ class Router {
         // Track consecutive empty polls to implement adaptive backoff
         $emptyPollCount = 0;
         $maxEmptyPolls = 50; // After 50 empty polls (5 seconds), increase interval
+        $maxIdleTime = 300; // Exit after 5 minutes of no work (300 seconds)
+        $jobsProcessed = 0;
         
         // NO INITIAL SLEEP - start checking for work immediately for parallel execution
         while (true) {
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            
+            // Check if worker has been idle too long (safety exit)
+            $elapsedTime = microtime(true) - $workerStartTime;
+            if ($emptyPollCount > ($maxIdleTime / $pollingInterval) && $jobsProcessed === 0) {
+                echo "Worker idle timeout ({$maxIdleTime}s) - no jobs found. Exiting.\n";
+                error_log("Worker {$workerName} exiting due to idle timeout after " . round($elapsedTime, 1) . "s");
+                break;
+            }
             
             // Pass job_id to only get queue items for that specific job
             $job = Worker::getNextJob($jobId);
@@ -2176,15 +2191,18 @@ class Router {
                 $emptyPollCount = 0;
                 
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
-                error_log("Worker {$workerName} starting job #{$job['id']} in parallel mode");
+                error_log("✓ Worker {$workerName} (PID " . getmypid() . ") starting job #{$job['id']} in PARALLEL mode at " . date('H:i:s'));
                 Worker::processJob($job['id']);
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
-                error_log("Worker {$workerName} completed job #{$job['id']}");
+                $jobsProcessed++;
+                error_log("✓ Worker {$workerName} completed job #{$job['id']} (total: {$jobsProcessed} jobs)");
             } else if ($jobId !== null) {
                 // If dedicated to a specific job and no work found, check if job is complete
                 $jobDetails = Job::getById($jobId);
                 if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
-                    echo "Job {$jobId} is complete or not found. Exiting.\n";
+                    $totalTime = round(microtime(true) - $workerStartTime, 2);
+                    echo "Job {$jobId} is complete or not found. Exiting after {$totalTime}s ({$jobsProcessed} jobs processed).\n";
+                    error_log("Worker {$workerName} exiting - job complete. Processed {$jobsProcessed} jobs in {$totalTime}s");
                     break;
                 }
                 $emptyPollCount++;
