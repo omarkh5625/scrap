@@ -1000,6 +1000,25 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
         $extractedCount = 0;
         error_log("PERFORM_EXTRACTION: Got " . count($extractedEmails) . " emails from serper.dev");
         
+        // Check if any emails were found
+        if (empty($extractedEmails)) {
+            error_log("PERFORM_EXTRACTION: ERROR - No emails found in search results");
+            $errorMsg = "No emails found in search results. This could be because:\n";
+            $errorMsg .= "- The search query '{$searchQuery}' returned no results with email addresses\n";
+            $errorMsg .= "- All emails were filtered out (only business emails are extracted, free providers like gmail.com are excluded)\n";
+            $errorMsg .= "- The search results don't contain visible email addresses\n\n";
+            $errorMsg .= "Suggestions:\n";
+            $errorMsg .= "- Try a more specific search query (e.g., 'real estate agents california contact')\n";
+            $errorMsg .= "- Try a different location or industry\n";
+            $errorMsg .= "- Disable 'Business Only' filter if you want all email addresses\n\n";
+            $errorMsg .= "--- API Log ---\n" . implode("\n", $result['log'] ?? []);
+            
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ? WHERE id = ?");
+            $stmt->execute([$errorMsg, $jobId]);
+            error_log("PERFORM_EXTRACTION: Job marked as draft with error message");
+            throw new Exception("No emails found in search results");
+        }
+        
         // Store extracted emails in database
         foreach ($extractedEmails as $emailData) {
             try {
@@ -1022,6 +1041,19 @@ function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): v
                 error_log("PERFORM_EXTRACTION: Skipping duplicate email: " . ($emailData['email'] ?? 'unknown'));
                 continue;
             }
+        }
+        
+        // Final check: if no emails were actually inserted (all were duplicates)
+        if ($extractedCount === 0) {
+            error_log("PERFORM_EXTRACTION: ERROR - All emails were duplicates, 0 new emails inserted");
+            $errorMsg = "All emails found were duplicates (already extracted in a previous job).\n";
+            $errorMsg .= "Found " . count($extractedEmails) . " email(s) but all were already in the database.\n\n";
+            $errorMsg .= "Try a different search query to find new email addresses.";
+            
+            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ? WHERE id = ?");
+            $stmt->execute([$errorMsg, $jobId]);
+            error_log("PERFORM_EXTRACTION: Job marked as draft - all duplicates");
+            throw new Exception("All emails were duplicates");
         }
         
         // Mark job as completed
