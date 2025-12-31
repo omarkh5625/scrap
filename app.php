@@ -980,11 +980,21 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $businessOnly = !empty($profile['filter_business_only']);
         $rawTargetCount = (int)($profile['target_count'] ?? 100);
         $targetCount = max(1, $rawTargetCount);  // Ensure at least 1 email target
-        $workers = max(1, (int)($profile['workers'] ?? 4));
+        $rawWorkers = (int)($profile['workers'] ?? 4);
+        
+        // Limit workers to prevent resource exhaustion (curl handles, memory, etc.)
+        // Maximum 50 parallel workers per batch to stay within system limits
+        $maxWorkersPerBatch = 50;
+        $workers = max(1, min($rawWorkers, $maxWorkersPerBatch));
         
         // Log warning if target count was invalid
         if ($rawTargetCount <= 0) {
             error_log("PARALLEL_EXTRACTION: WARNING - Profile target_count was {$rawTargetCount}, adjusted to {$targetCount}");
+        }
+        
+        // Log warning if workers were limited
+        if ($rawWorkers > $maxWorkersPerBatch) {
+            error_log("PARALLEL_EXTRACTION: WARNING - Profile workers was {$rawWorkers}, limited to {$workers} per batch to prevent resource exhaustion");
         }
         
         // Get email domain filtering parameters
@@ -1214,6 +1224,9 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                 $errorMsg .= "Target Domains: " . implode(', ', $emailDomains) . "\n";
             }
             $errorMsg .= "Workers Used: {$workers}\n";
+            if (isset($rawWorkers) && $rawWorkers > $maxWorkersPerBatch) {
+                $errorMsg .= "  (Note: Requested {$rawWorkers} workers, limited to {$workers} per batch)\n";
+            }
             $errorMsg .= "API Calls Made: {$attempts}\n\n";
             
             // Special case: if attempts is 0, provide specific guidance
@@ -1224,6 +1237,15 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                     $errorMsg .= "✗ Profile 'Target Email Count' was {$rawTargetCount} (invalid - must be at least 1)\n";
                     $errorMsg .= "  → The system adjusted it to {$targetCount}, but the profile should be updated\n";
                     $errorMsg .= "  → Edit the profile and set 'Target Email Count' to a valid number (e.g., 100)\n\n";
+                } elseif (isset($rawWorkers) && $rawWorkers > $maxWorkersPerBatch) {
+                    $errorMsg .= "✗ Too many workers requested: {$rawWorkers}\n";
+                    $errorMsg .= "  → System limit is {$maxWorkersPerBatch} parallel workers per batch\n";
+                    $errorMsg .= "  → Creating {$rawWorkers} parallel curl handles likely caused a resource exhaustion error\n";
+                    $errorMsg .= "  → The script probably crashed before the loop could start\n\n";
+                    $errorMsg .= "SOLUTION:\n";
+                    $errorMsg .= "  1. Edit your profile and reduce 'Workers' to 50 or less\n";
+                    $errorMsg .= "  2. Recommended: 4-10 workers for optimal performance\n";
+                    $errorMsg .= "  3. More workers doesn't always mean faster - it can cause resource issues\n\n";
                 } else {
                     $errorMsg .= "The extraction loop failed to start. This is unusual.\n";
                     $errorMsg .= "Check the server error.log for messages starting with 'PARALLEL_EXTRACTION:'\n\n";
