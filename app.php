@@ -1,8584 +1,6094 @@
-<?php
+<?php declare(strict_types=1);
+
 /**
- * EMAIL EXTRACTION SYSTEM
- *
- * Professional Email Extraction Tool using serper.dev API
+ * Complete PHP Email Extraction System - Single File Application
+ * PHP 8.0+ Required
  * 
  * Features:
- * - Database Installation Wizard
- * - Admin Authentication System
- * - Multi-worker parallel extraction
- * - Real-time job progress tracking
- * - API job profiles management
- * - Serper.dev API integration for email extraction
- * 
- * Enhanced with:
- * - First-time setup wizard with professional UI
- * - Secure admin login
- * - Automatic database table creation
- * - Efficient parallel worker system
+ * - Setup Wizard
+ * - Authentication System
+ * - Dashboard
+ * - Email Extraction Jobs
+ * - Async Background Workers (1-1000)
+ * - Email Type Filtering (Gmail, Yahoo, Business)
+ * - Country Targeting
+ * - Results Export
+ * - Google Serper.dev Integration
+ * - BloomFilter Deduplication
+ * - CLI Worker Support
+ * - Regex Email Extraction
  */
 
-// Enable error reporting for debugging
+// ============================================================================
+// CONFIGURATION SECTION - DO NOT EDIT MANUALLY AFTER INSTALLATION
+// ============================================================================
+
+define('CONFIG_START', true);
+
+// Database configuration (filled by setup wizard)
+$DB_CONFIG = [
+    'host' => 'localhost',
+    'database' => 'send_serp',
+    'username' => 'send_serp',
+    'password' => '0165625092Oo@',
+    'installed' => true
+];
+
+define('CONFIG_END', true);
+
+// ============================================================================
+// APPLICATION BOOTSTRAP
+// ============================================================================
+
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
-ini_set('display_startup_errors', 1);
-ini_set('log_errors', 1);
-ini_set('error_log', __DIR__ . '/error.log');
+ini_set('display_errors', '1');
+ini_set('log_errors', '1');
+ini_set('error_log', __DIR__ . '/php_errors.log');
+date_default_timezone_set('UTC');
 
-// Custom error handler for better debugging
-set_error_handler(function($errno, $errstr, $errfile, $errline) {
-    $error_message = sprintf(
-        "[%s] Error #%d: %s in %s on line %d",
-        date('Y-m-d H:i:s'),
-        $errno,
-        $errstr,
-        $errfile,
-        $errline
-    );
-    error_log($error_message);
-    
-    // Display error in development mode ONLY if not an AJAX request
-    if (ini_get('display_errors') && !isset($_POST['action']) && !isset($_GET['action'])) {
-        echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
-        echo "<strong>Error:</strong> $errstr<br>";
-        echo "<strong>File:</strong> $errfile<br>";
-        echo "<strong>Line:</strong> $errline<br>";
-        echo "</div>";
-    }
-    return false;
-});
+// Performance optimizations for high-volume email extraction
+ini_set('memory_limit', '512M'); // Increased for large batch operations
+ini_set('max_execution_time', '600'); // 10 minutes for worker processes
+ini_set('default_socket_timeout', '10');
 
-// Exception handler
-set_exception_handler(function($exception) {
-    $error_message = sprintf(
-        "[%s] Exception: %s in %s on line %d\nStack trace:\n%s",
-        date('Y-m-d H:i:s'),
-        $exception->getMessage(),
-        $exception->getFile(),
-        $exception->getLine(),
-        $exception->getTraceAsString()
-    );
-    error_log($error_message);
-    
-    // Display exception in development mode ONLY if not an AJAX request
-    if (ini_get('display_errors') && !isset($_POST['action']) && !isset($_GET['action'])) {
-        echo "<div style='background:#fee; border:2px solid #c00; padding:20px; margin:10px; font-family:monospace;'>";
-        echo "<strong>Exception:</strong> " . htmlspecialchars($exception->getMessage()) . "<br>";
-        echo "<strong>File:</strong> " . htmlspecialchars($exception->getFile()) . "<br>";
-        echo "<strong>Line:</strong> " . $exception->getLine() . "<br>";
-        echo "<strong>Stack trace:</strong><br><pre>" . htmlspecialchars($exception->getTraceAsString()) . "</pre>";
-        echo "</div>";
-    }
-});
-
-///////////////////////
-//  LOAD CONFIGURATION
-///////////////////////
-// Check if config file exists
-$configFile = __DIR__ . '/config.php';
-$configExists = file_exists($configFile);
-
-// If config doesn't exist and not installing or testing connection, show installation wizard
-if (!$configExists && (!isset($_GET['action']) || ($_GET['action'] !== 'install' && $_GET['action'] !== 'test_connection'))) {
-    // Show installation wizard
-    include_once 'install_wizard.php';
-    exit;
-}
-
-// Load configuration if it exists
-if ($configExists) {
-    require_once $configFile;
-    // Set globals for CLI workers
-    $DB_HOST = defined('DB_HOST') ? DB_HOST : 'localhost';
-    $DB_NAME = defined('DB_NAME') ? DB_NAME : '';
-    $DB_USER = defined('DB_USER') ? DB_USER : '';
-    $DB_PASS = defined('DB_PASS') ? DB_PASS : '';
-} else {
-    // Defaults for installation
-    $DB_HOST = 'localhost';
-    $DB_NAME = '';
-    $DB_USER = '';
-    $DB_PASS = '';
-}
-
-///////////////////////
-//  CONSTANTS
-///////////////////////
-// Brand configuration
-define('BRAND_NAME', 'EMAIL EXTRACTOR');
-
-// Worker configuration defaults for extraction
-define('DEFAULT_WORKERS', 4);
-define('DEFAULT_EMAILS_PER_WORKER', 100);
-define('MIN_WORKERS', 1);
-// MAX_WORKERS removed - NO LIMIT on number of workers - accepts ANY value
-define('MIN_EMAILS_PER_WORKER', 1);
-define('MAX_EMAILS_PER_WORKER', 10000);
-// IMPORTANT: This is ONLY for logging warnings - NOT a limit!
-// Workers can be set to ANY number (100, 500, 1000+)
-// This threshold just triggers informational log messages for monitoring
-define('WORKERS_LOG_WARNING_THRESHOLD', 50);
-
-// Progress update frequency (update progress every N emails extracted)
-define('PROGRESS_UPDATE_FREQUENCY', 10);
-
-// Cycle delay configuration (delay between worker processing cycles in milliseconds)
-define('DEFAULT_CYCLE_DELAY_MS', 0);
-define('MIN_CYCLE_DELAY_MS', 0);
-define('MAX_CYCLE_DELAY_MS', 10000); // Max 10 seconds
-
-///////////////////////
-//  DATABASE CONNECTION
-///////////////////////
-$pdo = null;
-if ($DB_NAME !== '' && $DB_USER !== '') {
-    try {
-        $pdo = new PDO(
-            "mysql:host={$DB_HOST};dbname={$DB_NAME};charset=utf8mb4",
-            $DB_USER,
-            $DB_PASS,
-            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
-        );
-    } catch (Exception $e) {
-        if (PHP_SAPI === 'cli') {
-            fwrite(STDERR, "DB connection error: " . $e->getMessage() . PHP_EOL);
-            exit(1);
-        }
-        // If web request and not installing, show error
-        if (!isset($_GET['action']) || $_GET['action'] !== 'install') {
-            die('Database connection error. Please check your configuration.');
-        }
-    }
-}
-
-if (PHP_SAPI === 'cli' && isset($argv) && count($argv) > 1) {
-    if ($argv[1] === '--bg-send-profile') {
-        $cid = isset($argv[2]) ? (int)$argv[2] : 0;
-        $pid = isset($argv[3]) ? (int)$argv[3] : 0;
-        $tmpfile = isset($argv[4]) ? $argv[4] : '';
-        $recipientsText = '';
-        $overrides = [];
-        if ($tmpfile && is_readable($tmpfile)) {
-            $raw = file_get_contents($tmpfile);
-            $dec = json_decode($raw, true);
-            if (is_array($dec) && isset($dec['recipients'])) {
-                // support recipients as array or string
-                if (is_array($dec['recipients'])) {
-                    $recipientsText = implode("\n", $dec['recipients']);
-                } else {
-                    $recipientsText = (string)$dec['recipients'];
-                }
-                $overrides = isset($dec['overrides']) && is_array($dec['overrides']) ? $dec['overrides'] : [];
-            } else {
-                $recipientsText = $raw;
-            }
-        }
-        try {
-            $campaign = get_campaign($pdo, $cid);
-            if ($campaign) {
-                send_campaign_real($pdo, $campaign, $recipientsText, false, $pid, $overrides);
-            }
-        } catch (Exception $e) {
-            // nothing to do
-        }
-        if ($tmpfile) @unlink($tmpfile);
-        exit(0);
-    }
-
-    if ($argv[1] === '--bg-send') {
-        $cid = isset($argv[2]) ? (int)$argv[2] : 0;
-        $tmpfile = isset($argv[3]) ? $argv[3] : '';
-        $recipientsText = '';
-        $overrides = [];
-        if ($tmpfile && is_readable($tmpfile)) {
-            $raw = file_get_contents($tmpfile);
-            $dec = json_decode($raw, true);
-            if (is_array($dec) && isset($dec['recipients'])) {
-                if (is_array($dec['recipients'])) {
-                    $recipientsText = implode("\n", $dec['recipients']);
-                } else {
-                    $recipientsText = (string)$dec['recipients'];
-                }
-                $overrides = isset($dec['overrides']) && is_array($dec['overrides']) ? $dec['overrides'] : [];
-            } else {
-                $recipientsText = $raw;
-            }
-        }
-        try {
-            $campaign = get_campaign($pdo, $cid);
-            if ($campaign) {
-                send_campaign_real($pdo, $campaign, $recipientsText, false, null, $overrides);
-            }
-        } catch (Exception $e) {
-            // nothing to do
-        }
-        if ($tmpfile) @unlink($tmpfile);
-        exit(0);
-    }
-
-    if ($argv[1] === '--bg-scan-bounces') {
-        try {
-            process_imap_bounces($pdo);
-        } catch (Exception $e) {
-            // ignore
-        }
-        exit(0);
-    }
-    
-    if ($argv[1] === '--bg-extract') {
-        // Background extraction worker
-        $jobId = isset($argv[2]) ? (int)$argv[2] : 0;
-        if ($jobId > 0) {
-            try {
-                $job = get_job($pdo, $jobId);
-                if ($job && !empty($job['profile_id'])) {
-                    // Get profile information
-                    $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
-                    $profile_stmt->execute([$job['profile_id']]);
-                    $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
-                    
-                    if ($profile) {
-                        // Perform extraction using the shared function
-                        perform_extraction($pdo, $jobId, $job, $profile);
-                    }
-                }
-            } catch (Exception $e) {
-                error_log("Background extraction worker failed for job {$jobId}: " . $e->getMessage());
-                try {
-                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error' WHERE id = ?");
-                    $stmt->execute([$jobId]);
-                } catch (Exception $e2) {}
-            }
-        }
-        exit(0);
-    }
-}
-
-///////////////////////
-//  EARLY API HANDLERS (before session)
-///////////////////////
-// Handle test_connection API endpoint early to avoid session/auth overhead
-// This must run before session_start() to prevent any output buffering issues
-if (isset($_GET['action']) && $_GET['action'] === 'test_connection') {
-    // Suppress display of errors but keep logging enabled
-    @ini_set('display_errors', 0);
-    @ini_set('log_errors', 1);  // Keep logging enabled for debugging
-    // Don't suppress error_reporting completely - still log errors
-    
-    // Clear ALL output buffers that might exist
-    while (ob_get_level()) @ob_end_clean();
-    @ob_start();
-    
-    header('Content-Type: application/json; charset=utf-8');
-    
-    try {
-        // Accept parameters from both POST (direct API calls) and GET (profile list)
-        $profile_id = isset($_POST['profile_id']) ? (int)$_POST['profile_id'] : (isset($_GET['profile_id']) ? (int)$_GET['profile_id'] : 0);
-        $api_key = trim($_POST['api_key'] ?? $_GET['api_key'] ?? '');
-        $search_query = trim($_POST['search_query'] ?? $_GET['search_query'] ?? '');
-        
-        // If profile_id provided, fetch from database
-        if ($profile_id > 0 && $pdo !== null) {
-            $stmt = $pdo->prepare("SELECT api_key, search_query FROM job_profiles WHERE id = ?");
-            $stmt->execute([$profile_id]);
-            $profile = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($profile) {
-                $api_key = $profile['api_key'];
-                $search_query = $profile['search_query'];
-            }
-        }
-        
-        if (empty($api_key)) {
-            @ob_end_clean();
-            echo json_encode(['success' => false, 'error' => 'API key is required'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        if (empty($search_query)) {
-            @ob_end_clean();
-            echo json_encode(['success' => false, 'error' => 'Search query is required'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        // Test API call
-        $start_time = microtime(true);
-        $ch = curl_init('https://google.serper.dev/search');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'X-API-KEY: ' . $api_key,
-            'Content-Type: application/json'
-        ]);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
-            'q' => $search_query,
-            'num' => 10
-        ]));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        
-        $response = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curl_error = curl_error($ch);
-        curl_close($ch);
-        
-        $elapsed_time = round((microtime(true) - $start_time) * 1000); // ms
-        
-        if ($curl_error) {
-            @ob_end_clean();
-            echo json_encode([
-                'success' => false,
-                'error' => 'Connection error: ' . $curl_error,
-                'http_code' => 0,
-                'elapsed_ms' => $elapsed_time
-            ], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-        
-        $response_preview = substr($response, 0, 500);
-        
-        if ($http_code === 200) {
-            $data = json_decode($response, true);
-            $result_count = isset($data['organic']) ? count($data['organic']) : 0;
-            
-            @ob_end_clean();
-            echo json_encode([
-                'success' => true,
-                'message' => '✓ Connection successful!',
-                'http_code' => $http_code,
-                'elapsed_ms' => $elapsed_time,
-                'result_count' => $result_count,
-                'response_preview' => $response_preview
-            ], JSON_UNESCAPED_UNICODE);
-        } else {
-            @ob_end_clean();
-            echo json_encode([
-                'success' => false,
-                'error' => 'API returned HTTP ' . $http_code,
-                'http_code' => $http_code,
-                'elapsed_ms' => $elapsed_time,
-                'response_preview' => $response_preview
-            ], JSON_UNESCAPED_UNICODE);
-        }
-    } catch (Exception $e) {
-        @ob_end_clean();
-        echo json_encode([
-            'success' => false,
-            'error' => 'Internal error: ' . $e->getMessage()
-        ], JSON_UNESCAPED_UNICODE);
-    }
-    exit;
-}
+// MySQL connection optimizations
+ini_set('mysql.connect_timeout', '10');
+ini_set('mysqli.reconnect', '1');
 
 session_start();
 
-///////////////////////
-//  AUTHENTICATION SYSTEM
-///////////////////////
-// Check if user is logged in (skip for login, logout, install, and tracking actions)
-$publicActions = ['login', 'do_login', 'logout', 'install', 'do_install'];
-$trackingRequests = ['t' => ['open', 'click', 'unsubscribe']];
-$isPublicAction = isset($_GET['action']) && in_array($_GET['action'], $publicActions);
-$isTrackingRequest = isset($_GET['t']) && in_array($_GET['t'], $trackingRequests['t']);
-$isApiRequest = isset($_GET['api']);
+// ============================================================================
+// DATABASE CLASS
+// ============================================================================
 
-if (!$isPublicAction && !$isTrackingRequest && !$isApiRequest && PHP_SAPI !== 'cli') {
-    // Check if installation is complete
-    if (!defined('INSTALLED') || !INSTALLED) {
-        // Redirect to installation wizard
-        if (!isset($_GET['action']) || $_GET['action'] !== 'install') {
-            header('Location: ' . $_SERVER['SCRIPT_NAME'] . '?action=install');
-            exit;
-        }
-    } elseif (!isset($_SESSION['admin_logged_in']) || $_SESSION['admin_logged_in'] !== true) {
-        // Not logged in, show login page
-        if (!isset($_GET['action']) || $_GET['action'] !== 'login') {
-            header('Location: ' . $_SERVER['SCRIPT_NAME'] . '?action=login');
-            exit;
-        }
-    }
-}
-
-///////////////////////
-//  AUTHENTICATION HANDLERS
-///////////////////////
-if (isset($_GET['action']) && $_GET['action'] === 'do_login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = $_POST['username'] ?? '';
-    $password = $_POST['password'] ?? '';
+class Database {
+    private static ?PDO $pdo = null;
+    private static bool $migrated = false;
     
-    if (defined('ADMIN_USERNAME') && defined('ADMIN_PASSWORD_HASH')) {
-        if ($username === ADMIN_USERNAME && password_verify($password, ADMIN_PASSWORD_HASH)) {
-            $_SESSION['admin_logged_in'] = true;
-            $_SESSION['admin_username'] = $username;
-            header('Location: ' . $_SERVER['SCRIPT_NAME']);
-            exit;
-        }
-    }
-    
-    // Login failed
-    header('Location: ' . $_SERVER['SCRIPT_NAME'] . '?action=login&error=1');
-    exit;
-}
-
-if (isset($_GET['action']) && $_GET['action'] === 'logout') {
-    session_destroy();
-    header('Location: ' . $_SERVER['SCRIPT_NAME'] . '?action=login&logged_out=1');
-    exit;
-}
-
-// Show login page
-if (isset($_GET['action']) && $_GET['action'] === 'login') {
-    include_once 'login.php';
-    exit;
-}
-
-// Show installation wizard
-if (isset($_GET['action']) && $_GET['action'] === 'install') {
-    include_once 'install_wizard.php';
-    exit;
-}
-
-///////////////////////
-//  OPTIONAL SCHEMA (Job Profiles + Extraction Jobs)
-///////////////////////
-// Only run schema updates if PDO is connected and user is authenticated
-if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_logged_in'] === true)) {
-    try {
-        // Create extracted_emails table to store extracted emails
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS extracted_emails (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                job_id INT NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                source VARCHAR(500) DEFAULT NULL,
-                extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX(job_id),
-                INDEX(email)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-
-        // Create global settings table
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS settings (
-                setting_key VARCHAR(100) PRIMARY KEY,
-                setting_value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-
-        // Ensure job_profiles table exists (replacing sending_profiles)
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS job_profiles (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                profile_name VARCHAR(255) NOT NULL,
-                api_key TEXT NOT NULL,
-                search_query TEXT NOT NULL,
-                target_count INT DEFAULT 100,
-                filter_business_only TINYINT(1) DEFAULT 1,
-                country VARCHAR(100) DEFAULT '',
-                workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS . ",
-                emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER . ",
-                cycle_delay_ms INT NOT NULL DEFAULT " . DEFAULT_CYCLE_DELAY_MS . ",
-                active TINYINT(1) DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-
-        // Ensure jobs table exists (renamed from campaigns)
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                status VARCHAR(50) DEFAULT 'draft',
-                profile_id INT DEFAULT NULL,
-                target_count INT DEFAULT 100,
-                progress_extracted INT NOT NULL DEFAULT 0,
-                progress_total INT NOT NULL DEFAULT 0,
-                progress_status VARCHAR(50) DEFAULT 'draft',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                started_at TIMESTAMP NULL DEFAULT NULL,
-                completed_at TIMESTAMP NULL DEFAULT NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        ");
-
-        // Add job progress tracking fields if they don't exist
-        try { 
-            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_extracted INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_total INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress_status VARCHAR(50) DEFAULT 'draft'");
-            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS active_workers INT NOT NULL DEFAULT 0");
-            $pdo->exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT NULL");
-        } catch (Exception $e) {}
-
-        // Update rotation settings for extraction
-        try {
-            $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS);
-            $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER);
-        } catch (Exception $e) {}
+    public static function connect(): PDO {
+        global $DB_CONFIG;
         
-        // RETROACTIVE FIX: Convert stuck jobs to 'completed'
-        // Fix jobs that are 100% complete but stuck at 'extracting' status
-        try {
-            $pdo->exec("
-                UPDATE jobs 
-                SET status = 'completed', 
-                    completed_at = COALESCE(completed_at, NOW()),
-                    progress_status = 'completed'
-                WHERE status IN ('extracting', 'queued')
-                  AND progress_total > 0
-                  AND progress_extracted >= progress_total
-                  AND progress_extracted > 0
-            ");
-            
-            // Also fix jobs where progress_status is 'completed' but main status is not 'completed'
-            // Only apply to jobs that have actually completed extraction (completed_at is set)
-            $pdo->exec("
-                UPDATE jobs 
-                SET status = 'completed'
-                WHERE progress_status = 'completed'
-                  AND status != 'completed'
-                  AND completed_at IS NOT NULL
-            ");
-        } catch (Exception $e) {
-            error_log("Retroactive job fix error: " . $e->getMessage());
-        }
-    } catch (Exception $e) {
-        // Log error but don't stop execution
-        error_log("Schema update error: " . $e->getMessage());
-    }
-}
-
-///////////////////////
-//  HELPERS
-///////////////////////
-function h($s) {
-    return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
-}
-
-function uuidv4()
-{
-    $data = random_bytes(16);
-    $data[6] = chr((ord($data[6]) & 0x0f) | 0x40);
-    $data[8] = chr((ord($data[8]) & 0x3f) | 0x80);
-    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
-}
-
-function base64url_encode(string $data): string {
-    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
-}
-
-function base64url_decode(string $data): string {
-    $data = strtr($data, '-_', '+/');
-    return base64_decode($data);
-}
-
-function get_base_url(): string {
-    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    $script = $_SERVER['SCRIPT_NAME'] ?? '/mailer.php';
-    return $scheme . '://' . $host . $script;
-}
-
-function encode_mime_header(string $str): string {
-    if ($str === '') return '';
-    
-    // Check if string contains any non-ASCII characters or special characters that need encoding
-    // According to RFC 2047, we need to encode if there are:
-    // - Non-ASCII characters (outside \x20-\x7E range)
-    // - Special characters like quotes, parentheses, backslashes, etc.
-    // - Characters that have special meaning in email headers
-    
-    // Check for any character that requires encoding:
-    // - Any byte > 127 (non-ASCII, includes UTF-8 multibyte chars, emojis, symbols)
-    // - Special RFC 5322 characters: ( ) < > @ , ; : \ " [ ]
-    // - Control characters (< \x20)
-    if (preg_match('/[\x00-\x1F\x7F-\xFF()<>@,;:\\\"\[\]]/', $str)) {
-        // Use RFC 2047 Base64 encoding for the entire string
-        // Format: =?charset?encoding?encoded-text?=
-        // We use UTF-8 charset and Base64 (B) encoding
-        
-        // RFC 2047 recommends that encoded-words should not be longer than 75 characters
-        // If the string is very long, we may need to split it, but for sender names
-        // this is typically not an issue as they're usually short
-        
-        $encoded = base64_encode($str);
-        
-        // Check if we need to split into multiple encoded-words
-        // Each encoded-word has overhead: =?UTF-8?B? (11 chars) + ?= (2 chars) = 13 chars
-        // So we have 75 - 13 = 62 characters available for the encoded content
-        $maxEncodedLength = 62;
-        
-        if (strlen($encoded) <= $maxEncodedLength) {
-            // Single encoded-word is sufficient
-            return '=?UTF-8?B?' . $encoded . '?=';
-        }
-        
-        // For very long strings, split into multiple encoded-words
-        // Each chunk should be on a valid UTF-8 boundary
-        // Use mb_substr for safe UTF-8 character boundary detection
-        
-        // Calculate chunk size in original bytes that fits in maxEncodedLength base64 chars
-        // Base64 encoding increases size by 4/3, so original size = maxEncodedLength * 3/4
-        $chunkSize = (int)floor($maxEncodedLength * 3 / 4);
-        
-        // Split the string using mb_substr to respect UTF-8 character boundaries
-        $chunks = [];
-        $strLenChars = mb_strlen($str, 'UTF-8');
-        $offset = 0;
-        
-        while ($offset < $strLenChars) {
-            // Calculate how many UTF-8 characters we can fit
-            // Start with an estimate and adjust based on byte length
-            $chunkChars = $chunkSize;
-            $chunk = mb_substr($str, $offset, $chunkChars, 'UTF-8');
-            
-            // If chunk is too large in bytes, reduce character count
-            while (strlen($chunk) > $chunkSize && $chunkChars > 1) {
-                $chunkChars--;
-                $chunk = mb_substr($str, $offset, $chunkChars, 'UTF-8');
-            }
-            
-            // Ensure we make progress (at least 1 character)
-            if (mb_strlen($chunk, 'UTF-8') === 0) {
-                $chunk = mb_substr($str, $offset, 1, 'UTF-8');
-            }
-            
-            $chunks[] = $chunk;
-            $offset += mb_strlen($chunk, 'UTF-8');
-        }
-        
-        // Encode each chunk and join with CRLF + space for RFC 5322 compliance
-        // This ensures proper folding for long headers
-        $encodedWords = [];
-        foreach ($chunks as $chunk) {
-            $encodedWords[] = '=?UTF-8?B?' . base64_encode($chunk) . '?=';
-        }
-        
-        // Use space as separator (simpler and works for most email clients)
-        // For extremely long headers, CRLF folding would be: implode("\r\n ", $encodedWords)
-        return implode(' ', $encodedWords);
-    }
-    
-    // String contains only safe ASCII characters, return as-is
-    return $str;
-}
-
-function is_unsubscribed(PDO $pdo, string $email): bool {
-    if ($email === '') return false;
-    try {
-        $stmt = $pdo->prepare("SELECT 1 FROM unsubscribes WHERE email = ? LIMIT 1");
-        $stmt->execute([strtolower($email)]);
-        return (bool)$stmt->fetchColumn();
-    } catch (Exception $e) {
-        return false;
-    }
-}
-
-function add_to_unsubscribes(PDO $pdo, string $email) {
-    if ($email === '') return;
-    try {
-        $stmt = $pdo->prepare("INSERT IGNORE INTO unsubscribes (email) VALUES (?)");
-        $stmt->execute([strtolower($email)]);
-    } catch (Exception $e) {
-        // ignore
-    }
-}
-
-/**
- * Try to execute a background command using several strategies.
- * Returns true if a background launch was attempted and likely succeeded.
- */
-function try_background_exec(string $cmd): bool {
-    $cmd = trim($cmd);
-    if ($cmd === '') return false;
-
-    // Windows: try start /B
-    if (stripos(PHP_OS, 'WIN') === 0) {
-        // Note: Windows background execution is less reliable here; we attempt it.
-        $winCmd = "start /B " . $cmd;
-        @pclose(@popen($winCmd, "r"));
-        return true;
-    }
-
-    // Prefer proc_open if available
-    if (function_exists('proc_open')) {
-        $descriptors = [
-            0 => ["pipe", "r"],
-            1 => ["file", "/dev/null", "a"],
-            2 => ["file", "/dev/null", "a"],
-        ];
-        $process = @proc_open($cmd, $descriptors, $pipes);
-        if (is_resource($process)) {
-            @proc_close($process);
-            return true;
-        }
-    }
-
-    // Try exec with async redirection
-    if (function_exists('exec')) {
-        @exec($cmd . " > /dev/null 2>&1 &");
-        return true;
-    }
-
-    // Try shell_exec
-    if (function_exists('shell_exec')) {
-        @shell_exec($cmd . " > /dev/null 2>&1 &");
-        return true;
-    }
-
-    // Try popen
-    if (function_exists('popen')) {
-        @pclose(@popen($cmd . " > /dev/null 2>&1 &", "r"));
-        return true;
-    }
-
-    // No method available
-    return false;
-}
-
-/**
- * Spawn a detached background PHP process that runs this script with --bg-send
- * Returns true if spawn was likely successful.
- */
-function spawn_background_send(PDO $pdo, int $campaignId, string $recipientsText, array $overrides = []): bool {
-    $tmpDir = sys_get_temp_dir();
-    $tmpFile = tempnam($tmpDir, 'ss_send_');
-    if ($tmpFile === false) return false;
-    $payload = ['recipients' => $recipientsText, 'overrides' => $overrides];
-    if (file_put_contents($tmpFile, json_encode($payload)) === false) {
-        @unlink($tmpFile);
-        return false;
-    }
-
-    $php = PHP_BINARY ?: 'php';
-    $script = $_SERVER['SCRIPT_FILENAME'] ?? __FILE__;
-    // Build command for UNIX-like systems; quoted args
-    $cmd = escapeshellcmd($php) . ' -f ' . escapeshellarg($script)
-         . ' -- ' . '--bg-send ' . escapeshellarg((string)$campaignId) . ' ' . escapeshellarg($tmpFile);
-
-    // Try variants: with nohup, with & redirect, etc.
-    $candidates = [
-        $cmd . " > /dev/null 2>&1 &",
-        "nohup " . $cmd . " > /dev/null 2>&1 &",
-        $cmd, // fallback
-    ];
-
-    foreach ($candidates as $c) {
-        if (try_background_exec($c)) {
-            // the CLI worker will remove the tmpfile after processing; but if spawn failed and we decide to fallback
-            return true;
-        }
-    }
-
-    // if none worked, cleanup and return false (caller will fallback to synchronous send)
-    @unlink($tmpFile);
-    return false;
-}
-
-/**
- * Spawn a detached background PHP process that runs this script with --bg-send-profile <campaignId> <profileId> <tmpfile>
- * Returns true if spawn was likely successful.
- *
- * Accepts $overrides array which will be written to the tmpfile JSON so the CLI worker can apply runtime overrides
- * such as 'send_rate' (messages/sec).
- */
-function spawn_background_send_profile(PDO $pdo, int $campaignId, int $profileId, string $recipientsText, array $overrides = []): bool {
-    $tmpDir = sys_get_temp_dir();
-    $tmpFile = tempnam($tmpDir, 'ss_send_pf_');
-    if ($tmpFile === false) return false;
-    $payload = ['recipients' => $recipientsText, 'overrides' => $overrides];
-    if (file_put_contents($tmpFile, json_encode($payload)) === false) {
-        @unlink($tmpFile);
-        return false;
-    }
-
-    $php = PHP_BINARY ?: 'php';
-    $script = $_SERVER['SCRIPT_FILENAME'] ?? __FILE__;
-    $cmd = escapeshellcmd($php) . ' -f ' . escapeshellarg($script)
-         . ' -- ' . '--bg-send-profile ' . escapeshellarg((string)$campaignId) . ' ' . escapeshellarg((string)$profileId) . ' ' . escapeshellarg($tmpFile);
-
-    $candidates = [
-        $cmd . " > /dev/null 2>&1 &",
-        "nohup " . $cmd . " > /dev/null 2>&1 &",
-        $cmd,
-    ];
-
-    foreach ($candidates as $c) {
-        if (try_background_exec($c)) {
-            return true;
-        }
-    }
-
-    @unlink($tmpFile);
-    return false;
-}
-
-/**
- * Spawn multiple parallel workers for sending emails
- * Spawns the specified number of workers (or fewer if there are fewer recipients than workers)
- * Distributes recipients evenly across workers
- */
-function spawn_parallel_workers(PDO $pdo, int $campaignId, array $recipients, int $workers, int $messagesPerWorker, ?int $profileId = null, array $overrides = [], int $cycleDelayMs = 0): array {
-    $totalRecipients = count($recipients);
-    if ($totalRecipients === 0) return ['success' => true, 'workers' => 0];
-    
-    // Validate workers parameter - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
-    // Only enforces minimum of 1 worker
-    $workers = max(MIN_WORKERS, $workers);
-    
-    // OPTIONAL logging for monitoring (NOT a limit - just informational)
-    if ($workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Large worker count ($workers) for campaign $campaignId. This is NOT an error - just monitoring.");
-    }
-    
-    $messagesPerWorker = max(MIN_MESSAGES_PER_WORKER, $messagesPerWorker);
-    $cycleDelayMs = max(MIN_CYCLE_DELAY_MS, min(MAX_CYCLE_DELAY_MS, $cycleDelayMs));
-    
-    // Spawn up to $workers parallel workers (but not more than total recipients)
-    $actualWorkers = min($workers, $totalRecipients);
-    
-    // Distribute recipients across workers in chunks of messagesPerWorker
-    // If messagesPerWorker is small, each worker gets multiple small batches in round-robin fashion
-    // If messagesPerWorker is large, we may need fewer workers
-    
-    $spawnedWorkers = 0;
-    $failures = [];
-    
-    // Distribute all recipients across actualWorkers in a round-robin fashion
-    // Each "round" gives each worker up to messagesPerWorker emails
-    $workerRecipients = array_fill(0, $actualWorkers, []);
-    
-    $recipientIdx = 0;
-    $roundCount = 0;
-    while ($recipientIdx < $totalRecipients) {
-        // Apply cycle delay between rounds (except for the first round)
-        if ($roundCount > 0 && $cycleDelayMs > 0) {
-            usleep($cycleDelayMs * 1000); // Convert milliseconds to microseconds
-        }
-        
-        for ($workerIdx = 0; $workerIdx < $actualWorkers && $recipientIdx < $totalRecipients; $workerIdx++) {
-            // Give this worker up to messagesPerWorker emails in this round
-            $chunkSize = min($messagesPerWorker, $totalRecipients - $recipientIdx);
-            $chunk = array_slice($recipients, $recipientIdx, $chunkSize);
-            $workerRecipients[$workerIdx] = array_merge($workerRecipients[$workerIdx], $chunk);
-            $recipientIdx += $chunkSize;
-        }
-        
-        $roundCount++;
-    }
-    
-    // Now spawn workers with their allocated recipients
-    foreach ($workerRecipients as $workerIdx => $recips) {
-        if (empty($recips)) continue;
-        
-        $chunkText = implode("\n", $recips);
-        
-        if ($profileId !== null) {
-            $spawned = spawn_background_send_profile($pdo, $campaignId, $profileId, $chunkText, $overrides);
-        } else {
-            $spawned = spawn_background_send($pdo, $campaignId, $chunkText, $overrides);
-        }
-        
-        if ($spawned) {
-            $spawnedWorkers++;
-        } else {
-            $failures[] = ['chunk' => $recips, 'profileId' => $profileId, 'overrides' => $overrides];
-        }
-    }
-    
-    return [
-        'success' => empty($failures),
-        'workers' => $spawnedWorkers,
-        'failures' => $failures
-    ];
-}
-
-/**
- * Spawn a detached background PHP process to scan IMAP bounce mailboxes
- */
-function spawn_bounce_scan(PDO $pdo): bool {
-    $php = PHP_BINARY ?: 'php';
-    $script = $_SERVER['SCRIPT_FILENAME'] ?? __FILE__;
-    $cmd = escapeshellcmd($php) . ' -f ' . escapeshellarg($script)
-         . ' -- ' . '--bg-scan-bounces';
-
-    $candidates = [
-        $cmd . " > /dev/null 2>&1 &",
-        "nohup " . $cmd . " > /dev/null 2>&1 &",
-        $cmd,
-    ];
-
-    foreach ($candidates as $c) {
-        if (try_background_exec($c)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Spawn a detached background PHP process to extract emails for a job
- * Returns true if spawn was likely successful.
- */
-function spawn_extraction_worker(PDO $pdo, int $jobId): bool {
-    $php = PHP_BINARY ?: 'php';
-    $script = $_SERVER['SCRIPT_FILENAME'] ?? __FILE__;
-    
-    // Build command for background extraction
-    $cmd = escapeshellcmd($php) . ' -f ' . escapeshellarg($script)
-         . ' -- ' . '--bg-extract ' . escapeshellarg((string)$jobId);
-    
-    // Try variants: with nohup, with & redirect, etc.
-    $candidates = [
-        $cmd . " > /dev/null 2>&1 &",
-        "nohup " . $cmd . " > /dev/null 2>&1 &",
-        $cmd,
-    ];
-    
-    foreach ($candidates as $c) {
-        if (try_background_exec($c)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Perform parallel email extraction using multiple workers
- * Each worker makes independent API calls to maximize speed
- */
-function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
-    error_log("PARALLEL_EXTRACTION: ========== STARTING for job_id={$jobId} ==========");
-    error_log("PARALLEL_EXTRACTION: Job data: " . json_encode($job));
-    error_log("PARALLEL_EXTRACTION: Profile data: " . json_encode($profile));
-    
-    try {
-        // Update status to extracting
-        $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting' WHERE id = ?");
-        $stmt->execute([$jobId]);
-        
-        // Get extraction parameters
-        $apiKey = $profile['api_key'] ?? '';
-        $searchQuery = $profile['search_query'] ?? '';
-        $country = $profile['country'] ?? '';
-        $businessOnly = !empty($profile['filter_business_only']);
-        $targetCount = (int)($profile['target_count'] ?? 100);  // Always use profile's target
-        $workers = max(1, (int)($profile['workers'] ?? 4));
-        
-        error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}'");
-        
-        // Set active_workers count EARLY so UI shows workers are starting
-        $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, active_workers = ? WHERE id = ?");
-        $stmt->execute([$targetCount, $workers, $jobId]);
-        error_log("PARALLEL_EXTRACTION: Set active_workers={$workers} for job {$jobId}");
-        
-        if (empty($apiKey) || empty($searchQuery)) {
-            throw new Exception("API key or search query is missing");
-        }
-        
-        // Each worker requests a fixed optimal number of results per API call
-        // This ensures we get enough results to find emails regardless of target count
-        // serper.dev returns max 100 results per call, so we use 50-100 for efficiency
-        $resultsPerWorkerCall = 100; // Fixed optimal value for best results
-        
-        error_log("PARALLEL_EXTRACTION: Each worker will request {$resultsPerWorkerCall} results per call");
-        
-        $extractedCount = 0;
-        $attempts = 0;
-        $maxAttempts = $workers * 5; // Allow multiple rounds per worker
-        $pageOffset = 0;
-        
-        // Store diagnostic info in database (fallback when error_log not available)
-        $diagMsg = "DIAGNOSTIC: Loop vars: extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}\n";
-        $diagMsg .= "DIAGNOSTIC: Condition: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")";
-        $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
-        $stmt->execute([$diagMsg, $jobId]);
-        
-        error_log("PARALLEL_EXTRACTION: Loop variables - extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}");
-        error_log("PARALLEL_EXTRACTION: While condition check: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")");
-        
-        // Parallel extraction loop - all workers work simultaneously
-        while ($extractedCount < $targetCount && $attempts < $maxAttempts) {
-            // Update diagnostic in database
-            $diagMsg .= "\nDIAGNOSTIC: Round {$attempts} started";
-            $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
-            $stmt->execute([$diagMsg, $jobId]);
-            
-            error_log("PARALLEL_EXTRACTION: ===== ROUND {$attempts} START =====");
-            $workerResults = [];
-            
-            // Spawn all workers in parallel using curl_multi
-            for ($workerNum = 0; $workerNum < $workers && $extractedCount < $targetCount; $workerNum++) {
-                $workerResults[] = [
-                    'worker_id' => $workerNum,
-                    'page' => $pageOffset + $workerNum
-                ];
-            }
-            
-            // Execute all API calls in parallel
-            $multiHandle = curl_multi_init();
-            $curlHandles = [];
-            
-            foreach ($workerResults as $idx => $workerInfo) {
-                $ch = curl_init();
-                $payload = [
-                    'q' => $searchQuery,
-                    'num' => $resultsPerWorkerCall,
-                    'page' => $workerInfo['page']
-                ];
-                
-                if ($country !== '') {
-                    $payload['gl'] = $country;
-                }
-                
-                curl_setopt($ch, CURLOPT_URL, 'https://google.serper.dev/search');
-                curl_setopt($ch, CURLOPT_POST, true);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                    'X-API-KEY: ' . $apiKey,
-                    'Content-Type: application/json'
+        if (self::$pdo === null) {
+            try {
+                $dsn = "mysql:host={$DB_CONFIG['host']};dbname={$DB_CONFIG['database']};charset=utf8mb4";
+                self::$pdo = new PDO($dsn, $DB_CONFIG['username'], $DB_CONFIG['password'], [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false
                 ]);
-                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
                 
-                curl_multi_add_handle($multiHandle, $ch);
-                $curlHandles[$idx] = $ch;
-            }
-            
-            // Execute all requests in parallel
-            $running = null;
-            do {
-                curl_multi_exec($multiHandle, $running);
-                curl_multi_select($multiHandle);
-            } while ($running > 0);
-            
-            // Process results from all workers
-            $roundEmails = 0;
-            foreach ($curlHandles as $idx => $ch) {
-                $response = curl_multi_getcontent($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                $curlError = curl_error($ch);
-                
-                error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode}, Response length: " . strlen($response));
-                
-                if ($curlError) {
-                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - CURL ERROR: {$curlError}");
+                // Run migrations if not already done
+                if (!self::$migrated) {
+                    self::runMigrations();
+                    self::$migrated = true;
                 }
-                
-                if ($httpCode === 200 && $response) {
-                    $data = json_decode($response, true);
-                    if ($data === null) {
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - JSON decode failed! Response: " . substr($response, 0, 500));
-                    } elseif (!isset($data['organic'])) {
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - No 'organic' field in response. Keys: " . implode(', ', array_keys($data)));
-                        if (isset($data['error'])) {
-                            error_log("PARALLEL_EXTRACTION: Worker {$idx} - API ERROR: " . json_encode($data['error']));
-                        }
-                    } else {
-                        $organicCount = count($data['organic']);
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Found {$organicCount} organic results");
-                        
-                        $emails = extract_emails_from_results($data['organic'], $businessOnly);
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results");
-                        
-                        // Insert emails into database
-                        foreach ($emails as $emailData) {
-                            if ($extractedCount >= $targetCount) break;
-                            
-                            try {
-                                $stmt = $pdo->prepare("INSERT IGNORE INTO extracted_emails (job_id, email, source, extracted_at) VALUES (?, ?, ?, NOW())");
-                                $stmt->execute([
-                                    $jobId,
-                                    $emailData['email'],
-                                    $emailData['source'] ?? ''
-                                ]);
-                                
-                                if ($stmt->rowCount() > 0) {
-                                    $extractedCount++;
-                                    $roundEmails++;
-                                    
-                                    // Update progress every 5 emails for responsiveness
-                                    if ($extractedCount % 5 === 0) {
-                                        $stmt = $pdo->prepare("UPDATE jobs SET progress_extracted = ? WHERE id = ?");
-                                        $stmt->execute([$extractedCount, $jobId]);
-                                    }
-                                }
-                            } catch (Exception $e) {
-                                // Skip duplicates
-                                error_log("PARALLEL_EXTRACTION: Worker {$idx} - Duplicate email: " . $emailData['email']);
-                                continue;
-                            }
-                        }
-                    }
-                } else {
-                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode} or empty response");
-                }
-                
-                curl_multi_remove_handle($multiHandle, $ch);
-                curl_close($ch);
+            } catch (PDOException $e) {
+                die('Database connection failed: ' . $e->getMessage());
             }
-            
-            curl_multi_close($multiHandle);
-            
-            error_log("PARALLEL_EXTRACTION: Round {$attempts} - extracted {$roundEmails} emails (total: {$extractedCount}/{$targetCount})");
-            
-            // If no emails extracted in this round, stop
-            if ($roundEmails === 0) {
-                error_log("PARALLEL_EXTRACTION: No new emails found, stopping");
-                break;
-            }
-            
-            $attempts++;
-            $pageOffset += $workers;
         }
         
-        // Update final worker count
-        $stmt = $pdo->prepare("UPDATE jobs SET active_workers = 0 WHERE id = ?");
-        $stmt->execute([$jobId]);
-        
-        // Check if we extracted any emails
-        if ($extractedCount === 0) {
-            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$attempts} attempts with {$workers} workers");
-            
-            $errorMsg = "No emails found in search results after {$attempts} API calls.\n\n";
-            $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
-            $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
-            $errorMsg .= "Business Only Filter: " . ($businessOnly ? "Enabled" : "Disabled") . "\n";
-            $errorMsg .= "Workers Used: {$workers}\n";
-            $errorMsg .= "API Calls Made: {$attempts}\n\n";
-            $errorMsg .= "Possible reasons:\n";
-            $errorMsg .= "1. The search query returns no results with email addresses\n";
-            $errorMsg .= "2. All emails filtered out (Business Only excludes gmail.com, yahoo.com, etc.)\n";
-            $errorMsg .= "3. API key may be invalid or rate limited\n";
-            $errorMsg .= "4. Network connectivity issues\n\n";
-            $errorMsg .= "Suggestions:\n";
-            $errorMsg .= "- Try a more specific search query (e.g., 'company contact email')\n";
-            $errorMsg .= "- Try a different location or industry\n";
-            $errorMsg .= "- Disable 'Business Only' filter to include all emails\n";
-            $errorMsg .= "- Check server error.log for API response details\n";
-            $errorMsg .= "- Verify API key at serper.dev/dashboard\n";
-            
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
-            $stmt->execute([$errorMsg, $jobId]);
-            error_log("PARALLEL_EXTRACTION: Job {$jobId} failed with 0 emails - detailed error message stored in database");
-            return; // Exit gracefully without throwing exception (detailed error already stored in DB)
-        }
-        
-        // Mark job as completed
-        $stmt = $pdo->prepare("UPDATE jobs SET status = 'completed', progress_status = 'completed', progress_extracted = ?, completed_at = NOW(), active_workers = 0 WHERE id = ?");
-        $stmt->execute([$extractedCount, $jobId]);
-        
-        error_log("PARALLEL_EXTRACTION: Job {$jobId} completed. Extracted {$extractedCount} emails using {$workers} parallel workers.");
-        
-    } catch (Throwable $e) {
-        error_log("PARALLEL_EXTRACTION: EXCEPTION - " . $e->getMessage());
-        error_log("PARALLEL_EXTRACTION: Stack trace - " . $e->getTraceAsString());
-        try {
-            // Store the detailed exception message with context
-            $errorDetails = "System Exception: " . $e->getMessage() . "\n\n";
-            $errorDetails .= "Location: " . $e->getFile() . " (Line " . $e->getLine() . ")\n\n";
-            $errorDetails .= "This is a system-level error. Common causes:\n";
-            $errorDetails .= "1. Invalid or expired API key\n";
-            $errorDetails .= "2. No internet connectivity from server\n";
-            $errorDetails .= "3. Database connection issue\n";
-            $errorDetails .= "4. Missing required profile fields\n\n";
-            $errorDetails .= "Check server error.log for full stack trace and details.\n";
-            
-            $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
-            $stmt->execute([$errorDetails, $jobId]);
-        } catch (Exception $e2) {
-            error_log("PARALLEL_EXTRACTION: Failed to save error message - " . $e2->getMessage());
-        }
-        // Don't re-throw - allow graceful exit so error message stays in DB
+        return self::$pdo;
     }
-}
-
-/**
- * Extract emails from search result array
- */
-function extract_emails_from_results(array $results, bool $businessOnly = true): array {
-    $emails = [];
-    $emailSet = []; // Use associative array for O(1) duplicate checking
-    $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
     
-    foreach ($results as $result) {
-        $text = '';
-        if (isset($result['snippet'])) $text .= ' ' . $result['snippet'];
-        if (isset($result['title'])) $text .= ' ' . $result['title'];
-        if (isset($result['link'])) $text .= ' ' . $result['link'];
-        
-        if (preg_match_all($emailPattern, $text, $matches)) {
-            foreach ($matches[0] as $email) {
-                $email = strtolower($email);
+    private static function runMigrations(): void {
+        try {
+            // Migration: Add country and email_filter columns to jobs table if they don't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'country'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN country VARCHAR(100) AFTER max_results");
+                self::$pdo->exec("ALTER TABLE jobs ADD INDEX idx_country (country)");
+            }
+            
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'email_filter'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN email_filter VARCHAR(50) AFTER country");
+            }
+            
+            // Migration: Add error_message column to jobs table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM jobs LIKE 'error_message'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE jobs ADD COLUMN error_message TEXT DEFAULT NULL AFTER progress");
+            }
+            
+            // Migration: Create emails table if it doesn't exist (rename from results)
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'emails'");
+            if ($stmt->rowCount() === 0) {
+                // Check if old results table exists
+                $stmt = self::$pdo->query("SHOW TABLES LIKE 'results'");
+                if ($stmt->rowCount() > 0) {
+                    // Rename old table
+                    self::$pdo->exec("RENAME TABLE results TO results_backup");
+                }
                 
-                $atPos = strpos($email, '@');
-                if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
+                // Create new emails table
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS emails (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        job_id INT NOT NULL,
+                        email VARCHAR(500) NOT NULL,
+                        email_hash VARCHAR(64) UNIQUE,
+                        domain VARCHAR(255),
+                        country VARCHAR(100),
+                        source_url VARCHAR(1000),
+                        source_title TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                        INDEX idx_job (job_id),
+                        INDEX idx_hash (email_hash),
+                        INDEX idx_domain (domain),
+                        INDEX idx_country (country)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
+            
+            // Migration: Add worker statistics columns if they don't exist
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM workers LIKE 'pages_processed'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN pages_processed INT DEFAULT 0 AFTER last_heartbeat");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN emails_extracted INT DEFAULT 0 AFTER pages_processed");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN runtime_seconds INT DEFAULT 0 AFTER emails_extracted");
+            }
+            
+            // Migration: Create job_queue table if it doesn't exist
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'job_queue'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS job_queue (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        job_id INT NOT NULL,
+                        start_offset INT NOT NULL,
+                        max_results INT NOT NULL,
+                        status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+                        worker_id INT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP NULL,
+                        completed_at TIMESTAMP NULL,
+                        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                        INDEX idx_status (status),
+                        INDEX idx_job (job_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
+            
+            // Migration: Create worker_errors table for error tracking
+            $stmt = self::$pdo->query("SHOW TABLES LIKE 'worker_errors'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("
+                    CREATE TABLE IF NOT EXISTS worker_errors (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        worker_id INT NULL,
+                        job_id INT NULL,
+                        error_type VARCHAR(100),
+                        error_message TEXT,
+                        error_details TEXT,
+                        severity ENUM('warning', 'error', 'critical') DEFAULT 'error',
+                        resolved BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_worker (worker_id),
+                        INDEX idx_job (job_id),
+                        INDEX idx_severity (severity),
+                        INDEX idx_resolved (resolved)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                ");
+            }
+            
+            // Migration: Add error_count column to workers table
+            $stmt = self::$pdo->query("SHOW COLUMNS FROM workers LIKE 'error_count'");
+            if ($stmt->rowCount() === 0) {
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN error_count INT DEFAULT 0 AFTER runtime_seconds");
+                self::$pdo->exec("ALTER TABLE workers ADD COLUMN last_error TEXT AFTER error_count");
+            }
+        } catch (PDOException $e) {
+            error_log('Migration error: ' . $e->getMessage());
+            // Don't die on migration errors, just log them
+        }
+    }
+    
+    public static function testConnection(string $host, string $db, string $user, string $pass): array {
+        try {
+            // Try different host formats for better compatibility
+            $hosts = [$host];
+            if ($host === 'localhost') {
+                $hosts = ['localhost', '127.0.0.1', 'localhost:/tmp/mysql.sock', 'localhost:/var/run/mysqld/mysqld.sock'];
+            }
+            
+            $lastError = '';
+            $pdo = null;
+            
+            foreach ($hosts as $tryHost) {
+                try {
+                    $dsn = "mysql:host={$tryHost};charset=utf8mb4";
+                    $pdo = new PDO($dsn, $user, $pass, [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+                    ]);
+                    break; // Connection successful
+                } catch (PDOException $e) {
+                    $lastError = $e->getMessage();
                     continue;
                 }
-                
-                if ($businessOnly) {
-                    $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
-                    $domain = substr($email, $atPos + 1);
-                    if (in_array($domain, $freeProviders)) {
-                        continue;
-                    }
-                }
-                
-                // Check if email already in set (O(1) lookup)
-                if (!isset($emailSet[$email])) {
-                    $emailSet[$email] = true;
-                    $emails[] = [
-                        'email' => $email,
-                        'source' => $result['link'] ?? ''
-                    ];
-                }
             }
+            
+            if (!$pdo) {
+                return ['success' => false, 'error' => 'Connection failed: ' . $lastError];
+            }
+            
+            // Create database if not exists
+            try {
+                $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            } catch (PDOException $e) {
+                return ['success' => false, 'error' => 'Cannot create database. User may lack CREATE DATABASE privilege: ' . $e->getMessage()];
+            }
+            
+            $pdo->exec("USE `{$db}`");
+            
+            // Create tables
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(100) UNIQUE NOT NULL,
+                    password VARCHAR(255) NOT NULL,
+                    email VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    query VARCHAR(500) NOT NULL,
+                    api_key VARCHAR(255) NOT NULL,
+                    max_results INT DEFAULT 100,
+                    country VARCHAR(100),
+                    email_filter VARCHAR(50),
+                    status ENUM('pending', 'running', 'completed', 'failed') DEFAULT 'pending',
+                    progress INT DEFAULT 0,
+                    error_message TEXT DEFAULT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    INDEX idx_status (status),
+                    INDEX idx_created (created_at),
+                    INDEX idx_country (country)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS emails (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    job_id INT NOT NULL,
+                    email VARCHAR(500) NOT NULL,
+                    email_hash VARCHAR(64) UNIQUE,
+                    domain VARCHAR(255),
+                    country VARCHAR(100),
+                    source_url VARCHAR(1000),
+                    source_title TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                    INDEX idx_job (job_id),
+                    INDEX idx_hash (email_hash),
+                    INDEX idx_domain (domain),
+                    INDEX idx_country (country)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS bloomfilter (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    hash VARCHAR(64) UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_hash (hash)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS workers (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    worker_name VARCHAR(100) UNIQUE NOT NULL,
+                    status ENUM('idle', 'running', 'stopped') DEFAULT 'idle',
+                    current_job_id INT NULL,
+                    last_heartbeat TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    pages_processed INT DEFAULT 0,
+                    emails_extracted INT DEFAULT 0,
+                    runtime_seconds INT DEFAULT 0,
+                    error_count INT DEFAULT 0,
+                    last_error TEXT,
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS settings (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    setting_key VARCHAR(100) UNIQUE NOT NULL,
+                    setting_value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS job_queue (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    job_id INT NOT NULL,
+                    start_offset INT NOT NULL,
+                    max_results INT NOT NULL,
+                    status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+                    worker_id INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP NULL,
+                    completed_at TIMESTAMP NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                    INDEX idx_status (status),
+                    INDEX idx_job (job_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS worker_errors (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    worker_id INT NULL,
+                    job_id INT NULL,
+                    error_type VARCHAR(100),
+                    error_message TEXT,
+                    error_details TEXT,
+                    severity ENUM('warning', 'error', 'critical') DEFAULT 'error',
+                    resolved BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_worker (worker_id),
+                    INDEX idx_job (job_id),
+                    INDEX idx_severity (severity),
+                    INDEX idx_resolved (resolved)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+            
+            return ['success' => true, 'error' => null];
+            
+        } catch (PDOException $e) {
+            return ['success' => false, 'error' => $e->getMessage()];
         }
     }
     
-    return $emails;
-}
-
-/**
- * Perform email extraction for a job (called from fastcgi_finish_request or background worker)
- * This is the core extraction logic, similar to send_campaign_real in the old system
- */
-function perform_extraction(PDO $pdo, int $jobId, array $job, array $profile): void {
-    // Use new parallel extraction system
-    perform_parallel_extraction($pdo, $jobId, $job, $profile);
-}
-
-/**
- * Get a global setting value
- */
-function get_setting(PDO $pdo, string $key, string $default = ''): string {
-    try {
-        $stmt = $pdo->prepare("SELECT setting_value FROM settings WHERE setting_key = ?");
-        $stmt->execute([$key]);
-        $result = $stmt->fetch(PDO::FETCH_ASSOC);
-        return $result ? $result['setting_value'] : $default;
-    } catch (Exception $e) {
-        return $default;
+    public static function install(string $host, string $db, string $user, string $pass, string $adminUser, string $adminPass, string $adminEmail): array {
+        $result = self::testConnection($host, $db, $user, $pass);
+        
+        if (!$result['success']) {
+            return $result;
+        }
+        
+        // Create admin user
+        try {
+            // Try different host formats
+            $hosts = [$host];
+            if ($host === 'localhost') {
+                $hosts = ['localhost', '127.0.0.1', 'localhost:/tmp/mysql.sock', 'localhost:/var/run/mysqld/mysqld.sock'];
+            }
+            
+            $pdo = null;
+            foreach ($hosts as $tryHost) {
+                try {
+                    $dsn = "mysql:host={$tryHost};dbname={$db};charset=utf8mb4";
+                    $pdo = new PDO($dsn, $user, $pass, [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+                    ]);
+                    break;
+                } catch (PDOException $e) {
+                    continue;
+                }
+            }
+            
+            if (!$pdo) {
+                return ['success' => false, 'error' => 'Could not reconnect to database after table creation'];
+            }
+            
+            // Check if admin already exists
+            $stmt = $pdo->prepare("SELECT COUNT(*) as count FROM users WHERE username = ?");
+            $stmt->execute([$adminUser]);
+            $count = $stmt->fetch()['count'];
+            
+            if ($count > 0) {
+                return ['success' => false, 'error' => 'Admin user already exists. System may already be installed.'];
+            }
+            
+            $hashedPassword = password_hash($adminPass, PASSWORD_BCRYPT);
+            $stmt = $pdo->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)");
+            $stmt->execute([$adminUser, $hashedPassword, $adminEmail]);
+            
+            // Update config in file
+            self::updateConfig($host, $db, $user, $pass);
+            
+            return ['success' => true, 'error' => null];
+        } catch (PDOException $e) {
+            return ['success' => false, 'error' => 'Failed to create admin user: ' . $e->getMessage()];
+        } catch (Exception $e) {
+            return ['success' => false, 'error' => $e->getMessage()];
+        }
+    }
+    
+    private static function updateConfig(string $host, string $db, string $user, string $pass): void {
+        $filePath = __FILE__;
+        $content = file_get_contents($filePath);
+        
+        $newConfig = "\$DB_CONFIG = [
+    'host' => 'localhost',
+    'database' => 'send_serp',
+    'username' => 'send_serp',
+    'password' => '0165625092Oo@',
+    'installed' => true
+];";
+        
+        $pattern = '/\$DB_CONFIG\s*=\s*\[.*?\];/s';
+        $content = preg_replace($pattern, $newConfig, $content);
+        
+        if (file_put_contents($filePath, $content) === false) {
+            throw new Exception('Failed to update configuration file. Please check file permissions.');
+        }
     }
 }
 
-/**
- * Set a global setting value
- */
-function set_setting(PDO $pdo, string $key, string $value): bool {
-    try {
-        $stmt = $pdo->prepare("INSERT INTO settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?, updated_at = CURRENT_TIMESTAMP");
-        $stmt->execute([$key, $value, $value]);
-        return true;
-    } catch (Exception $e) {
+// ============================================================================
+// AUTHENTICATION CLASS
+// ============================================================================
+
+class Auth {
+    public static function login(string $username, string $password): bool {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT id, username, password FROM users WHERE username = ?");
+        $stmt->execute([$username]);
+        $user = $stmt->fetch();
+        
+        if ($user && password_verify($password, $user['password'])) {
+            $_SESSION['user_id'] = $user['id'];
+            $_SESSION['username'] = $user['username'];
+            return true;
+        }
+        
         return false;
     }
+    
+    public static function logout(): void {
+        session_destroy();
+        session_start();
+    }
+    
+    public static function isLoggedIn(): bool {
+        return isset($_SESSION['user_id']);
+    }
+    
+    public static function requireAuth(): void {
+        if (!self::isLoggedIn()) {
+            header('Location: ?page=login');
+            exit;
+        }
+    }
+    
+    public static function getUserId(): ?int {
+        return $_SESSION['user_id'] ?? null;
+    }
 }
 
-/**
- * Inject open & click tracking inside HTML
- */
-function build_tracked_html(array $campaign, string $recipientEmail = ''): string
-{
-    global $pdo;
+// ============================================================================
+// BLOOMFILTER CLASS
+// ============================================================================
+
+class BloomFilter {
+    // Configuration constants
+    private const DEFAULT_CACHE_SIZE = 10000;
+    private const BULK_CHECK_BATCH_SIZE = 1000;
     
-    $html = $campaign['html'] ?? '';
-    if ($html === '') {
-        return '';
-    }
-
-    $cid  = (int)$campaign['id'];
-    $base = get_base_url();
-
-    $rParam = '';
-    if ($recipientEmail !== '') {
-        $rParam = '&r=' . rawurlencode(base64url_encode(strtolower($recipientEmail)));
-    }
-
-    $unsubscribeEnabled = !empty($campaign['unsubscribe_enabled']) ? true : false;
+    private static array $cache = [];
+    private static int $cacheSize = self::DEFAULT_CACHE_SIZE;
     
-    // Use global tracking settings
-    $openTrackingEnabled = (get_setting($pdo, 'open_tracking_enabled', '1') === '1');
-    $clickTrackingEnabled = (get_setting($pdo, 'click_tracking_enabled', '1') === '1');
-
-    // Only inject open tracking if enabled
-    // Use CSS with inline base64 image to avoid spam filters
-    if ($openTrackingEnabled) {
-        $openUrl = $base . '?t=open&cid=' . $cid . $rParam;
-        // Use CSS with a transparent 1x1 GIF as background - less likely to be flagged as spam
-        // Also add a fallback IMG tag for email clients that don't support CSS backgrounds
-        $pixel   = '<div style="width:0;height:0;line-height:0;font-size:0;background:transparent url(\'' . $openUrl . '\') no-repeat center;"></div>';
-
-        if (stripos($html, '</body>') !== false) {
-            $html = preg_replace('~</body>~i', $pixel . '</body>', $html, 1);
-        } else {
-            $html .= $pixel;
-        }
-    }
-
-    $pattern_unsub = '~<a\b([^>]*?)\bhref\s*=\s*(["\'])(.*?)\2([^>]*)>(.*?)</a>~is';
-    $foundUnsubAnchor = false;
-    $html = preg_replace_callback($pattern_unsub, function ($m) use ($base, $cid, $rParam, $unsubscribeEnabled, &$foundUnsubAnchor) {
-        $beforeAttrs = $m[1];
-        $quote       = $m[2];
-        $href        = $m[3];
-        $afterAttrs  = $m[4];
-        $innerText   = $m[5];
-
-        if (stripos($innerText, 'unsubscribe') !== false) {
-            if (!$unsubscribeEnabled) {
-                return '';
-            }
-            $foundUnsubAnchor = true;
-            $unsubUrl = $base . '?t=unsubscribe&cid=' . $cid . $rParam;
-            return '<a' . $beforeAttrs . ' href=' . $quote . $unsubUrl . $quote . $afterAttrs . '>' . $innerText . '</a>';
-        }
-        return $m[0];
-    }, $html);
-
-    if ($unsubscribeEnabled && !$foundUnsubAnchor) {
-        $unsubUrl = $base . '?t=unsubscribe&cid=' . $cid . $rParam;
-        $unsubBlock = '<div style="text-align:center;margin-top:18px;color:#777;font-size:13px;">'
-                     . '<a href="' . $unsubUrl . '" style="color:#1A82E2;">Unsubscribe</a>'
-                     . '</div>';
-        if (stripos($html, '</body>') !== false) {
-            $html = preg_replace('~</body>~i', $unsubBlock . '</body>', $html, 1);
-        } else {
-            $html .= $unsubBlock;
-        }
-    }
-
-    // Only wrap links with click tracking if enabled
-    if ($clickTrackingEnabled) {
-        $pattern = '~<a\b([^>]*?)\bhref\s*=\s*(["\'])(.*?)\2([^>]*)>~i';
-
-        $html = preg_replace_callback($pattern, function ($m) use ($base, $cid, $rParam) {
-            $beforeAttrs = $m[1];
-            $quote       = $m[2];
-            $href        = $m[3];
-            $afterAttrs  = $m[4];
-
-            $trimHref = trim($href);
-
-            if (
-                $trimHref === '' ||
-                stripos($trimHref, 'mailto:') === 0 ||
-                stripos($trimHref, 'javascript:') === 0 ||
-                $trimHref[0] === '#'
-            ) {
-                return $m[0];
-            }
-
-            if (stripos($trimHref, '?t=click') !== false && stripos($trimHref, 'cid=') !== false) {
-                return $m[0];
-            }
-            if (stripos($trimHref, '?t=unsubscribe') !== false && stripos($trimHref, 'cid=') !== false) {
-                return $m[0];
-            }
-
-            // Check if href contains template tags (e.g., {{email}}, {{name}}, etc.)
-            // If it does, preserve them by not encoding the URL yet
-            if (preg_match('/\{\{[^}]+\}\}/', $trimHref)) {
-                // URL contains template tags - store it without encoding to preserve tags
-                // We'll use a special marker to indicate this URL needs tag preservation
-                $encodedUrl = base64url_encode($trimHref);
-                $trackUrl   = $base . '?t=click&cid=' . $cid . '&u=' . rawurlencode($encodedUrl) . $rParam;
-            } else {
-                // Normal URL without template tags - encode as usual
-                $encodedUrl = base64url_encode($trimHref);
-                $trackUrl   = $base . '?t=click&cid=' . $cid . '&u=' . rawurlencode($encodedUrl) . $rParam;
-            }
-
-            return '<a' . $beforeAttrs . ' href=' . $quote . $trackUrl . $quote . $afterAttrs . '>';
-        }, $html);
-    }
-
-    return $html;
-}
-
-/**
- * Extract emails using serper.dev API
- * @param string $apiKey The serper.dev API key
- * @param string $query Search query (e.g., "real estate agents california")
- * @param string $country Optional country code (e.g., "us")
- * @param bool $businessOnly Filter for business emails only
- * @param int $numResults Number of results to fetch (default: 10)
- * @return array Array with 'success' boolean and 'emails' array or 'error' string
- */
-function extract_emails_serper(string $apiKey, string $query, string $country = '', bool $businessOnly = true, int $numResults = 10): array {
-    $log = [];
-    
-    if ($apiKey === '' || $query === '') {
-        return ['success' => false, 'error' => 'Missing API key or search query', 'log' => $log];
+    /**
+     * Set cache size (useful for tuning based on available memory)
+     */
+    public static function setCacheSize(int $size): void {
+        self::$cacheSize = max(100, min($size, 100000)); // Limit between 100 and 100K
     }
     
-    $apiUrl = 'https://google.serper.dev/search';
-    
-    // Build request payload
-    $payload = [
-        'q' => $query,
-        'num' => min($numResults, 100) // serper.dev typically supports up to 100 results
-    ];
-    
-    if ($country !== '') {
-        $payload['gl'] = $country;
-    }
-    
-    $headers = [
-        'X-API-KEY: ' . $apiKey,
-        'Content-Type: application/json'
-    ];
-    
-    $log[] = 'Calling serper.dev API...';
-    $log[] = 'Query: ' . $query;
-    if ($country) $log[] = 'Country: ' . $country;
-    
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $apiUrl);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-    
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    
-    if ($response === false) {
-        $error = curl_error($ch);
-        curl_close($ch);
-        $log[] = 'cURL error: ' . $error;
-        return ['success' => false, 'error' => 'API request failed: ' . $error, 'log' => $log];
-    }
-    
-    curl_close($ch);
-    
-    $log[] = 'HTTP Code: ' . $httpCode;
-    $log[] = 'Response length: ' . strlen($response) . ' bytes';
-    $log[] = 'First 500 chars of response: ' . substr($response, 0, 500);
-    
-    if ($httpCode !== 200) {
-        $log[] = 'FULL ERROR RESPONSE: ' . $response;
-        return ['success' => false, 'error' => "HTTP $httpCode: " . substr($response, 0, 200), 'log' => $log];
-    }
-    
-    $data = json_decode($response, true);
-    if (!is_array($data)) {
-        $log[] = 'Invalid JSON response';
-        return ['success' => false, 'error' => 'Invalid API response', 'log' => $log];
-    }
-    
-    // Extract emails from search results
-    $emails = [];
-    // More robust email pattern that prevents multiple consecutive dots
-    $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
-    
-    // Check organic results
-    if (isset($data['organic']) && is_array($data['organic'])) {
-        foreach ($data['organic'] as $result) {
-            $text = '';
-            if (isset($result['snippet'])) $text .= ' ' . $result['snippet'];
-            if (isset($result['title'])) $text .= ' ' . $result['title'];
-            if (isset($result['link'])) $text .= ' ' . $result['link'];
-            
-            // Extract all emails from text
-            if (preg_match_all($emailPattern, $text, $matches)) {
-                foreach ($matches[0] as $email) {
-                    $email = strtolower($email);
-                    
-                    // Additional validation: check for @ symbol
-                    $atPos = strpos($email, '@');
-                    if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
-                        continue; // Invalid email format
-                    }
-                    
-                    // Filter business emails if requested
-                    if ($businessOnly) {
-                        // Skip common free email providers
-                        $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
-                        $domain = substr($email, $atPos + 1);
-                        if (in_array($domain, $freeProviders)) {
-                            continue;
-                        }
-                    }
-                    
-                    // Check if email already added
-                    $emailExists = false;
-                    foreach ($emails as $existingEmail) {
-                        if ($existingEmail['email'] === $email) {
-                            $emailExists = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!$emailExists) {
-                        $emails[] = [
-                            'email' => $email,
-                            'source' => $result['link'] ?? $query
-                        ];
-                    }
-                }
-            }
-        }
-    }
-    
-    $log[] = 'Extracted ' . count($emails) . ' unique emails';
-    
-    return [
-        'success' => true,
-        'emails' => $emails,
-        'log' => $log
-    ];
-}
-
-function smtp_check_connection(array $profile): array {
-    $log = [];
-
-    $host = trim($profile['host'] ?? '');
-    $port = (int)($profile['port'] ?? 587);
-    $user = trim($profile['username'] ?? '');
-    $pass = (string)($profile['password'] ?? '');
-
-    if ($host === '') {
-        return ['ok'=>false,'msg'=>'Missing SMTP host','log'=>$log];
-    }
-
-    $remoteHost = ($port === 465 ? "ssl://{$host}" : $host);
-
-    $errno = 0;
-    $errstr = '';
-    $socket = @fsockopen($remoteHost, $port, $errno, $errstr, 10);
-    if (!$socket) {
-        $log[] = "connect_error: {$errno} {$errstr}";
-        return ['ok'=>false,'msg'=>"SMTP connect error: {$errno} {$errstr}", 'log'=>$log];
-    }
-    stream_set_timeout($socket, 10);
-
-    $read = function() use ($socket, &$log) {
-        $data = '';
-        while ($str = fgets($socket, 515)) {
-            $data .= $str;
-            $log[] = rtrim($str, "\r\n");
-            if (strlen($str) < 4) break;
-            if (substr($str, 3, 1) === ' ') break;
-        }
-        $code = isset($data[0]) ? substr($data, 0, 3) : null;
-        $msg  = isset($data[4]) ? trim(substr($data, 4)) : trim($data);
-        return [$code, $msg, $data];
-    };
-    $write = function(string $cmd) use ($socket, $read, &$log) {
-        fputs($socket, $cmd . "\r\n");
-        $log[] = 'C: ' . $cmd;
-        return $read();
-    };
-
-    list($gcode, $gmsg) = $read();
-    if (!is_string($gcode) || substr($gcode,0,1) !== '2') {
-        fclose($socket);
-        $log[] = 'banner_failed';
-        return ['ok'=>false,'msg'=>"SMTP banner failed: {$gcode} {$gmsg}", 'log'=>$log];
-    }
-
-    list($ecode, $emsg) = $write('EHLO localhost');
-    if (!is_string($ecode) || substr($ecode,0,1) !== '2') {
-        list($hcode, $hmsg) = $write('HELO localhost');
-        if (!is_string($hcode) || substr($hcode,0,1) !== '2') {
-            fclose($socket);
-            $log[] = 'ehlo_failed';
-            return ['ok'=>false,'msg'=>"EHLO/HELO failed: {$ecode} / {$hcode}", 'log'=>$log];
-        } else {
-            $ecode = $hcode; $emsg = $hmsg;
-        }
-    }
-
-    if ($user !== '') {
-        list($acode, $amsg) = $write('AUTH LOGIN');
-        if (!is_string($acode) || substr($acode,0,1) !== '3') {
-            fclose($socket);
-            return ['ok'=>true,'msg'=>'Connected; AUTH not required/accepted','log'=>$log];
-        }
-        list($ucode, $umsg) = $write(base64_encode($user));
-        if (!is_string($ucode) || substr($ucode,0,1) !== '3') {
-            fclose($socket);
-            return ['ok'=>false,'msg'=>"AUTH username rejected: {$ucode} {$umsg}", 'log'=>$log];
-        }
-        list($pcode, $pmsg) = $write(base64_encode($pass));
-        if (!is_string($pcode) || substr($pcode,0,1) !== '2') {
-            fclose($socket);
-            return ['ok'=>false,'msg'=>"AUTH password rejected: {$pcode} {$pmsg}", 'log'=>$log];
-        }
-    }
-
-    $write('QUIT');
-    fclose($socket);
-
-    return ['ok'=>true,'msg'=>'SMTP connect OK','log'=>$log];
-}
-
-function api_check_connection(array $profile): array {
-    $apiUrl = trim($profile['api_url'] ?? '');
-    $apiKey = trim($profile['api_key'] ?? '');
-    $provider = trim($profile['provider'] ?? '');
-
-    $log = [];
-
-    if ($apiUrl === '') {
-        return ['ok'=>false,'msg'=>'Missing API URL','log'=>$log];
-    }
-
-    $log[] = 'Testing connection to: ' . $apiUrl;
-    $log[] = 'Provider: ' . ($provider ?: 'Generic');
-
-    // Prepare headers
-    $headers = ['Content-Type: application/json'];
-    if ($apiKey !== '') {
-        $headers[] = 'Authorization: Bearer ' . $apiKey;
-        $log[] = 'Using API key: ' . substr($apiKey, 0, 10) . '...';
-    } else {
-        $log[] = 'No API key provided';
-    }
-    
-    if (!empty($profile['headers_json'])) {
-        $extra = json_decode($profile['headers_json'], true);
-        if (is_array($extra)) {
-            foreach ($extra as $k => $v) {
-                $headers[] = "{$k}: {$v}";
-                $log[] = 'Custom header: ' . $k;
-            }
-        }
-    }
-
-    // Build provider-specific test payload
-    $testCampaign = [
-        'subject' => 'Connection Test',
-        'sender_name' => 'Test Sender'
-    ];
-    $testPayload = api_build_payload($provider, 'test@example.com', 'test@example.com', $testCampaign, '<p>Test</p>');
-    
-    if ($testPayload === null) {
-        $testPayload = ['test' => 'connection'];
-    }
-
-    $log[] = 'Attempting POST request with provider-specific payload...';
-
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $apiUrl);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($testPayload));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    
-    // Handle SSL certificate issues (common with APIs)
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-    
-    // Get verbose information
-    curl_setopt($ch, CURLOPT_VERBOSE, false);
-
-    $resp = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlInfo = curl_getinfo($ch);
-    
-    if ($resp === false) {
-        $err = curl_error($ch);
-        $errNo = curl_errno($ch);
-        curl_close($ch);
-        $log[] = 'cURL error #' . $errNo . ': ' . $err;
+    public static function add(string $email): void {
+        $hash = self::normalize($email);
         
-        // If SSL error, try without verification (fallback)
-        if ($errNo === 60 || $errNo === 77) {
-            $log[] = 'SSL verification failed, retrying without SSL verification...';
-            
-            $ch2 = curl_init();
-            curl_setopt($ch2, CURLOPT_URL, $apiUrl);
-            curl_setopt($ch2, CURLOPT_POST, true);
-            curl_setopt($ch2, CURLOPT_POSTFIELDS, $testPayload);
-            curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch2, CURLOPT_TIMEOUT, 15);
-            curl_setopt($ch2, CURLOPT_FOLLOWLOCATION, true);
-            curl_setopt($ch2, CURLOPT_MAXREDIRS, 3);
-            curl_setopt($ch2, CURLOPT_HTTPHEADER, $headers);
-            curl_setopt($ch2, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch2, CURLOPT_SSL_VERIFYHOST, 0);
-            
-            $resp = curl_exec($ch2);
-            $code = curl_getinfo($ch2, CURLINFO_HTTP_CODE);
-            
-            if ($resp === false) {
-                $err2 = curl_error($ch2);
-                curl_close($ch2);
-                $log[] = 'Retry also failed: ' . $err2;
-                return ['ok'=>false,'msg'=>"cURL error: {$err}", 'log'=>$log];
-            }
-            curl_close($ch2);
-            $log[] = 'SSL verification bypass succeeded';
-        } else {
-            return ['ok'=>false,'msg'=>"cURL error: {$err}", 'log'=>$log];
-        }
-    } else {
-        curl_close($ch);
-    }
-
-    $log[] = 'HTTP CODE: ' . $code;
-    $log[] = 'Response preview: ' . substr($resp, 0, 150) . (strlen($resp) > 150 ? '...' : '');
-    $log[] = 'Effective URL: ' . ($curlInfo['url'] ?? $apiUrl);
-    
-    // Very permissive acceptance criteria for connection testing
-    // The goal is to verify the endpoint exists and is reachable, not to validate the full request
-    if ($code >= 200 && $code < 300) {
-        // 2xx - perfect success
-        $log[] = 'Success: API accepted the request';
-        return ['ok'=>true,'msg'=>'API connection successful (HTTP ' . $code . ')','log'=>$log];
-    } elseif ($code >= 300 && $code < 400) {
-        // 3xx - redirect is acceptable
-        $log[] = 'Success: API endpoint found (redirect)';
-        return ['ok'=>true,'msg'=>'API endpoint found (HTTP ' . $code . ' redirect)','log'=>$log];
-    } elseif ($code === 400 || $code === 401 || $code === 403 || $code === 422) {
-        // These codes mean endpoint exists but rejected our test request - this is GOOD
-        $log[] = 'Success: Endpoint exists and responded (rejected test data as expected)';
-        return ['ok'=>true,'msg'=>'API endpoint is reachable and working (HTTP ' . $code . ')','log'=>$log];
-    } elseif ($code === 405) {
-        // Method not allowed - the endpoint exists but doesn't accept POST
-        // Try GET as fallback
-        $log[] = 'POST not allowed, trying GET method...';
+        // Add to in-memory cache
+        self::$cache[$hash] = true;
         
-        $ch3 = curl_init();
-        curl_setopt($ch3, CURLOPT_URL, $apiUrl);
-        curl_setopt($ch3, CURLOPT_HTTPGET, true);
-        curl_setopt($ch3, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch3, CURLOPT_TIMEOUT, 10);
-        curl_setopt($ch3, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($ch3, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch3, CURLOPT_SSL_VERIFYHOST, 0);
-        
-        $resp3 = curl_exec($ch3);
-        $code3 = curl_getinfo($ch3, CURLINFO_HTTP_CODE);
-        curl_close($ch3);
-        
-        $log[] = 'GET method returned HTTP ' . $code3;
-        
-        if ($code3 >= 200 && $code3 < 500 && $code3 !== 404) {
-            return ['ok'=>true,'msg'=>'API endpoint is reachable (HTTP ' . $code3 . ' via GET)','log'=>$log];
-        }
-    } elseif ($code === 404) {
-        // 404 - this usually means the URL path is wrong
-        $log[] = 'Error: 404 means the endpoint URL path is incorrect';
-        $log[] = 'Please verify the complete API URL including the path (e.g., /v1/send)';
-        return ['ok'=>false,'msg'=>'API endpoint not found (HTTP 404). Verify the complete URL including path.','log'=>$log];
-    } elseif ($code >= 500) {
-        // 5xx server error - endpoint exists but server has issues
-        $log[] = 'Warning: Server error - endpoint exists but API server has problems';
-        return ['ok'=>false,'msg'=>'API server error (HTTP ' . $code . '). The endpoint exists but the server has issues.','log'=>$log];
-    } else {
-        // Other codes
-        $log[] = 'Unexpected HTTP code: ' . $code;
-        return ['ok'=>false,'msg'=>'API returned HTTP ' . $code,'log'=>$log];
-    }
-    
-    return ['ok'=>false,'msg'=>'API check completed with HTTP ' . $code,'log'=>$log];
-}
-
-/**
- * SMTP send (returns structured array)
- */
-function smtp_send_mail(array $profile, array $campaign, string $to, string $html): array
-{
-    $log = [];
-
-    $host = trim($profile['host'] ?? '');
-    $port = (int)($profile['port'] ?? 587);
-    $user = trim($profile['username'] ?? '');
-    $pass = (string)($profile['password'] ?? '');
-
-    $from = trim($campaign['from_email'] ?? '');
-
-    if ($host === '' || $from === '' || $to === '') {
-        return [
-            'ok' => false,
-            'type' => 'bounce',
-            'code' => null,
-            'msg' => 'SMTP: missing host/from/to',
-            'stage' => 'connect',
-            'log' => $log,
-        ];
-    }
-
-    $remoteHost = ($port === 465 ? "ssl://{$host}" : $host);
-
-    $errno = 0;
-    $errstr = '';
-    $socket = @fsockopen($remoteHost, $port, $errno, $errstr, 25);
-    if (!$socket) {
-        return [
-            'ok' => false,
-            'type' => 'bounce',
-            'code' => null,
-            'msg' => "SMTP connect error: {$errno} {$errstr}",
-            'stage' => 'connect',
-            'log' => $log,
-        ];
-    }
-    stream_set_timeout($socket, 25);
-
-    $read = function() use ($socket, &$log) {
-        $data = '';
-        while ($str = fgets($socket, 515)) {
-            $data .= $str;
-            $log[] = rtrim($str, "\r\n");
-            if (strlen($str) < 4) break;
-            if (substr($str, 3, 1) === ' ') break;
-        }
-        $code = isset($data[0]) ? substr($data, 0, 3) : null;
-        $msg  = isset($data[4]) ? trim(substr($data, 4)) : trim($data);
-        return [$code, $msg, $data];
-    };
-    $write = function(string $cmd) use ($socket, $read, &$log) {
-        fputs($socket, $cmd . "\r\n");
-        $log[] = 'C: ' . $cmd;
-        return $read();
-    };
-
-    list($gcode, $gmsg) = $read();
-    if (!is_string($gcode) || substr($gcode,0,1) !== '2') {
-        fclose($socket);
-        return [
-            'ok' => false,
-            'type' => 'bounce',
-            'code' => $gcode,
-            'msg' => $gmsg,
-            'stage' => 'banner',
-            'log' => $log,
-        ];
-    }
-
-    list($ecode, $emsg) = $write('EHLO localhost');
-    if (!is_string($ecode) || substr($ecode,0,1) !== '2') {
-        list($hcode, $hmsg) = $write('HELO localhost');
-        if (!is_string($hcode) || substr($hcode,0,1) !== '2') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => $ecode ?: $hcode,
-                'msg' => $emsg ?: $hmsg,
-                'stage' => 'ehlo',
-                'log' => $log,
-            ];
-        } else {
-            $ecode = $hcode; $emsg = $hmsg;
-        }
-    }
-
-    if ($port !== 465 && is_string($emsg) && stripos(implode("\n", $log), 'STARTTLS') !== false) {
-        list($tcode, $tmsg) = $write('STARTTLS');
-        if (!is_string($tcode) || substr($tcode, 0, 3) !== '220') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => $tcode,
-                'msg' => $tmsg,
-                'stage' => 'starttls',
-                'log' => $log,
-            ];
-        }
-        $cryptoMethod = defined('STREAM_CRYPTO_METHOD_TLS_CLIENT')
-            ? STREAM_CRYPTO_METHOD_TLS_CLIENT
-            : (STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT
-               | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT
-               | STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT);
-
-        if (!stream_socket_enable_crypto($socket, true, $cryptoMethod)) {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => null,
-                'msg' => 'Unable to start TLS crypto',
-                'stage' => 'starttls',
-                'log' => $log,
-            ];
-        }
-        list($ecode, $emsg) = $write('EHLO localhost');
-    }
-
-    if ($user !== '') {
-        list($acode, $amsg) = $write('AUTH LOGIN');
-        if (!is_string($acode) || substr($acode,0,1) !== '3') {
-            fclose($socket);
-            return ['ok'=>false, 'type'=>'bounce', 'code'=>$acode, 'msg'=>$amsg, 'stage'=>'auth', 'log'=>$log];
-        }
-        list($ucode, $umsg) = $write(base64_encode($user));
-        if (!is_string($ucode) || substr($ucode,0,1) !== '3') {
-            fclose($socket);
-            return ['ok'=>false, 'type'=>'bounce', 'code'=>$ucode, 'msg'=>$umsg, 'stage'=>'auth_user', 'log'=>$log];
-        }
-        list($pcode, $pmsg) = $write(base64_encode($pass));
-        if (!is_string($pcode) || substr($pcode,0,1) !== '2') {
-            fclose($socket);
-            return ['ok'=>false, 'type'=>'bounce', 'code'=>$pcode, 'msg'=>$pmsg, 'stage'=>'auth_pass', 'log'=>$log];
-        }
-    }
-
-    list($mcode, $mmsg) = $write('MAIL FROM: <' . $from . '>');
-    if (!is_string($mcode)) $mcode = null;
-    if ($mcode !== null && $mcode !== '' && $mcode[0] === '5') {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'bounce','code'=>$mcode,'msg'=>$mmsg,'stage'=>'mail_from','log'=>$log];
-    } elseif ($mcode !== null && $mcode !== '' && $mcode[0] === '4') {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'deferred','code'=>$mcode,'msg'=>$mmsg,'stage'=>'mail_from','log'=>$log];
-    } elseif ($mcode === null) {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'bounce','code'=>null,'msg'=>'MAIL FROM unknown response','stage'=>'mail_from','log'=>$log];
-    }
-
-    list($rcode, $rmsg) = $write('RCPT TO: <' . $to . '>');
-    if (!is_string($rcode)) $rcode = null;
-    if ($rcode !== null && $rcode[0] === '5') {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'bounce','code'=>$rcode,'msg'=>$rmsg,'stage'=>'rcpt_to','log'=>$log];
-    } elseif ($rcode !== null && $rcode[0] === '4') {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'deferred','code'=>$rcode,'msg'=>$rmsg,'stage'=>'rcpt_to','log'=>$log];
-    } elseif ($rcode === null) {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'bounce','code'=>null,'msg'=>'RCPT TO unknown response','stage'=>'rcpt_to','log'=>$log];
-    }
-
-    list($dcode, $dmsg) = $write('DATA');
-    if (!is_string($dcode) || substr($dcode,0,1) !== '3') {
-        fclose($socket);
-        return ['ok'=>false,'type'=>'bounce','code'=>$dcode,'msg'=>$dmsg,'stage'=>'data_cmd','log'=>$log];
-    }
-
-    $subject = encode_mime_header($campaign['subject'] ?? '');
-
-    $headers = '';
-    $headers .= "Date: " . gmdate('D, d M Y H:i:s T') . "\r\n";
-
-    $fromDisplay = '';
-    if (!empty($campaign['sender_name'])) {
-        $fromDisplay = encode_mime_header($campaign['sender_name']) . " <{$from}>";
-    } else {
-        $fromDisplay = "<{$from}>";
-    }
-    $headers .= "From: {$fromDisplay}\r\n";
-
-    $headers .= "To: <{$to}>\r\n";
-    if ($subject !== '') {
-        $headers .= "Subject: {$subject}\r\n";
-    }
-
-    $headers .= "MIME-Version: 1.0\r\n";
-    $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
-    $headers .= "Content-Transfer-Encoding: base64\r\n\r\n";
-
-    $body = chunk_split(base64_encode($html), 76, "\r\n");
-
-    $message = $headers . $body . "\r\n.\r\n";
-    fputs($socket, $message);
-    $log[] = 'C: <message data...>';
-
-    list($finalCode, $finalMsg) = $read();
-
-    if (!is_string($finalCode) || $finalCode[0] !== '2') {
-        fclose($socket);
-        $type = 'bounce';
-        if (is_string($finalCode) && $finalCode[0] === '4') $type = 'deferred';
-        return ['ok'=>false,'type'=>$type,'code'=>$finalCode,'msg'=>$finalMsg,'stage'=>'data_end','log'=>$log];
-    }
-
-    $write('QUIT');
-    fclose($socket);
-
-    return [
-        'ok'    => true,
-        'type'  => 'delivered',
-        'code'  => $finalCode,
-        'msg'   => $finalMsg,
-        'stage' => 'done',
-        'log'   => $log,
-    ];
-}
-
-/**
- * Send multiple emails using a single SMTP connection (batch sending)
- * This improves performance by reusing the connection instead of opening/closing for each email
- * 
- * @param array $profile SMTP profile configuration
- * @param array $campaign Campaign data
- * @param array $recipients Array of recipient email addresses
- * @param array $htmlMap Optional map of recipient => custom HTML (if not provided, same HTML for all)
- * @return array Results with 'results' array containing per-recipient results
- */
-function smtp_send_batch(array $profile, array $campaign, array $recipients, array $htmlMap = []): array
-{
-    $log = [];
-    $results = [];
-    
-    if (empty($recipients)) {
-        return [
-            'ok' => false,
-            'error' => 'No recipients provided',
-            'log' => $log,
-            'results' => []
-        ];
-    }
-
-    $host = trim($profile['host'] ?? '');
-    $port = (int)($profile['port'] ?? 587);
-    $user = trim($profile['username'] ?? '');
-    $pass = (string)($profile['password'] ?? '');
-    $from = trim($campaign['from_email'] ?? '');
-
-    if ($host === '' || $from === '') {
-        return [
-            'ok' => false,
-            'error' => 'Missing SMTP host or from address',
-            'log' => $log,
-            'results' => []
-        ];
-    }
-
-    $remoteHost = ($port === 465 ? "ssl://{$host}" : $host);
-    
-    // Open connection
-    $errno = 0;
-    $errstr = '';
-    $socket = @fsockopen($remoteHost, $port, $errno, $errstr, 25);
-    if (!$socket) {
-        $error = "SMTP connect error: {$errno} {$errstr}";
-        $log[] = $error;
-        return [
-            'ok' => false,
-            'error' => $error,
-            'log' => $log,
-            'results' => []
-        ];
-    }
-    stream_set_timeout($socket, 25);
-
-    $read = function() use ($socket, &$log) {
-        $data = '';
-        while ($str = fgets($socket, 515)) {
-            $data .= $str;
-            $log[] = rtrim($str, "\r\n");
-            if (strlen($str) < 4) break;
-            if (substr($str, 3, 1) === ' ') break;
-        }
-        $code = isset($data[0]) ? substr($data, 0, 3) : null;
-        $msg  = isset($data[4]) ? trim(substr($data, 4)) : trim($data);
-        return [$code, $msg, $data];
-    };
-    
-    $write = function(string $cmd) use ($socket, $read, &$log) {
-        fputs($socket, $cmd . "\r\n");
-        $log[] = 'C: ' . $cmd;
-        return $read();
-    };
-
-    // Banner
-    list($gcode, $gmsg) = $read();
-    if (!is_string($gcode) || substr($gcode,0,1) !== '2') {
-        fclose($socket);
-        return [
-            'ok' => false,
-            'error' => "SMTP banner failed: {$gcode} {$gmsg}",
-            'log' => $log,
-            'results' => []
-        ];
-    }
-
-    // EHLO/HELO
-    list($ecode, $emsg) = $write('EHLO localhost');
-    if (!is_string($ecode) || substr($ecode,0,1) !== '2') {
-        list($hcode, $hmsg) = $write('HELO localhost');
-        if (!is_string($hcode) || substr($hcode,0,1) !== '2') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'error' => "EHLO/HELO failed: {$ecode} / {$hcode}",
-                'log' => $log,
-                'results' => []
-            ];
-        } else {
-            $ecode = $hcode; $emsg = $hmsg;
-        }
-    }
-
-    // STARTTLS if needed
-    if ($port !== 465 && is_string($emsg) && stripos(implode("\n", $log), 'STARTTLS') !== false) {
-        list($tcode, $tmsg) = $write('STARTTLS');
-        if (!is_string($tcode) || substr($tcode, 0, 3) !== '220') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'error' => "STARTTLS failed: {$tcode} {$tmsg}",
-                'log' => $log,
-                'results' => []
-            ];
-        }
-        $cryptoMethod = defined('STREAM_CRYPTO_METHOD_TLS_CLIENT')
-            ? STREAM_CRYPTO_METHOD_TLS_CLIENT
-            : (STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT
-               | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT
-               | STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT);
-
-        if (!stream_socket_enable_crypto($socket, true, $cryptoMethod)) {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'error' => 'Unable to start TLS crypto',
-                'log' => $log,
-                'results' => []
-            ];
-        }
-        list($ecode, $emsg) = $write('EHLO localhost');
-    }
-
-    // AUTH
-    if ($user !== '') {
-        list($acode, $amsg) = $write('AUTH LOGIN');
-        if (!is_string($acode) || substr($acode,0,1) !== '3') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'error' => "AUTH LOGIN failed: {$acode} {$amsg}",
-                'log' => $log,
-                'results' => []
-            ];
-        }
-        list($ucode, $umsg) = $write(base64_encode($user));
-        if (!is_string($ucode) || substr($ucode,0,1) !== '3') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'error' => "AUTH username rejected: {$ucode} {$umsg}",
-                'log' => $log,
-                'results' => []
-            ];
-        }
-        list($pcode, $pmsg) = $write(base64_encode($pass));
-        if (!is_string($pcode) || substr($pcode,0,1) !== '2') {
-            fclose($socket);
-            return [
-                'ok' => false,
-                'error' => "AUTH password rejected: {$pcode} {$pmsg}",
-                'log' => $log,
-                'results' => []
-            ];
-        }
-    }
-
-    // Now send each email using the same connection
-    foreach ($recipients as $to) {
-        $to = trim($to);
-        if ($to === '') continue;
-        
-        // Determine HTML for this recipient
-        $html = isset($htmlMap[$to]) ? $htmlMap[$to] : (isset($htmlMap['default']) ? $htmlMap['default'] : '');
-
-        // MAIL FROM
-        list($mcode, $mmsg) = $write('MAIL FROM: <' . $from . '>');
-        if (!is_string($mcode)) $mcode = null;
-        if ($mcode !== null && $mcode !== '' && $mcode[0] === '5') {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => $mcode,
-                'msg' => $mmsg,
-                'stage' => 'mail_from',
-                'log' => []
-            ];
-            // Try to continue with next recipient (some servers allow this)
-            continue;
-        } elseif ($mcode !== null && $mcode !== '' && $mcode[0] === '4') {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'deferred',
-                'code' => $mcode,
-                'msg' => $mmsg,
-                'stage' => 'mail_from',
-                'log' => []
-            ];
-            continue;
-        } elseif ($mcode === null) {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => null,
-                'msg' => 'MAIL FROM unknown response',
-                'stage' => 'mail_from',
-                'log' => []
-            ];
-            continue;
-        }
-
-        // RCPT TO
-        list($rcode, $rmsg) = $write('RCPT TO: <' . $to . '>');
-        if (!is_string($rcode)) $rcode = null;
-        if ($rcode !== null && $rcode[0] === '5') {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => $rcode,
-                'msg' => $rmsg,
-                'stage' => 'rcpt_to',
-                'log' => []
-            ];
-            continue;
-        } elseif ($rcode !== null && $rcode[0] === '4') {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'deferred',
-                'code' => $rcode,
-                'msg' => $rmsg,
-                'stage' => 'rcpt_to',
-                'log' => []
-            ];
-            continue;
-        } elseif ($rcode === null) {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => null,
-                'msg' => 'RCPT TO unknown response',
-                'stage' => 'rcpt_to',
-                'log' => []
-            ];
-            continue;
-        }
-
-        // DATA command
-        list($dcode, $dmsg) = $write('DATA');
-        if (!is_string($dcode) || substr($dcode,0,1) !== '3') {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => $dcode,
-                'msg' => $dmsg,
-                'stage' => 'data_cmd',
-                'log' => []
-            ];
-            continue;
-        }
-
-        // Build message
-        $subject = encode_mime_header($campaign['subject'] ?? '');
-        $headers = '';
-        $headers .= "Date: " . gmdate('D, d M Y H:i:s T') . "\r\n";
-
-        $fromDisplay = '';
-        if (!empty($campaign['sender_name'])) {
-            $fromDisplay = encode_mime_header($campaign['sender_name']) . " <{$from}>";
-        } else {
-            $fromDisplay = "<{$from}>";
-        }
-        $headers .= "From: {$fromDisplay}\r\n";
-        $headers .= "To: <{$to}>\r\n";
-        if ($subject !== '') {
-            $headers .= "Subject: {$subject}\r\n";
-        }
-        $headers .= "MIME-Version: 1.0\r\n";
-        $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
-        $headers .= "Content-Transfer-Encoding: base64\r\n\r\n";
-
-        $body = chunk_split(base64_encode($html), 76, "\r\n");
-        
-        // Send message data
-        fputs($socket, $headers . $body);
-        // Send termination sequence (CRLF.CRLF)
-        fputs($socket, ".\r\n");
-        $log[] = 'C: <message data...>';
-
-        list($finalCode, $finalMsg) = $read();
-
-        if (!is_string($finalCode) || $finalCode[0] !== '2') {
-            $type = 'bounce';
-            if (is_string($finalCode) && $finalCode[0] === '4') $type = 'deferred';
-            $results[$to] = [
-                'ok' => false,
-                'type' => $type,
-                'code' => $finalCode,
-                'msg' => $finalMsg,
-                'stage' => 'data_end',
-                'log' => []
-            ];
-        } else {
-            $results[$to] = [
-                'ok' => true,
-                'type' => 'delivered',
-                'code' => $finalCode,
-                'msg' => $finalMsg,
-                'stage' => 'done',
-                'log' => []
-            ];
-        }
-    }
-
-    // Close connection
-    $write('QUIT');
-    fclose($socket);
-
-    // Check overall success
-    $successCount = 0;
-    foreach ($results as $result) {
-        if (!empty($result['ok'])) $successCount++;
-    }
-
-    return [
-        'ok' => $successCount > 0,
-        'total' => count($recipients),
-        'success' => $successCount,
-        'failed' => count($recipients) - $successCount,
-        'log' => $log,
-        'results' => $results
-    ];
-}
-
-function api_send_mail(array $profile, array $campaign, string $to, string $html): array
-{
-    $apiUrl = trim($profile['api_url'] ?? '');
-    $apiKey = trim($profile['api_key'] ?? '');
-    $from   = trim($campaign['from_email'] ?? '');
-    $provider = trim($profile['provider'] ?? '');
-
-    $log = [];
-
-    if ($apiUrl === '' || $from === '' || $to === '') {
-        return [
-            'ok' => false,
-            'type' => 'bounce',
-            'code' => null,
-            'msg' => 'API: missing api_url/from/to',
-            'stage' => 'api',
-            'log' => $log,
-        ];
-    }
-
-    $headers = [
-        'Content-Type: application/json',
-    ];
-    if ($apiKey !== '') {
-        $headers[] = 'Authorization: Bearer ' . $apiKey;
-    }
-
-    if (!empty($profile['headers_json'])) {
-        $extra = json_decode($profile['headers_json'], true);
-        if (is_array($extra)) {
-            foreach ($extra as $k => $v) {
-                $headers[] = $k . ': ' . $v;
-            }
-        }
-    }
-
-    // Build provider-specific payload
-    $payload = api_build_payload($provider, $from, $to, $campaign, $html);
-    
-    if ($payload === null) {
-        return [
-            'ok' => false,
-            'type' => 'bounce',
-            'code' => null,
-            'msg' => 'API: unsupported provider format',
-            'stage' => 'api',
-            'log' => $log,
-        ];
-    }
-
-    $log[] = 'API POST ' . $apiUrl . ' Provider: ' . $provider;
-    $log[] = 'Payload: ' . substr(json_encode($payload), 0, 500);
-
-    $ch = curl_init($apiUrl);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 25);
-
-    $resp = curl_exec($ch);
-    if ($resp === false) {
-        $err = curl_error($ch);
-        curl_close($ch);
-        $log[] = 'CURL ERROR: ' . $err;
-        return [
-            'ok' => false,
-            'type' => 'bounce',
-            'code' => null,
-            'msg' => 'API cURL error: ' . $err,
-            'stage' => 'api',
-            'log' => $log,
-        ];
-    }
-
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    $log[] = 'API RESPONSE CODE: ' . $code . ' BODY: ' . substr($resp,0,1000);
-
-    if ($code >= 200 && $code < 300) {
-        return [
-            'ok' => true,
-            'type' => 'delivered',
-            'code' => (string)$code,
-            'msg'  => substr($resp,0,1000),
-            'stage'=> 'api',
-            'log'  => $log,
-        ];
-    }
-
-    $etype = ($code >= 500) ? 'bounce' : 'deferred';
-    return [
-        'ok' => false,
-        'type' => $etype,
-        'code' => (string)$code,
-        'msg'  => substr($resp,0,1000),
-        'stage'=> 'api',
-        'log'  => $log,
-    ];
-}
-
-/**
- * Build API payload based on provider
- */
-function api_build_payload(string $provider, string $from, string $to, array $campaign, string $html): ?array
-{
-    $subject = $campaign['subject'] ?? '';
-    $fromName = $campaign['sender_name'] ?? '';
-    
-    // Detect provider from URL if not explicitly set
-    $providerLower = strtolower($provider);
-    
-    // SparkPost format
-    if ($providerLower === 'sparkpost' || strpos($providerLower, 'sparkpost') !== false) {
-        return [
-            'options' => [
-                'open_tracking' => false,
-                'click_tracking' => false,
-            ],
-            'content' => [
-                'from' => [
-                    'email' => $from,
-                    'name' => $fromName ?: $from,
-                ],
-                'subject' => $subject,
-                'html' => $html,
-            ],
-            'recipients' => [
-                ['address' => $to]
-            ]
-        ];
-    }
-    
-    // SendGrid format
-    if ($providerLower === 'sendgrid api' || strpos($providerLower, 'sendgrid') !== false) {
-        $payload = [
-            'personalizations' => [
-                [
-                    'to' => [
-                        ['email' => $to]
-                    ]
-                ]
-            ],
-            'from' => [
-                'email' => $from
-            ],
-            'subject' => $subject,
-            'content' => [
-                [
-                    'type' => 'text/html',
-                    'value' => $html
-                ]
-            ]
-        ];
-        
-        if ($fromName) {
-            $payload['from']['name'] = $fromName;
+        // Trim cache if too large
+        if (count(self::$cache) > self::$cacheSize) {
+            self::$cache = array_slice(self::$cache, -self::$cacheSize, null, true);
         }
         
-        return $payload;
+        $db = Database::connect();
+        
+        try {
+            $stmt = $db->prepare("INSERT IGNORE INTO bloomfilter (hash) VALUES (?)");
+            $stmt->execute([$hash]);
+        } catch (PDOException $e) {
+            // Duplicate entry is fine
+        }
     }
     
-    // Mailgun format
-    if ($providerLower === 'mailgun' || strpos($providerLower, 'mailgun') !== false) {
-        // Note: Mailgun typically uses form-data, not JSON
-        // This is a JSON approximation - actual implementation may need form-data
-        return [
-            'from' => $fromName ? "{$fromName} <{$from}>" : $from,
-            'to' => $to,
-            'subject' => $subject,
-            'html' => $html,
-        ];
-    }
-    
-    // MailJet format
-    if ($providerLower === 'mailjet api' || strpos($providerLower, 'mailjet') !== false) {
-        return [
-            'Messages' => [
-                [
-                    'From' => [
-                        'Email' => $from,
-                        'Name' => $fromName ?: $from,
-                    ],
-                    'To' => [
-                        [
-                            'Email' => $to
-                        ]
-                    ],
-                    'Subject' => $subject,
-                    'HTMLPart' => $html,
-                ]
-            ]
-        ];
-    }
-    
-    // Generic/fallback format (similar to SendGrid)
-    return [
-        'personalizations' => [
-            [
-                'to' => [
-                    ['email' => $to]
-                ]
-            ]
-        ],
-        'from' => [
-            'email' => $from,
-            'name' => $fromName ?: $from
-        ],
-        'subject' => $subject,
-        'content' => [
-            [
-                'type' => 'text/html',
-                'value' => $html
-            ]
-        ]
-    ];
-}
-
-/**
- * Send emails via API (sequential processing)
- * Processes multiple email sends through the API endpoint sequentially.
- * For parallel high-speed sending, use the existing spawn_parallel_workers() infrastructure.
- * 
- * @param array $profile API profile configuration
- * @param array $campaign Campaign data
- * @param array $recipients Array of recipient email addresses
- * @param array $htmlMap Optional map of recipient => custom HTML (if not provided, same HTML for all)
- * @return array Results with 'results' array containing per-recipient results
- */
-function api_send_batch(array $profile, array $campaign, array $recipients, array $htmlMap = []): array
-{
-    $results = [];
-    
-    if (empty($recipients)) {
-        return [
-            'ok' => false,
-            'error' => 'No recipients provided',
-            'results' => []
-        ];
-    }
-
-    $apiUrl = trim($profile['api_url'] ?? '');
-    $apiKey = trim($profile['api_key'] ?? '');
-    $from   = trim($campaign['from_email'] ?? '');
-    $provider = trim($profile['provider'] ?? '');
-
-    if ($apiUrl === '' || $from === '') {
-        return [
-            'ok' => false,
-            'error' => 'Missing API URL or from address',
-            'results' => []
-        ];
-    }
-
-    // Prepare common headers
-    $headers = [
-        'Content-Type: application/json',
-    ];
-    if ($apiKey !== '') {
-        $headers[] = 'Authorization: Bearer ' . $apiKey;
-    }
-    if (!empty($profile['headers_json'])) {
-        $extra = json_decode($profile['headers_json'], true);
-        if (is_array($extra)) {
-            foreach ($extra as $k => $v) {
-                $headers[] = $k . ': ' . $v;
-            }
-        }
-    }
-
-    // Process each email using provider-specific payload format
-    foreach ($recipients as $to) {
-        $html = $htmlMap[$to] ?? $htmlMap['default'] ?? '';
+    public static function exists(string $email): bool {
+        $hash = self::normalize($email);
         
-        // Build provider-specific payload (SparkPost, SendGrid, Mailgun, MailJet, etc.)
-        $payload = api_build_payload($provider, $from, $to, $campaign, $html);
-        
-        if ($payload === null) {
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => null,
-                'msg' => 'API: unsupported provider format',
-                'stage' => 'api',
-                'log' => []
-            ];
-            continue;
-        }
-
-        $ch = curl_init($apiUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 25);
-
-        $resp = curl_exec($ch);
-        if ($resp === false) {
-            $err = curl_error($ch);
-            curl_close($ch);
-            $results[$to] = [
-                'ok' => false,
-                'type' => 'bounce',
-                'code' => null,
-                'msg' => 'API cURL error: ' . $err,
-                'stage' => 'api',
-                'log' => []
-            ];
-            continue;
-        }
-
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        if ($code >= 200 && $code < 300) {
-            $results[$to] = [
-                'ok' => true,
-                'type' => 'delivered',
-                'code' => (string)$code,
-                'msg'  => substr($resp, 0, 1000),
-                'stage'=> 'api',
-                'log'  => []
-            ];
-        } else {
-            $etype = ($code >= 500) ? 'bounce' : 'deferred';
-            $results[$to] = [
-                'ok' => false,
-                'type' => $etype,
-                'code' => (string)$code,
-                'msg'  => substr($resp, 0, 1000),
-                'stage'=> 'api',
-                'log'  => []
-            ];
-        }
-    }
-
-    return [
-        'ok' => true,
-        'results' => $results
-    ];
-}
-
-function get_job(PDO $pdo, int $id) {
-    $stmt = $pdo->prepare("SELECT * FROM jobs WHERE id = ?");
-    $stmt->execute([$id]);
-    $row = $stmt->fetch(PDO::FETCH_ASSOC);
-    return $row ?: false;
-}
-
-// Keep get_campaign as alias for backward compatibility during transition
-function get_campaign(PDO $pdo, int $id) {
-    return get_job($pdo, $id);
-}
-
-function get_job_stats(PDO $pdo, int $id) {
-    $stats = [
-        'extracted'   => 0,
-        'queries_processed' => 0,
-        'target' => 0,
-        'progress_extracted' => 0,
-        'progress_total' => 0,
-    ];
-
-    try {
-        // Get job details from jobs table
-        // Get job and profile info to get target from profile
-        $stmt = $pdo->prepare("
-            SELECT j.progress_extracted, j.progress_total, j.profile_id, p.target_count
-            FROM jobs j
-            LEFT JOIN job_profiles p ON j.profile_id = p.id
-            WHERE j.id = ? 
-            LIMIT 1
-        ");
-        $stmt->execute([$id]);
-        $job = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if ($job) {
-            $stats['target'] = (int)($job['target_count'] ?? 0);  // From profile
-            $stats['progress_extracted'] = (int)($job['progress_extracted'] ?? 0);
-            $stats['progress_total'] = (int)($job['progress_total'] ?? 0);
+        // Check in-memory cache first (much faster)
+        if (isset(self::$cache[$hash])) {
+            return true;
         }
         
-        // Get actual count of extracted emails from extracted_emails table
-        $stmt2 = $pdo->prepare("SELECT COUNT(*) FROM extracted_emails WHERE job_id = ?");
-        $stmt2->execute([$id]);
-        $stats['extracted'] = (int)$stmt2->fetchColumn();
+        $db = Database::connect();
         
-        // Queries processed is same as progress_extracted for now
-        $stats['queries_processed'] = $stats['progress_extracted'];
+        $stmt = $db->prepare("SELECT COUNT(*) as count FROM bloomfilter WHERE hash = ?");
+        $stmt->execute([$hash]);
+        $result = $stmt->fetch();
         
-    } catch (Exception $e) {
-        // If tables don't exist yet, return default stats
-    }
-
-    return $stats;
-}
-
-/**
- * Update campaign progress for real-time stats
- */
-function update_campaign_progress(PDO $pdo, int $campaignId, int $sent, int $total, string $status = 'sending') {
-    try {
-        // When updating to 'completed' status or 'sending' status, use GREATEST to ensure we don't overwrite
-        // a higher value that workers may have incremented to
-        if ($status === 'completed' || $status === 'sending') {
-            $stmt = $pdo->prepare("UPDATE campaigns SET progress_sent = GREATEST(progress_sent, ?), progress_total = ?, progress_status = ? WHERE id = ?");
-            $stmt->execute([$sent, $total, $status, $campaignId]);
-        } else {
-            // For other statuses (queued, draft), just set the values directly
-            $stmt = $pdo->prepare("UPDATE campaigns SET progress_sent = ?, progress_total = ?, progress_status = ? WHERE id = ?");
-            $stmt->execute([$sent, $total, $status, $campaignId]);
+        $exists = $result['count'] > 0;
+        
+        // Cache the result
+        if ($exists) {
+            self::$cache[$hash] = true;
         }
-    } catch (Exception $e) {
-        // Ignore errors gracefully (column might not exist in older schemas)
-        error_log("Failed to update campaign progress: " . $e->getMessage());
-    }
-}
-
-/**
- * Get campaign progress for real-time stats
- */
-function get_campaign_progress(PDO $pdo, int $campaignId): array {
-    try {
-        $stmt = $pdo->prepare("SELECT progress_sent, progress_total, progress_status, status FROM campaigns WHERE id = ?");
-        $stmt->execute([$campaignId]);
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        if ($row) {
-            return [
-                'sent' => (int)$row['progress_sent'],
-                'total' => (int)$row['progress_total'],
-                'status' => $row['progress_status'] ?? 'draft',
-                'campaign_status' => $row['status'] ?? 'draft',
-                'percentage' => $row['progress_total'] > 0 ? round(($row['progress_sent'] / $row['progress_total']) * 100, 1) : 0
-            ];
-        }
-    } catch (Exception $e) {
-        // Graceful fallback for older schemas without progress columns
-        error_log("Failed to get campaign progress: " . $e->getMessage());
-    }
-    return ['sent' => 0, 'total' => 0, 'status' => 'draft', 'campaign_status' => 'draft', 'percentage' => 0];
-}
-
-function get_profiles(PDO $pdo) {
-    $stmt = $pdo->query("SELECT * FROM job_profiles ORDER BY id ASC");
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
-}
-
-function get_rotation_settings(PDO $pdo) {
-    $stmt = $pdo->query("SELECT * FROM rotation_settings WHERE id = 1");
-    $row  = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$row) {
-        $pdo->exec("INSERT INTO rotation_settings(id) VALUES(1)");
-        $stmt = $pdo->query("SELECT * FROM rotation_settings WHERE id = 1");
-        $row  = $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    return $row;
-}
-
-function update_rotation_settings(PDO $pdo, array $data) {
-    // Only update columns that exist in the schema (rotation_enabled, workers, emails_per_worker)
-    $stmt = $pdo->prepare("
-        UPDATE rotation_settings
-        SET rotation_enabled = :rotation_enabled,
-            workers = :workers,
-            emails_per_worker = :emails_per_worker
-        WHERE id = 1
-    ");
-    $stmt->execute([
-        ':rotation_enabled'      => $data['rotation_enabled'],
-        ':workers'               => $data['workers'] ?? 4,
-        ':emails_per_worker'     => $data['emails_per_worker'] ?? $data['messages_per_worker'] ?? 100,
-    ]);
-}
-
-function get_contact_lists(PDO $pdo) {
-    $sql = "
-        SELECT l.*, COUNT(c.id) AS contact_count
-        FROM contact_lists l
-        LEFT JOIN contacts c ON c.list_id = l.id
-        GROUP BY l.id
-        ORDER BY l.created_at DESC
-    ";
-    $stmt = $pdo->query($sql);
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
-}
-
-function get_contact_list(PDO $pdo, int $id) {
-    $stmt = $pdo->prepare("SELECT * FROM contact_lists WHERE id = ?");
-    $stmt->execute([$id]);
-    return $stmt->fetch(PDO::FETCH_ASSOC);
-}
-
-function get_contacts_for_list(PDO $pdo, int $listId) {
-    $stmt = $pdo->prepare("SELECT * FROM contacts WHERE list_id = ? ORDER BY created_at DESC");
-    $stmt->execute([$listId]);
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
-}
-
-function pick_next_profile(PDO $pdo) {
-    $settings = get_rotation_settings($pdo);
-    if ((int)$settings['rotation_enabled'] !== 1) {
-        return null;
-    }
-
-    $profiles = get_profiles($pdo);
-    $active = array_values(array_filter($profiles, function ($p) {
-        return (int)$p['active'] === 1;
-    }));
-
-    if (empty($active)) return null;
-
-    if ($settings['mode'] === 'random') {
-        return $active[array_rand($active)];
-    }
-
-    $lastId = (int)$settings['last_profile_id'];
-    $next = null;
-    if ($lastId === 0) {
-        $next = $active[0];
-    } else {
-        $foundIndex = null;
-        foreach ($active as $i => $p) {
-            if ((int)$p['id'] === $lastId) {
-                $foundIndex = $i;
-                break;
-            }
-        }
-        if ($foundIndex === null || $foundIndex === (count($active)-1)) {
-            $next = $active[0];
-        } else {
-            $next = $active[$foundIndex+1];
-        }
-    }
-
-    if ($next) {
-        $stmt = $pdo->prepare("UPDATE rotation_settings SET last_profile_id = ? WHERE id = 1");
-        $stmt->execute([$next['id']]);
-    }
-
-    return $next;
-}
-
-function find_profile_for_campaign(PDO $pdo, array $campaign) {
-    $from = trim($campaign['from_email'] ?? '');
-    $profiles = get_profiles($pdo);
-
-    if ($from !== '') {
-        foreach ($profiles as $p) {
-            if ((int)$p['active'] === 1 && strtolower($p['from_email']) === strtolower($from)) {
-                return $p;
-            }
-        }
-    }
-    foreach ($profiles as $p) {
-        if ((int)$p['active'] === 1) {
-            return $p;
-        }
-    }
-    return null;
-}
-
-/**
- * Check if an 'open' event exists for a campaign/recipient (safe PHP-based check)
- */
-function has_open_event_for_rcpt(PDO $pdo, int $campaignId, string $rcpt): bool {
-    if ($rcpt === '') return false;
-    try {
-        $stmt = $pdo->prepare("SELECT details FROM events WHERE campaign_id = ? AND event_type = 'open' LIMIT 2000");
-        $stmt->execute([$campaignId]);
-        foreach ($stmt as $row) {
-            $d = json_decode($row['details'], true);
-            if (is_array($d) && isset($d['rcpt']) && strtolower($d['rcpt']) === strtolower($rcpt)) {
-                return true;
-            }
-        }
-    } catch (Exception $e) {}
-    return false;
-}
-
-/**
- * Buffered event logger for improved performance during high-volume sends
- * Batches event inserts to reduce database round-trips
- */
-class BufferedEventLogger {
-    private $pdo;
-    private $buffer = [];
-    private $bufferSize = 50; // Insert every 50 events
-    private $campaignId;
-    
-    public function __construct(PDO $pdo, int $campaignId, int $bufferSize = 50) {
-        $this->pdo = $pdo;
-        $this->campaignId = $campaignId;
-        $this->bufferSize = max(1, $bufferSize);
+        
+        return $exists;
     }
     
     /**
-     * Add an event to the buffer
+     * Bulk check multiple emails at once - much faster than individual checks
      */
-    public function log(string $eventType, array $details) {
-        $this->buffer[] = [
-            'campaign_id' => $this->campaignId,
-            'event_type' => $eventType,
-            'details' => json_encode($details)
-        ];
-        
-        // Flush if buffer is full
-        if (count($this->buffer) >= $this->bufferSize) {
-            $this->flush();
+    public static function filterExisting(array $emails): array {
+        if (empty($emails)) {
+            return [];
         }
+        
+        $unique = [];
+        $hashes = [];
+        
+        foreach ($emails as $email) {
+            $hash = self::normalize($email);
+            
+            // Skip if already in memory cache
+            if (isset(self::$cache[$hash])) {
+                continue;
+            }
+            
+            $hashes[$hash] = $email;
+        }
+        
+        if (empty($hashes)) {
+            return [];
+        }
+        
+        // Bulk query database in batches to avoid large IN clauses
+        $db = Database::connect();
+        $hashKeys = array_keys($hashes);
+        $existingHashes = [];
+        
+        // Process in batches to avoid MySQL max_allowed_packet issues
+        $batches = array_chunk($hashKeys, self::BULK_CHECK_BATCH_SIZE);
+        
+        foreach ($batches as $batch) {
+            $placeholders = implode(',', array_fill(0, count($batch), '?'));
+            $stmt = $db->prepare("SELECT hash FROM bloomfilter WHERE hash IN ($placeholders)");
+            $stmt->execute($batch);
+            
+            while ($row = $stmt->fetch()) {
+                $existingHashes[$row['hash']] = true;
+                // Add to cache
+                self::$cache[$row['hash']] = true;
+            }
+        }
+        
+        // Return emails that don't exist yet
+        foreach ($hashes as $hash => $email) {
+            if (!isset($existingHashes[$hash])) {
+                $unique[] = $email;
+            }
+        }
+        
+        return $unique;
     }
     
     /**
-     * Flush all buffered events to database
+     * Bulk add multiple emails at once
      */
-    public function flush() {
-        if (empty($this->buffer)) {
+    public static function addBulk(array $emails): void {
+        if (empty($emails)) {
             return;
         }
         
+        $hashes = [];
+        foreach ($emails as $email) {
+            $hash = self::normalize($email);
+            $hashes[] = $hash;
+            self::$cache[$hash] = true;
+        }
+        
+        // Trim cache if too large
+        if (count(self::$cache) > self::$cacheSize) {
+            self::$cache = array_slice(self::$cache, -self::$cacheSize, null, true);
+        }
+        
+        if (empty($hashes)) {
+            return;
+        }
+        
+        $db = Database::connect();
+        
         try {
-            // Build batch insert
-            $values = [];
-            $params = [];
-            foreach ($this->buffer as $event) {
-                $values[] = "(?, ?, ?)";
-                $params[] = $event['campaign_id'];
-                $params[] = $event['event_type'];
-                $params[] = $event['details'];
+            // Build bulk insert
+            $values = implode(',', array_fill(0, count($hashes), '(?)'));
+            $stmt = $db->prepare("INSERT IGNORE INTO bloomfilter (hash) VALUES $values");
+            $stmt->execute($hashes);
+        } catch (PDOException $e) {
+            // Silently fail - duplicates are expected
+        }
+    }
+    
+    private static function normalize(string $email): string {
+        // Normalize email and return SHA-256 hash
+        $email = strtolower(trim($email));
+        
+        return hash('sha256', $email);
+    }
+}
+
+// ============================================================================
+// EMAIL EXTRACTOR CLASS
+// ============================================================================
+
+class EmailExtractor {
+    // Comprehensive email regex pattern
+    private static string $emailPattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/';
+    
+    public static function extractEmails(string $text): array {
+        $emails = [];
+        preg_match_all(self::$emailPattern, $text, $matches);
+        
+        if (!empty($matches[0])) {
+            foreach ($matches[0] as $email) {
+                $email = strtolower(trim($email));
+                // Validate email
+                if (self::isValidEmail($email)) {
+                    $emails[] = $email;
+                }
             }
+        }
+        
+        return array_unique($emails);
+    }
+    
+    public static function extractEmailsFromUrl(string $url, int $timeout = 5): array {
+        $emails = [];
+        
+        try {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+            curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
             
-            $sql = "INSERT INTO events (campaign_id, event_type, details) VALUES " . implode(", ", $values);
-            $stmt = $this->pdo->prepare($sql);
-            $stmt->execute($params);
+            $content = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
             
-            // Clear buffer
-            $this->buffer = [];
+            if ($httpCode === 200 && $content) {
+                $emails = self::extractEmails($content);
+            }
         } catch (Exception $e) {
-            error_log("BufferedEventLogger flush error: " . $e->getMessage());
-            // Don't throw - we don't want to stop sending if logging fails
+            // Silently fail - page scraping is optional
+        }
+        
+        return $emails;
+    }
+    
+    /**
+     * Extract emails from multiple URLs in parallel using curl_multi
+     * Returns array with url => [emails] mapping
+     */
+    public static function extractEmailsFromUrlsParallel(array $urls, int $timeout = 3): array {
+        $results = [];
+        
+        if (empty($urls)) {
+            return $results;
+        }
+        
+        $curlMulti = new CurlMultiManager(min(count($urls), 100)); // Increased from 50
+        
+        // Add all URLs to the multi handle
+        foreach ($urls as $url) {
+            $curlMulti->addUrl($url, [
+                'timeout' => $timeout,
+                'connect_timeout' => 2 // Reduced from 3 for faster processing
+            ], $url);
+        }
+        
+        // Execute all requests in parallel
+        $responses = $curlMulti->execute();
+        
+        // Process results
+        foreach ($responses as $response) {
+            $url = $response['user_data'];
+            $results[$url] = [];
+            
+            if ($response['http_code'] === 200 && !empty($response['content'])) {
+                $emails = self::extractEmails($response['content']);
+                $results[$url] = $emails;
+            }
+        }
+        
+        $curlMulti->close();
+        
+        return $results;
+    }
+    
+    public static function isValidEmail(string $email): bool {
+        // Basic validation
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        
+        // Verify email structure
+        $parts = explode('@', $email);
+        if (count($parts) !== 2) {
+            return false;
+        }
+        
+        // Get domain for additional checks
+        $domain = self::getDomain($email);
+        
+        // Check against blacklisted/junk domains
+        if (self::isBlacklistedDomain($domain)) {
+            return false;
+        }
+        
+        // Check for placeholder/example emails
+        $localPart = $parts[0];
+        $junkPatterns = ['example', 'test', 'noreply', 'no-reply', 'admin', 'info', 'contact', 'support'];
+        foreach ($junkPatterns as $pattern) {
+            if (stripos($localPart, $pattern) !== false || stripos($email, $pattern) !== false) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Check if domain is blacklisted (famous sites, social media, etc.)
+     * Note: gmail.com and yahoo.com are NOT blacklisted as they can be explicitly selected via filters
+     */
+    public static function isBlacklistedDomain(string $domain): bool {
+        // Famous sites that don't provide value for email extraction
+        $blacklist = [
+            // Social media
+            'facebook.com', 'fb.com', 'twitter.com', 'x.com', 'instagram.com', 
+            'linkedin.com', 'pinterest.com', 'tiktok.com', 'snapchat.com',
+            'reddit.com', 'tumblr.com', 'whatsapp.com', 'telegram.org',
+            
+            // Search engines & tech giants
+            'google.com', 'bing.com', 'yandex.com',
+            'amazon.com', 'microsoft.com', 'apple.com', 'cloudflare.com',
+            
+            // Common service providers
+            'wordpress.com', 'wix.com', 'squarespace.com', 'godaddy.com',
+            'namecheap.com', 'hostgator.com', 'bluehost.com',
+            
+            // Email/communication
+            'mailchimp.com', 'sendgrid.com', 'mailgun.com', 'postmarkapp.com',
+            
+            // Video/media platforms
+            'youtube.com', 'vimeo.com', 'dailymotion.com', 'twitch.tv',
+            
+            // E-commerce platforms
+            'ebay.com', 'etsy.com', 'shopify.com', 'alibaba.com',
+            
+            // Common junk/placeholder domains
+            'example.com', 'example.org', 'test.com', 'localhost',
+            'sentry.io', 'gravatar.com', 'github.com', 'gitlab.com',
+            
+            // News/media sites
+            'cnn.com', 'bbc.com', 'nytimes.com', 'forbes.com', 'techcrunch.com',
+            
+            // Government/education (usually not useful for marketing)
+            'wikipedia.org', 'wikimedia.org'
+        ];
+        
+        // Check exact match
+        if (in_array($domain, $blacklist)) {
+            return true;
+        }
+        
+        // Check if domain ends with blacklisted TLD
+        foreach (['.gov', '.edu', '.mil'] as $tld) {
+            if (str_ends_with($domain, $tld)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    public static function getDomain(string $email): string {
+        $parts = explode('@', $email);
+        return isset($parts[1]) ? strtolower($parts[1]) : '';
+    }
+    
+    public static function matchesFilter(?string $filter, string $email): bool {
+        if (!$filter || $filter === 'all') {
+            return true;
+        }
+        
+        $domain = self::getDomain($email);
+        
+        switch ($filter) {
+            case 'gmail':
+                return $domain === 'gmail.com';
+            case 'yahoo':
+                return in_array($domain, ['yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'yahoo.de']);
+            case 'business':
+                // Not free email providers
+                $freeProviders = ['gmail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'hotmail.com', 
+                                 'outlook.com', 'aol.com', 'mail.com', 'protonmail.com'];
+                return !in_array($domain, $freeProviders);
+            default:
+                return true;
+        }
+    }
+}
+
+// ============================================================================
+// CURL MULTI MANAGER CLASS - For Parallel HTTP Requests
+// ============================================================================
+
+class CurlMultiManager {
+    // Configuration constants
+    private const DEFAULT_MAX_CONNECTIONS = 100; // Increased for maximum performance
+    private const MAX_HOST_CONNECTIONS = 20; // Increased for better parallelism
+    
+    private $multiHandle;
+    private array $handles = [];
+    private array $handleData = [];
+    private int $maxConnections;
+    
+    public function __construct(int $maxConnections = self::DEFAULT_MAX_CONNECTIONS) {
+        $this->maxConnections = min($maxConnections, 200); // Cap at 200 for safety (increased from 100)
+        $this->multiHandle = curl_multi_init();
+        
+        // Set max total connections and max per host
+        if (defined('CURLMOPT_MAX_TOTAL_CONNECTIONS')) {
+            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_TOTAL_CONNECTIONS, $this->maxConnections);
+        }
+        if (defined('CURLMOPT_MAX_HOST_CONNECTIONS')) {
+            curl_multi_setopt($this->multiHandle, CURLMOPT_MAX_HOST_CONNECTIONS, self::MAX_HOST_CONNECTIONS);
         }
     }
     
     /**
-     * Destructor ensures buffer is flushed
+     * Add a URL to fetch in parallel
      */
-    public function __destruct() {
-        $this->flush();
-    }
-}
-
-/**
- * Main send function — unchanged semantics but tolerant to forced profile and structured results from senders.
- *
- * Added $profileOverrides parameter (associative array) that may contain per-profile runtime overrides:
- * e.g. ['send_rate' => <messages_per_second>]
- */
-function send_campaign_real(PDO $pdo, array $campaign, string $recipientsText, bool $isTest = false, ?int $forceProfileId = null, array $profileOverrides = [])
-{
-    $recipients = array_filter(array_map('trim', preg_split("/\r\n|\n|\r|,/", $recipientsText)));
-    if (empty($recipients)) {
-        return;
-    }
-
-    $rotSettings      = get_rotation_settings($pdo);
-    $rotationEnabled  = (int)$rotSettings['rotation_enabled'] === 1;
-
-    $total = count($recipients);
-    if (!$isTest) {
-        try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='sending', total_recipients=? WHERE id=?");
-            $stmt->execute([$total, $campaign['id']]);
-            // Initialize progress tracking
-            update_campaign_progress($pdo, $campaign['id'], 0, $total, 'sending');
-        } catch (Exception $e) {}
-    }
-
-    $ins = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-
-    $ok = 0;
-    $failed = 0;
-
-    $attempted = [];
-
-    foreach ($recipients as $email) {
-        $emailLower = strtolower(trim($email));
-        if ($emailLower === '') continue;
-
-        if (in_array($emailLower, $attempted, true)) {
-            continue;
+    public function addUrl(string $url, array $options = [], $userData = null): void {
+        $ch = curl_init($url);
+        
+        // Default options for performance
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $options['timeout'] ?? 5); // Reduced from 10
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $options['connect_timeout'] ?? 3); // Reduced from 5
+        curl_setopt($ch, CURLOPT_USERAGENT, $options['user_agent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        curl_setopt($ch, CURLOPT_ENCODING, ''); // Enable compression
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 2); // Reduced from 3 for speed
+        
+        // SSL verification - configurable for environments with SSL issues
+        // In production, keep SSL verification enabled for security
+        $sslVerify = $options['ssl_verify'] ?? true;
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, $sslVerify);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, $sslVerify ? 2 : 0);
+        
+        // HTTP/2 for better performance (if available)
+        if (defined('CURL_HTTP_VERSION_2_0')) {
+            curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
         }
-        $attempted[] = $emailLower;
-
-        try {
-            if (is_unsubscribed($pdo, $emailLower)) {
-                $ins->execute([
-                    $campaign['id'],
-                    'skipped_unsubscribe',
-                    json_encode([
-                        'rcpt' => $emailLower,
-                        'reason' => 'recipient in unsubscribes table',
-                        'test' => $isTest ? 1 : 0,
-                    ])
-                ]);
-                $failed++;
-                // increment sends_used? No - we didn't attempt to send.
-                continue;
-            }
-
-            if ($forceProfileId !== null) {
-                $stmtpf = $pdo->prepare("SELECT * FROM sending_profiles WHERE id = ? LIMIT 1");
-                $stmtpf->execute([$forceProfileId]);
-                $profile = $stmtpf->fetch(PDO::FETCH_ASSOC);
-                if (!$profile) {
-                    throw new Exception("Forced profile not found: {$forceProfileId}");
-                }
-                // Apply runtime overrides if provided (e.g., send_rate)
-                if (!empty($profileOverrides) && isset($profileOverrides['send_rate'])) {
-                    $profile['send_rate'] = (int)$profileOverrides['send_rate'];
-                }
-            } else {
-                if ($rotationEnabled) {
-                    $profile = pick_next_profile($pdo);
-                } else {
-                    $profile = find_profile_for_campaign($pdo, $campaign);
-                }
-            }
-
-            if (!$profile) {
-                throw new Exception("No active sending profile configured.");
-            }
-
-            // Refresh sends_used & max_sends from DB to ensure we don't exceed limit (protect concurrent runs)
-            if (!empty($profile['id'])) {
-                try {
-                    $stmtSU = $pdo->prepare("SELECT COALESCE(sends_used,0) as su FROM sending_profiles WHERE id = ? LIMIT 1");
-                    $stmtSU->execute([$profile['id']]);
-                    $profile['sends_used'] = (int)$stmtSU->fetchColumn();
-                } catch (Exception $e) {
-                    $profile['sends_used'] = (int)($profile['sends_used'] ?? 0);
-                }
-            } else {
-                $profile['sends_used'] = 0;
-            }
-
-            $maxSends = max(0, (int)($profile['max_sends'] ?? 0));
-            if ($maxSends > 0 && $profile['sends_used'] >= $maxSends) {
-                // profile exhausted - record skipped event and continue
-                $ins->execute([
-                    $campaign['id'],
-                    'skipped_max_sends',
-                    json_encode([
-                        'rcpt' => $emailLower,
-                        'profile_id' => $profile['id'] ?? null,
-                        'reason' => 'profile reached max_sends',
-                        'test' => $isTest ? 1 : 0,
-                    ])
-                ]);
-                $failed++;
-                continue;
-            }
-
-            // Resolve FROM address:
-            // - If a profile is forced (worker per-profile) --> always use that profile's from_email.
-            // - Else if rotation is enabled --> use the profile's from_email.
-            // - Else (rotation disabled) --> prefer campaign's from_email, fallback to profile's from_email.
-            $fromToUse = '';
-            if ($forceProfileId !== null) {
-                // Forced per-profile send: use profile's from
-                $fromToUse = trim($profile['from_email'] ?? '');
-            } elseif ($rotationEnabled) {
-                // Global rotation enabled: each profile should send with its own From
-                $fromToUse = trim($profile['from_email'] ?? '');
-            } else {
-                // Rotation disabled: keep the campaign-level From if provided, else fallback to profile
-                $fromToUse = trim($campaign['from_email'] ?? '');
-                if ($fromToUse === '') {
-                    $fromToUse = trim($profile['from_email'] ?? '');
-                }
-            }
-
-            if ($fromToUse === '') {
-                throw new Exception("No FROM address resolved for this send.");
-            }
-
-            $campaignSend = $campaign;
-            $campaignSend['from_email'] = $fromToUse;
-
-            $campaignSend['sender_name'] = trim($profile['sender_name'] ?? '');
-            if ($campaignSend['sender_name'] === '') {
-                $campaignSend['sender_name'] = trim($campaign['sender_name'] ?? '');
-            }
-
-            $htmlTracked = build_tracked_html($campaignSend, $emailLower);
-
-            // Respect overrides for send_rate (profileOverrides wins, then profile setting)
-            $effectiveSendRate = 0;
-            if (!empty($profileOverrides) && isset($profileOverrides['send_rate'])) {
-                $effectiveSendRate = (int)$profileOverrides['send_rate'];
-            } elseif (!empty($profile['send_rate'])) {
-                $effectiveSendRate = (int)$profile['send_rate'];
-            } else {
-                $effectiveSendRate = 0;
-            }
-
-            if (isset($profile['type']) && $profile['type'] === 'api') {
-                $res = api_send_mail($profile, $campaignSend, $emailLower, $htmlTracked);
-            } else {
-                $res = smtp_send_mail($profile, $campaignSend, $emailLower, $htmlTracked);
-            }
-
-            // After attempting send, increment sends_used (persist)
-            if (!empty($profile['id'])) {
-                try {
-                    $stmtInc = $pdo->prepare("UPDATE sending_profiles SET sends_used = COALESCE(sends_used,0) + 1 WHERE id = ?");
-                    $stmtInc->execute([$profile['id']]);
-                } catch (Exception $ex) {
-                    // ignore
-                }
-            }
-
-            if (!is_array($res)) {
-                $ins->execute([
-                    $campaign['id'],
-                    'bounce',
-                    json_encode([
-                        'rcpt'  => $emailLower,
-                        'error' => 'Invalid send function response',
-                        'profile_id' => isset($profile['id']) ? $profile['id'] : null,
-                        'via'   => isset($profile['type']) ? $profile['type'] : null,
-                        'test'  => $isTest ? 1 : 0,
-                        'mode'  => 'sync',
-                    ])
-                ]);
-                add_to_unsubscribes($pdo, $emailLower);
-                try {
-                    if (!empty($profile) && isset($profile['id']) && ($profile['type'] ?? '') === 'smtp') {
-                        $stmt = $pdo->prepare("UPDATE sending_profiles SET active = 0 WHERE id = ?");
-                        $stmt->execute([$profile['id']]);
-                        $ins->execute([
-                            $campaign['id'],
-                            'profile_disabled',
-                            json_encode([
-                                'profile_id' => $profile['id'],
-                                'reason' => 'invalid send function response',
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                    }
-                } catch (Exception $ex) {}
-                $failed++;
-                continue;
-            }
-
-            if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                $ins->execute([
-                    $campaign['id'],
-                    'delivered',
-                    json_encode([
-                        'rcpt'       => $emailLower,
-                        'profile_id' => $profile['id'] ?? null,
-                        'via'        => $profile['type'] ?? null,
-                        'smtp_code'  => $res['code'] ?? null,
-                        'smtp_msg'   => $res['msg'] ?? '',
-                        'stage'      => $res['stage'] ?? 'done',
-                        'test'       => $isTest ? 1 : 0,
-                        'mode'       => 'sync',
-                    ])
-                ]);
-                $ok++;
-            } else {
-                $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-
-                $ins->execute([
-                    $campaign['id'],
-                    $etype,
-                    json_encode([
-                        'rcpt'       => $emailLower,
-                        'profile_id' => $profile['id'] ?? null,
-                        'via'        => $profile['type'] ?? null,
-                        'smtp_code'  => $res['code'] ?? null,
-                        'smtp_msg'   => $res['msg'] ?? '',
-                        'stage'      => $res['stage'] ?? 'unknown',
-                        'test'       => $isTest ? 1 : 0,
-                        'mode'       => 'sync',
-                        'log'        => $res['log'] ?? [],
-                    ])
-                ]);
-
-                if ($etype === 'bounce') {
-                    add_to_unsubscribes($pdo, $emailLower);
-                }
-
-                try {
-                    if (!empty($profile) && isset($profile['id']) && ($profile['type'] ?? '') === 'smtp' && $etype === 'bounce') {
-                        $stmt = $pdo->prepare("UPDATE sending_profiles SET active = 0 WHERE id = ?");
-                        $stmt->execute([$profile['id']]);
-
-                        $ins->execute([
-                            $campaign['id'],
-                            'profile_disabled',
-                            json_encode([
-                                'profile_id' => $profile['id'],
-                                'reason' => 'bounce/connection failure during send',
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                    }
-                } catch (Exception $ex) { /* ignore */ }
-
-                $failed++;
-            }
-        } catch (Exception $e) {
-            $ins->execute([
-                $campaign['id'],
-                'bounce',
-                json_encode([
-                    'rcpt'        => $emailLower,
-                    'error'       => $e->getMessage(),
-                    'profile_id'  => isset($profile['id']) ? $profile['id'] : null,
-                    'via'         => isset($profile['type']) ? $profile['type'] : null,
-                    'test'        => $isTest ? 1 : 0,
-                    'mode'        => 'exception',
-                ])
-            ]);
-            add_to_unsubscribes($pdo, $emailLower);
-
-            try {
-                if (!empty($profile) && isset($profile['id']) && ($profile['type'] ?? '') === 'smtp') {
-                    $stmt = $pdo->prepare("UPDATE sending_profiles SET active = 0 WHERE id = ?");
-                    $stmt->execute([$profile['id']]);
-                }
-            } catch (Exception $ex) {}
-
-            // increment sends_used even on exception to count attempt
-            if (!empty($profile['id'])) {
-                try {
-                    $stmtInc = $pdo->prepare("UPDATE sending_profiles SET sends_used = COALESCE(sends_used,0) + 1 WHERE id = ?");
-                    $stmtInc->execute([$profile['id']]);
-                } catch (Exception $_) {}
-            }
-
-            $failed++;
-        }
-
-        // Throttle according to effective send rate (overrides or profile)
-        $sendRate = 0;
-        if (!empty($profileOverrides) && isset($profileOverrides['send_rate'])) {
-            $sendRate = (int)$profileOverrides['send_rate'];
-        } elseif (!empty($profile) && isset($profile['send_rate'])) {
-            $sendRate = (int)$profile['send_rate'];
-        } else {
-            $sendRate = 0;
-        }
-
-        if ($sendRate > 0) {
-            $micro = (int)(1000000 / max(1, $sendRate));
-            if ($micro > 0) {
-                usleep($micro);
+        
+        // Keep-alive for connection reuse
+        curl_setopt($ch, CURLOPT_TCP_KEEPALIVE, 1);
+        curl_setopt($ch, CURLOPT_TCP_KEEPIDLE, 120);
+        curl_setopt($ch, CURLOPT_TCP_KEEPINTVL, 60);
+        
+        // POST request if needed
+        if (isset($options['post']) && $options['post']) {
+            curl_setopt($ch, CURLOPT_POST, true);
+            if (isset($options['postfields'])) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $options['postfields']);
             }
         }
         
-        // Update progress periodically (every 10 emails)
-        if (!$isTest && ($ok + $failed) % PROGRESS_UPDATE_FREQUENCY === 0) {
-            update_campaign_progress($pdo, $campaign['id'], $ok + $failed, $total, 'sending');
+        // Custom headers
+        if (isset($options['headers'])) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $options['headers']);
         }
-    }
-
-    // Final progress and status update - CRITICAL: This must always execute
-    if (!$isTest) {
-        // Mark progress as completed
-        update_campaign_progress($pdo, $campaign['id'], $ok + $failed, $total, 'completed');
         
-        // Update main campaign status to 'sent'
-        try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-            $result = $stmt->execute([$campaign['id']]);
-            if (!$result) {
-                error_log("Failed to update campaign status to sent for campaign ID: {$campaign['id']}");
-                // Fallback: retry status update with fresh prepared statement
-                $fallbackStmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                $fallbackStmt->execute([$campaign['id']]);
-            } else {
-                error_log("Successfully updated campaign {$campaign['id']} status to sent (simple mode)");
-            }
-        } catch (Exception $e) {
-            error_log("Exception updating campaign status to sent (simple): " . $e->getMessage());
-            // Final fallback: attempt one last status update
-            try {
-                $fallbackStmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                $fallbackStmt->execute([$campaign['id']]);
-                error_log("Fallback status update successful for campaign {$campaign['id']}");
-            } catch (Exception $e2) {
-                error_log("Fallback status update also failed: " . $e2->getMessage());
-            }
-        }
-    }
-}
-
-///////////////////////
-//  CONCURRENT EMAIL SENDING ARCHITECTURE
-///////////////////////
-/**
- * CONCURRENT EMAIL SENDING SYSTEM
- * ================================
- * 
- * This system implements high-performance concurrent email sending using PHP's pcntl extension
- * for process forking. When pcntl is not available, it falls back to sequential processing.
- * 
- * ARCHITECTURE OVERVIEW:
- * 
- * 1. MULTI-LEVEL PARALLELIZATION
- *    - Level 1: Profile-level parallelization (rotation mode)
- *      When rotation is enabled with multiple profiles, each profile gets a separate process
- *    - Level 2: Connection-level parallelization (within each profile)
- *      Each profile spawns N workers based on connection_numbers setting
- *    - Level 3: Batch-level persistent connections (within each worker)
- *      Each worker sends batch_size emails before reconnecting to SMTP
- * 
- * 2. PROCESS HIERARCHY
- *    Main Process
- *    ├── Profile Worker 1 (if rotation enabled)
- *    │   ├── Connection Worker 1
- *    │   ├── Connection Worker 2
- *    │   └── Connection Worker N
- *    ├── Profile Worker 2
- *    │   └── ...
- *    └── Profile Worker M
- * 
- * 3. KEY FUNCTIONS
- *    - send_campaign_with_rotation(): Entry point for multi-profile campaigns
- *    - send_campaign_with_connections(): Entry point for single-profile campaigns
- *    - send_campaign_with_connections_for_profile_concurrent(): Spawns connection workers
- *    - process_worker_batch(): Worker function that runs in forked process
- * 
- * 4. CONFIGURATION
- *    - connection_numbers: Number of concurrent SMTP connections (1-40, default 5)
- *    - batch_size: Emails per connection before reconnecting (1-500, default 50)
- *    - rotation_enabled: Use multiple profiles concurrently
- * 
- * 5. THREAD SAFETY
- *    - Each worker creates its own database connection
- *    - Workers log events independently to avoid contention
- *    - Parent processes count results via database queries
- *    - Worker PIDs tracked in event details for debugging
- * 
- * 6. PERFORMANCE CHARACTERISTICS
- *    Example: 10,000 emails, 2 profiles, 10 workers per profile, batch size 50
- *    - 2 profile processes (parallel)
- *    - Each profile spawns 10 workers (parallel within profile)
- *    - Total: 20 concurrent workers in this example (2 profiles × 10 workers)
- *    - Each worker processes emails in batches
- *    - Worker count is unlimited - can be scaled based on system resources
- *    - Theoretical: ~Nx speedup vs sequential (where N = total workers)
- *    - Actual speedup limited by: system resources (CPU, memory), SMTP server limits,
- *      network capacity, and PHP process management overhead
- * 
- * 7. FALLBACK BEHAVIOR
- *    - If pcntl_fork unavailable: Sequential processing with same batch optimization
- *    - If fork fails: Logs error and continues with remaining workers
- *    - Test mode: Always sequential for predictability
- */
-
-/**
- * Worker function to process a batch of emails in a separate process
- * This runs in a forked child process and exits when done
- * 
- * @param array $dbConfig Database configuration
- * @param array $profile SMTP profile
- * @param array $campaign Campaign data
- * @param array $recipients Recipients for this worker
- * @param int $batchSize Batch size for reconnecting
- * @param bool $isTest Whether this is a test send
- */
-function process_worker_batch(array $dbConfig, array $profile, array $campaign, array $recipients, bool $isTest = false) {
-    // Create new PDO connection for this worker process
-    try {
-        $pdo = new PDO(
-            "mysql:host={$dbConfig['host']};dbname={$dbConfig['name']};charset=utf8mb4",
-            $dbConfig['user'],
-            $dbConfig['pass'],
-            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
-        );
-    } catch (Exception $e) {
-        error_log("Worker PDO error: " . $e->getMessage());
-        exit(1);
+        $handleId = (int)$ch;
+        $this->handles[$handleId] = $ch;
+        $this->handleData[$handleId] = [
+            'url' => $url,
+            'user_data' => $userData,
+            'started' => microtime(true)
+        ];
+        
+        curl_multi_add_handle($this->multiHandle, $ch);
     }
     
-    $campaignId = (int)$campaign['id'];
-    $ins = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-    
-    $sent = 0;
-    $failed = 0;
-    $processedCount = 0;
-    $lastProgressUpdate = 0; // Track when we last updated progress
-    
-    // Prepare campaign for sending
-    $campaignSend = $campaign;
-    $campaignSend['from_email'] = trim($profile['from_email'] ?? $campaign['from_email']);
-    $campaignSend['sender_name'] = trim($profile['sender_name'] ?? $campaign['sender_name']);
-    
-    // Process all recipients assigned to this worker
-    // Build HTML map for each recipient
-    $htmlMap = [];
-    foreach ($recipients as $emailLower) {
-        $htmlMap[$emailLower] = build_tracked_html($campaignSend, $emailLower);
-    }
-    
-    try {
-        if (isset($profile['type']) && $profile['type'] === 'api') {
-            // API sending - send individually
-            foreach ($recipients as $emailLower) {
-                $res = api_send_mail($profile, $campaignSend, $emailLower, $htmlMap[$emailLower]);
-                
-                if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                    $ins->execute([
-                        $campaignId,
-                        'delivered',
-                        json_encode([
-                            'rcpt' => $emailLower,
-                            'profile_id' => $profile['id'] ?? null,
-                            'via' => 'worker_' . ($profile['type'] ?? 'api'),
-                            'smtp_code' => $res['code'] ?? null,
-                            'test' => $isTest ? 1 : 0,
-                            'worker_pid' => getmypid(),
-                        ])
-                    ]);
-                    $sent++;
-                } else {
-                    $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-                    $ins->execute([
-                        $campaignId,
-                        $etype,
-                        json_encode([
-                            'rcpt' => $emailLower,
-                            'profile_id' => $profile['id'] ?? null,
-                            'via' => 'worker_' . ($profile['type'] ?? 'api'),
-                            'smtp_code' => $res['code'] ?? null,
-                            'smtp_msg' => $res['msg'] ?? '',
-                            'test' => $isTest ? 1 : 0,
-                            'worker_pid' => getmypid(),
-                        ])
-                    ]);
-                    if ($etype === 'bounce') {
-                        add_to_unsubscribes($pdo, $emailLower);
-                    }
-                    $failed++;
-                }
-                
-                // Update progress periodically
-                $processedCount++;
-                if ($processedCount - $lastProgressUpdate >= PROGRESS_UPDATE_FREQUENCY) {
-                    try {
-                        $pdo->exec("UPDATE campaigns SET progress_sent = progress_sent + " . ($processedCount - $lastProgressUpdate) . " WHERE id = " . $campaignId);
-                        $lastProgressUpdate = $processedCount;
-                    } catch (Exception $e) {}
-                }
-            }
-        } else {
-            // SMTP batch sending with persistent connection
-            $batchResult = smtp_send_batch($profile, $campaignSend, $recipients, $htmlMap);
+    /**
+     * Execute all pending requests in parallel
+     */
+    public function execute(): array {
+        $results = [];
+        
+        // Execute all handles
+        do {
+            $status = curl_multi_exec($this->multiHandle, $active);
             
-            if (isset($batchResult['results']) && is_array($batchResult['results'])) {
-                foreach ($batchResult['results'] as $recipientEmail => $res) {
-                    if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                        $ins->execute([
-                            $campaignId,
-                            'delivered',
-                            json_encode([
-                                'rcpt' => $recipientEmail,
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => 'worker_smtp',
-                                'smtp_code' => $res['code'] ?? null,
-                                'test' => $isTest ? 1 : 0,
-                                'worker_pid' => getmypid(),
-                            ])
-                        ]);
-                        $sent++;
-                    } else {
-                        $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-                        $ins->execute([
-                            $campaignId,
-                            $etype,
-                            json_encode([
-                                'rcpt' => $recipientEmail,
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => 'worker_smtp',
-                                'smtp_code' => $res['code'] ?? null,
-                                'smtp_msg' => $res['msg'] ?? '',
-                                'test' => $isTest ? 1 : 0,
-                                'worker_pid' => getmypid(),
-                            ])
-                        ]);
-                        if ($etype === 'bounce') {
-                            add_to_unsubscribes($pdo, $recipientEmail);
-                        }
-                        $failed++;
-                    }
-                    
-                    // Update progress periodically
-                    $processedCount++;
-                    if ($processedCount - $lastProgressUpdate >= PROGRESS_UPDATE_FREQUENCY) {
-                        try {
-                            $pdo->exec("UPDATE campaigns SET progress_sent = progress_sent + " . ($processedCount - $lastProgressUpdate) . " WHERE id = " . $campaignId);
-                            $lastProgressUpdate = $processedCount;
-                        } catch (Exception $e) {}
-                    }
-                }
-            } else {
-                // Batch failed entirely
-                foreach ($recipients as $emailLower) {
-                    $ins->execute([
-                        $campaignId,
-                        'bounce',
-                        json_encode([
-                            'rcpt' => $emailLower,
-                            'error' => $batchResult['error'] ?? 'Worker connection failed',
-                            'profile_id' => $profile['id'] ?? null,
-                            'via' => 'worker_smtp',
-                            'test' => $isTest ? 1 : 0,
-                            'worker_pid' => getmypid(),
-                        ])
-                    ]);
-                    add_to_unsubscribes($pdo, $emailLower);
-                    $failed++;
-                }
+            // Wait for activity on any curl handle
+            if ($active) {
+                curl_multi_select($this->multiHandle, 0.1);
             }
-        }
-    } catch (Exception $e) {
-        foreach ($recipients as $emailLower) {
-            $ins->execute([
-                $campaignId,
-                'bounce',
-                json_encode([
-                    'rcpt' => $emailLower,
-                    'error' => 'Worker exception: ' . $e->getMessage(),
-                    'profile_id' => $profile['id'] ?? null,
-                    'test' => $isTest ? 1 : 0,
-                    'worker_pid' => getmypid(),
-                ])
-            ]);
-            add_to_unsubscribes($pdo, $emailLower);
-            $failed++;
-        }
-    }
-    
-    // Final progress update for any remaining emails not yet reported
-    if (!$isTest && $processedCount > $lastProgressUpdate) {
-        $remaining = $processedCount - $lastProgressUpdate;
-        try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET progress_sent = progress_sent + ? WHERE id = ?");
-            $stmt->execute([$remaining, $campaignId]);
-        } catch (Exception $e) {
-            error_log("Worker final progress update error: " . $e->getMessage());
-        }
-    }
-    
-    exit(0);
-}
-
-/**
- * Concurrent version of send_campaign_with_connections_for_profile
- * Uses process forking to send via multiple concurrent connections
- */
-function send_campaign_with_connections_for_profile_concurrent(PDO $pdo, array $campaign, array $recipients, array $profile, bool $isTest = false) {
-    global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
-    
-    if (empty($recipients)) {
-        return ['sent' => 0, 'failed' => 0];
-    }
-    
-    $campaignId = (int)$campaign['id'];
-    
-    // Get workers count from profile - NO MAXIMUM LIMIT - accepts ANY value
-    $workers = max(MIN_WORKERS, (int)($profile['workers'] ?? DEFAULT_WORKERS));
-    
-    // OPTIONAL logging for monitoring (NOT a limit)
-    if ($workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Profile {$profile['id']} using $workers workers for campaign $campaignId (NOT an error)");
-    }
-    
-    $messagesPerWorker = max(MIN_MESSAGES_PER_WORKER, (int)($profile['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER));
-    
-    $ins = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-    
-    // Filter out unsubscribed recipients
-    $validRecipients = [];
-    $failed = 0;
-    foreach ($recipients as $email) {
-        $emailLower = strtolower(trim($email));
-        if ($emailLower === '' || in_array($emailLower, $validRecipients, true)) {
-            continue;
-        }
+        } while ($active && $status == CURLM_OK);
         
-        if (is_unsubscribed($pdo, $emailLower)) {
-            $ins->execute([
-                $campaignId,
-                'skipped_unsubscribe',
-                json_encode([
-                    'rcpt' => $emailLower,
-                    'reason' => 'unsubscribed',
-                    'test' => $isTest ? 1 : 0,
-                ])
-            ]);
-            $failed++;
-            continue;
-        }
-        
-        $validRecipients[] = $emailLower;
-    }
-    
-    // Divide recipients across workers using round-robin with messagesPerWorker as batch size
-    $totalValidRecipients = count($validRecipients);
-    if ($totalValidRecipients === 0) {
-        return ['sent' => 0, 'failed' => $failed];
-    }
-    
-    // Spawn up to $workers parallel processes (but not more than total recipients)
-    $actualWorkers = min($workers, $totalValidRecipients);
-    
-    // Distribute recipients using round-robin with messagesPerWorker as batch size
-    // This matches the spawn_parallel_workers logic
-    $workerRecipients = array_fill(0, $actualWorkers, []);
-    $cycleDelayMs = (int)($profile['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS);
-    
-    $recipientIdx = 0;
-    $roundCount = 0;
-    while ($recipientIdx < $totalValidRecipients) {
-        // Apply cycle delay between rounds (except for the first round)
-        if ($roundCount > 0 && $cycleDelayMs > 0) {
-            usleep($cycleDelayMs * 1000);
-        }
-        
-        for ($workerIdx = 0; $workerIdx < $actualWorkers && $recipientIdx < $totalValidRecipients; $workerIdx++) {
-            $chunkSize = min($messagesPerWorker, $totalValidRecipients - $recipientIdx);
-            $chunk = array_slice($validRecipients, $recipientIdx, $chunkSize);
-            $workerRecipients[$workerIdx] = array_merge($workerRecipients[$workerIdx], $chunk);
-            $recipientIdx += $chunkSize;
-        }
-        
-        $roundCount++;
-    }
-    
-    // Convert to worker batches array (filter out empty)
-    $workerBatches = [];
-    foreach ($workerRecipients as $recips) {
-        if (!empty($recips)) {
-            $workerBatches[] = $recips;
-        }
-    }
-    
-    // Check if pcntl extension is available for true concurrency
-    $canFork = function_exists('pcntl_fork') && function_exists('pcntl_waitpid');
-    
-    if (!$canFork) {
-        // Fallback to sequential processing if pcntl not available
-        return send_campaign_with_connections_for_profile($pdo, $campaign, $recipients, $profile, $isTest);
-    }
-    
-    // Prepare database config for workers
-    $dbConfig = [
-        'host' => $DB_HOST,
-        'name' => $DB_NAME,
-        'user' => $DB_USER,
-        'pass' => $DB_PASS,
-    ];
-    
-    $workerPids = [];
-    
-    // Spawn worker processes for each worker batch
-    foreach ($workerBatches as $workerIdx => $batchRecipients) {
-        if (empty($batchRecipients)) continue;
-        
-        $pid = pcntl_fork();
-        
-        if ($pid === -1) {
-            // Fork failed - log error and continue with next
-            error_log("Failed to fork worker process for worker $workerIdx");
-            continue;
-        } elseif ($pid === 0) {
-            // Child process - process this batch
-            process_worker_batch($dbConfig, $profile, $campaign, $batchRecipients, $isTest);
-            // process_worker_batch calls exit(), so we never reach here
-        } else {
-            // Parent process - store child PID
-            $workerPids[] = $pid;
-        }
-    }
-    
-    // Parent process: wait for all workers to complete
-    $sent = 0;
-    foreach ($workerPids as $pid) {
-        $status = 0;
-        pcntl_waitpid($pid, $status);
-        // Note: We can't easily get sent/failed counts from child processes
-        // The database events table will have the accurate data
-    }
-    
-    // Count results from database for accurate totals
-    try {
-        $stmt = $pdo->prepare("
-            SELECT COUNT(*) 
-            FROM events 
-            WHERE campaign_id = ? 
-            AND event_type = 'delivered' 
-            AND JSON_EXTRACT(details, '$.worker_pid') IS NOT NULL
-            AND created_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
-        ");
-        $stmt->execute([$campaignId]);
-        $sent = (int)$stmt->fetchColumn();
-    } catch (Exception $e) {
-        $sent = 0;
-    }
-    
-    return ['sent' => $sent, 'failed' => $failed];
-}
-
-/**
- * Multi-profile sending function for rotation mode
- * 
- * When rotation is enabled, this function distributes recipients evenly across ALL active profiles.
- * Each profile then uses its own connection_numbers to further parallelize sending.
- * 
- * Example: 1000 emails, 4 active profiles → 250 emails per profile
- * If profile 1 has 10 connections → 25 emails per connection within profile 1
- * 
- * Status flow: draft → queued (orange) → sending (yellow) → sent (green)
- */
-function send_campaign_with_rotation(PDO $pdo, array $campaign, array $recipients, array $activeProfiles, bool $isTest = false) {
-    try {
-        if (empty($recipients) || empty($activeProfiles)) {
-            error_log("send_campaign_with_rotation called with empty recipients or profiles");
-            return ['sent' => 0, 'failed' => count($recipients)];
-        }
-        
-        $total = count($recipients);
-        $campaignId = (int)$campaign['id'];
-        
-        error_log("Starting rotation send for campaign {$campaignId} with {$total} recipients and " . count($activeProfiles) . " profiles");
-    
-    // PHASE 1: QUEUED - Set status to queued and prepare batches across profiles
-    if (!$isTest) {
-        update_campaign_progress($pdo, $campaignId, 0, $total, 'queued');
-        try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='queued', total_recipients=? WHERE id=?");
-            $stmt->execute([$total, $campaignId]);
-        } catch (Exception $e) {}
-    }
-    
-    // Divide recipients evenly across all active profiles
-    $profileCount = count($activeProfiles);
-    $recipientsPerProfile = ceil($total / $profileCount);
-    
-    $profileBatches = [];
-    for ($i = 0; $i < $profileCount; $i++) {
-        $start = $i * $recipientsPerProfile;
-        if ($start >= $total) break;
-        
-        $profileRecipients = array_slice($recipients, $start, $recipientsPerProfile);
-        if (!empty($profileRecipients)) {
-            $profileBatches[] = [
-                'profile' => $activeProfiles[$i],
-                'recipients' => $profileRecipients
+        // Collect results
+        foreach ($this->handles as $handleId => $ch) {
+            $content = curl_multi_getcontent($ch);
+            $info = curl_getinfo($ch);
+            $error = curl_error($ch);
+            
+            $elapsed = microtime(true) - $this->handleData[$handleId]['started'];
+            
+            $results[] = [
+                'url' => $this->handleData[$handleId]['url'],
+                'user_data' => $this->handleData[$handleId]['user_data'],
+                'content' => $content,
+                'http_code' => $info['http_code'],
+                'error' => $error,
+                'elapsed' => $elapsed,
+                'info' => $info
             ];
+            
+            curl_multi_remove_handle($this->multiHandle, $ch);
+            curl_close($ch);
+        }
+        
+        // Clear handles for next batch
+        $this->handles = [];
+        $this->handleData = [];
+        
+        return $results;
+    }
+    
+    /**
+     * Get number of handles currently registered
+     */
+    public function getHandleCount(): int {
+        return count($this->handles);
+    }
+    
+    /**
+     * Check if we're at max capacity
+     */
+    public function isFull(): bool {
+        return count($this->handles) >= $this->maxConnections;
+    }
+    
+    /**
+     * Close the multi handle
+     */
+    public function close(): void {
+        if ($this->multiHandle) {
+            curl_multi_close($this->multiHandle);
+            $this->multiHandle = null;
         }
     }
     
-    // PHASE 2: SENDING - Update status to sending
-    if (!$isTest) {
-        update_campaign_progress($pdo, $campaignId, 0, $total, 'sending');
-        try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='sending', total_recipients=? WHERE id=?");
-            $stmt->execute([$total, $campaignId]);
-        } catch (Exception $e) {}
-    }
-    
-    // Check if we can fork processes for concurrent profile sending
-    $canFork = function_exists('pcntl_fork') && function_exists('pcntl_waitpid');
-    
-    $totalSent = 0;
-    $totalFailed = 0;
-    
-    if ($canFork && !$isTest) {
-        // CONCURRENT MODE: Fork a process for each profile
-        global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
-        
-        $profilePids = [];
-        
-        foreach ($profileBatches as $batch) {
-            $profile = $batch['profile'];
-            $profileRecipients = $batch['recipients'];
-            
-            $pid = pcntl_fork();
-            
-            if ($pid === -1) {
-                // Fork failed - fall back to sequential for this profile
-                error_log("Failed to fork process for profile {$profile['id']}");
-                $result = send_campaign_with_connections_for_profile_concurrent(
-                    $pdo, 
-                    $campaign, 
-                    $profileRecipients, 
-                    $profile, 
-                    $isTest
-                );
-                $totalSent += $result['sent'];
-                $totalFailed += $result['failed'];
-            } elseif ($pid === 0) {
-                // Child process - handle this profile
-                // Create new PDO connection for child
-                try {
-                    $childPdo = new PDO(
-                        "mysql:host={$DB_HOST};dbname={$DB_NAME};charset=utf8mb4",
-                        $DB_USER,
-                        $DB_PASS,
-                        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
-                    );
-                } catch (Exception $e) {
-                    error_log("Child PDO error: " . $e->getMessage());
-                    exit(1);
-                }
-                
-                // Process this profile's recipients with concurrent connections
-                send_campaign_with_connections_for_profile_concurrent(
-                    $childPdo, 
-                    $campaign, 
-                    $profileRecipients, 
-                    $profile, 
-                    $isTest
-                );
-                
-                exit(0);
-            } else {
-                // Parent process - store child PID
-                $profilePids[] = $pid;
-            }
-        }
-        
-        // Wait for all profile workers to complete
-        foreach ($profilePids as $pid) {
-            $status = 0;
-            pcntl_waitpid($pid, $status);
-        }
-        
-        // Count results from database
-        try {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND event_type = 'delivered'");
-            $stmt->execute([$campaignId]);
-            $totalSent = (int)$stmt->fetchColumn();
-            
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND event_type IN ('bounce', 'deferred', 'skipped_unsubscribe')");
-            $stmt->execute([$campaignId]);
-            $totalFailed = (int)$stmt->fetchColumn();
-            
-            // Get the actual progress_sent value that workers have been updating
-            $stmt = $pdo->prepare("SELECT progress_sent FROM campaigns WHERE id = ?");
-            $stmt->execute([$campaignId]);
-            $actualProgressSent = (int)$stmt->fetchColumn();
-            
-            // Use the actual progress value if it's higher (workers may have updated it)
-            $totalProcessed = max($totalSent + $totalFailed, $actualProgressSent);
-        } catch (Exception $e) {
-            error_log("Error counting results: " . $e->getMessage());
-            // Use whatever values we have, defaulting to 0 if undefined
-            $totalProcessed = (isset($totalSent) ? $totalSent : 0) + (isset($totalFailed) ? $totalFailed : 0);
-        }
-    } else {
-        // SEQUENTIAL MODE: Process each profile one by one (fallback or test mode)
-        foreach ($profileBatches as $batch) {
-            $profile = $batch['profile'];
-            $profileRecipients = $batch['recipients'];
-            
-            // Use concurrent connections within each profile
-            $result = send_campaign_with_connections_for_profile_concurrent(
-                $pdo, 
-                $campaign, 
-                $profileRecipients, 
-                $profile, 
-                $isTest
-            );
-            
-            $totalSent += $result['sent'];
-            $totalFailed += $result['failed'];
-        }
-    }
-    
-    // Final status update - CRITICAL: This must always execute
-    // Wrapped in try-finally to ensure execution even if errors occur
-    try {
-        if (!$isTest) {
-            // For concurrent mode, use the actual total processed from workers
-            $progressToUpdate = isset($totalProcessed) ? $totalProcessed : ($totalSent + $totalFailed);
-            
-            // Mark as completed in progress tracker
-            update_campaign_progress($pdo, $campaignId, $progressToUpdate, $total, 'completed');
-            
-            // Update main campaign status to 'sent'
-            try {
-                $stmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                $result = $stmt->execute([$campaignId]);
-                if (!$result) {
-                    error_log("Failed to update campaign status to sent for campaign ID: {$campaignId}");
-                    // Force update as fallback (using prepared statement)
-                    $fallbackStmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                    $fallbackStmt->execute([$campaignId]);
-                } else {
-                    error_log("Successfully updated campaign {$campaignId} status to sent (rotation mode)");
-                }
-            } catch (Exception $e) {
-                error_log("Exception updating campaign status to sent (rotation): " . $e->getMessage());
-                // Force update as last resort (using prepared statement)
-                try {
-                    $fallbackStmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                    $fallbackStmt->execute([$campaignId]);
-                    error_log("Fallback status update successful for campaign {$campaignId}");
-                } catch (Exception $e2) {
-                    error_log("Fallback status update also failed: " . $e2->getMessage());
-                }
-            }
-        }
-    } finally {
-        // Ensure we always log completion regardless of any errors
-        error_log("Campaign {$campaignId} rotation send completed: sent={$totalSent}, failed={$totalFailed}, total={$total}");
-    }
-    
-    return ['sent' => $totalSent, 'failed' => $totalFailed];
-    
-    } catch (Throwable $e) {
-        error_log("CRITICAL ERROR in send_campaign_with_rotation: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
-        error_log("Stack trace: " . $e->getTraceAsString());
-        return ['sent' => 0, 'failed' => isset($total) ? $total : 0];
+    public function __destruct() {
+        $this->close();
     }
 }
 
-/**
- * Helper function for sending with a specific profile (used by multi-profile rotation)
- * Does NOT update campaign status - that's handled by the caller
- */
-function send_campaign_with_connections_for_profile(PDO $pdo, array $campaign, array $recipients, array $profile, bool $isTest = false) {
-    if (empty($recipients)) {
-        return ['sent' => 0, 'failed' => 0];
-    }
-    
-    $campaignId = (int)$campaign['id'];
-    
-    // Get workers count from profile - NO MAXIMUM LIMIT - accepts ANY value
-    $workers = max(MIN_WORKERS, (int)($profile['workers'] ?? DEFAULT_WORKERS));
-    
-    // OPTIONAL logging for monitoring (NOT a limit)
-    if ($workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Profile {$profile['id']} using $workers workers for campaign $campaignId (non-concurrent mode)");
-    }
-    
-    $ins = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-    
-    $sent = 0;
-    $failed = 0;
-    $attempted = [];
-    
-    // Filter out unsubscribed and prepare recipients
-    $validRecipients = [];
-    foreach ($recipients as $email) {
-        $emailLower = strtolower(trim($email));
-        if ($emailLower === '' || in_array($emailLower, $attempted, true)) {
-            continue;
-        }
-        $attempted[] = $emailLower;
-        
-        // Check unsubscribed
-        if (is_unsubscribed($pdo, $emailLower)) {
-            $ins->execute([
-                $campaignId,
-                'skipped_unsubscribe',
-                json_encode([
-                    'rcpt' => $emailLower,
-                    'reason' => 'unsubscribed',
-                    'test' => $isTest ? 1 : 0,
-                ])
-            ]);
-            $failed++;
-            continue;
-        }
-        
-        $validRecipients[] = $emailLower;
-    }
-    
-    // Process all valid recipients with this profile
-    // (No batching needed - send all emails directly)
-    
-    // Prepare campaign for sending
-    $campaignSend = $campaign;
-    $campaignSend['from_email'] = trim($profile['from_email'] ?? $campaign['from_email']);
-    $campaignSend['sender_name'] = trim($profile['sender_name'] ?? $campaign['sender_name']);
-    
-    // Build HTML map for each recipient
-    $htmlMap = [];
-    foreach ($validRecipients as $emailLower) {
-        $htmlMap[$emailLower] = build_tracked_html($campaignSend, $emailLower);
-    }
-    
-    try {
-        // Send all recipients
-        if (isset($profile['type']) && $profile['type'] === 'api') {
-            // API sending - send individually
-            foreach ($validRecipients as $emailLower) {
-                $res = api_send_mail($profile, $campaignSend, $emailLower, $htmlMap[$emailLower]);
-                
-                if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                    $ins->execute([
-                        $campaignId,
-                        'delivered',
-                        json_encode([
-                            'rcpt' => $emailLower,
-                            'profile_id' => $profile['id'] ?? null,
-                            'via' => $profile['type'] ?? null,
-                            'smtp_code' => $res['code'] ?? null,
-                            'test' => $isTest ? 1 : 0,
-                        ])
-                    ]);
-                    $sent++;
-                } else {
-                    $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-                    $ins->execute([
-                        $campaignId,
-                        $etype,
-                        json_encode([
-                            'rcpt' => $emailLower,
-                            'profile_id' => $profile['id'] ?? null,
-                            'via' => $profile['type'] ?? null,
-                            'smtp_code' => $res['code'] ?? null,
-                            'smtp_msg' => $res['msg'] ?? '',
-                            'test' => $isTest ? 1 : 0,
-                        ])
-                    ]);
-                    
-                    if ($etype === 'bounce') {
-                        add_to_unsubscribes($pdo, $emailLower);
-                    }
-                    $failed++;
-                }
-            }
-        } else {
-            // SMTP batch sending with persistent connection
-            $batchResult = smtp_send_batch($profile, $campaignSend, $validRecipients, $htmlMap);
-            
-            if (isset($batchResult['results']) && is_array($batchResult['results'])) {
-                foreach ($batchResult['results'] as $recipientEmail => $res) {
-                    if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                        $ins->execute([
-                            $campaignId,
-                            'delivered',
-                            json_encode([
-                                'rcpt' => $recipientEmail,
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => 'smtp_batch',
-                                'smtp_code' => $res['code'] ?? null,
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                        $sent++;
-                    } else {
-                        $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-                        $ins->execute([
-                            $campaignId,
-                            $etype,
-                            json_encode([
-                                'rcpt' => $recipientEmail,
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => 'smtp_batch',
-                                'smtp_code' => $res['code'] ?? null,
-                                'smtp_msg' => $res['msg'] ?? '',
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                        
-                        if ($etype === 'bounce') {
-                            add_to_unsubscribes($pdo, $recipientEmail);
-                        }
-                        $failed++;
-                    }
-                }
-            } else {
-                // Batch failed entirely (connection error)
-                foreach ($validRecipients as $emailLower) {
-                    $ins->execute([
-                        $campaignId,
-                        'bounce',
-                        json_encode([
-                            'rcpt' => $emailLower,
-                            'error' => $batchResult['error'] ?? 'Connection failed',
-                            'profile_id' => $profile['id'] ?? null,
-                            'via' => 'smtp_batch',
-                            'test' => $isTest ? 1 : 0,
-                        ])
-                    ]);
-                    add_to_unsubscribes($pdo, $emailLower);
-                    $failed++;
-                }
-            }
-        }
-    } catch (Exception $e) {
-        // Handle exception
-        foreach ($validRecipients as $emailLower) {
-            $ins->execute([
-                $campaignId,
-                'bounce',
-                json_encode([
-                    'rcpt' => $emailLower,
-                    'error' => 'Exception: ' . $e->getMessage(),
-                    'profile_id' => $profile['id'] ?? null,
-                    'test' => $isTest ? 1 : 0,
-                ])
-            ]);
-            add_to_unsubscribes($pdo, $emailLower);
-            $failed++;
-        }
-    }
-    
-    return ['sent' => $sent, 'failed' => $failed];
-}
+// ============================================================================
+// JOB CLASS
+// ============================================================================
 
-/**
- * Optimized sending function using connection-based batching with persistent connections
- * 
- * Implements a two-phase process:
- * 1. QUEUED phase: Divides recipients evenly across connection_numbers (e.g., 40 connections = 40 batches)
- * 2. SENDING phase: Sends emails using persistent SMTP connections, reconnecting every batch_size emails
- * 
- * Status flow: draft → queued (orange) → sending (yellow) → sent (green)
- */
-function send_campaign_with_connections(PDO $pdo, array $campaign, array $recipients, ?int $profileId = null, bool $isTest = false) {
-    if (empty($recipients)) {
-        return ['sent' => 0, 'failed' => 0];
-    }
+class Job {
+    // Configuration constants
+    private const BULK_INSERT_BATCH_SIZE = 1000;
     
-    $total = count($recipients);
-    $campaignId = (int)$campaign['id'];
-    
-    // Get profile first to determine connection numbers
-    $profile = null;
-    if ($profileId) {
-        $stmt = $pdo->prepare("SELECT * FROM sending_profiles WHERE id = ? LIMIT 1");
-        $stmt->execute([$profileId]);
-        $profile = $stmt->fetch(PDO::FETCH_ASSOC);
-    } else {
-        $profile = find_profile_for_campaign($pdo, $campaign);
-    }
-    
-    if (!$profile) {
-        return ['sent' => 0, 'failed' => $total, 'error' => 'No active profile'];
-    }
-    
-    // PHASE 1: QUEUED - Set status to queued and prepare batches
-    if (!$isTest) {
-        update_campaign_progress($pdo, $campaignId, 0, $total, 'queued');
+    public static function create(int $userId, string $query, string $apiKey, int $maxResults, ?string $country = null, ?string $emailFilter = null): int {
         try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='queued', total_recipients=? WHERE id=?");
-            $stmt->execute([$total, $campaignId]);
-        } catch (Exception $e) {}
-    }
-    
-    // Get workers count from profile - NO MAXIMUM LIMIT - accepts ANY value
-    $workers = max(MIN_WORKERS, (int)($profile['workers'] ?? DEFAULT_WORKERS));
-    
-    // OPTIONAL logging for monitoring (NOT a limit)
-    if ($workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Profile {$profile['id']} using $workers workers for campaign $campaignId (concurrent mode)");
-    }
-    
-    $messagesPerWorker = max(MIN_MESSAGES_PER_WORKER, (int)($profile['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER));
-    
-    $ins = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-    
-    $sent = 0;
-    $failed = 0;
-    $attempted = [];
-    
-    // Filter out unsubscribed and prepare recipients
-    $validRecipients = [];
-    foreach ($recipients as $email) {
-        $emailLower = strtolower(trim($email));
-        if ($emailLower === '' || in_array($emailLower, $attempted, true)) {
-            continue;
-        }
-        $attempted[] = $emailLower;
-        
-        // Check unsubscribed
-        if (is_unsubscribed($pdo, $emailLower)) {
-            $ins->execute([
-                $campaignId,
-                'skipped_unsubscribe',
-                json_encode([
-                    'rcpt' => $emailLower,
-                    'reason' => 'unsubscribed',
-                    'test' => $isTest ? 1 : 0,
-                ])
-            ]);
-            $failed++;
-            continue;
-        }
-        
-        $validRecipients[] = $emailLower;
-    }
-    
-    // WORKER MECHANISM: Divide recipients across workers evenly
-    $totalValidRecipients = count($validRecipients);
-    
-    // Spawn up to $workers parallel processes (but not more than total recipients)
-    $actualWorkers = min($workers, $totalValidRecipients);
-    
-    // Distribute recipients using round-robin with messagesPerWorker as batch size
-    // This matches the spawn_parallel_workers logic
-    $workerRecipients = array_fill(0, $actualWorkers, []);
-    $cycleDelayMs = (int)($profile['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS);
-    
-    $recipientIdx = 0;
-    $roundCount = 0;
-    while ($recipientIdx < $totalValidRecipients) {
-        // Apply cycle delay between rounds (except for the first round)
-        if ($roundCount > 0 && $cycleDelayMs > 0) {
-            usleep($cycleDelayMs * 1000);
-        }
-        
-        for ($workerIdx = 0; $workerIdx < $actualWorkers && $recipientIdx < $totalValidRecipients; $workerIdx++) {
-            $chunkSize = min($messagesPerWorker, $totalValidRecipients - $recipientIdx);
-            $chunk = array_slice($validRecipients, $recipientIdx, $chunkSize);
-            $workerRecipients[$workerIdx] = array_merge($workerRecipients[$workerIdx], $chunk);
-            $recipientIdx += $chunkSize;
-        }
-        
-        $roundCount++;
-    }
-    
-    // Convert to worker batches array (filter out empty)
-    $workerBatches = [];
-    foreach ($workerRecipients as $recips) {
-        if (!empty($recips)) {
-            $workerBatches[] = $recips;
-        }
-    }
-    
-    // PHASE 2: SENDING - Update status to sending when we start actual sending
-    if (!$isTest) {
-        update_campaign_progress($pdo, $campaignId, 0, $total, 'sending');
-        try {
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='sending', total_recipients=? WHERE id=?");
-            $stmt->execute([$total, $campaignId]);
-        } catch (Exception $e) {}
-    }
-    
-    // Prepare campaign for sending
-    $campaignSend = $campaign;
-    $campaignSend['from_email'] = trim($profile['from_email'] ?? $campaign['from_email']);
-    $campaignSend['sender_name'] = trim($profile['sender_name'] ?? $campaign['sender_name']);
-    
-    // Check if we can use concurrent processing
-    $canFork = function_exists('pcntl_fork') && function_exists('pcntl_waitpid');
-    
-    if ($canFork && !$isTest && count($workerBatches) > 1) {
-        // CONCURRENT MODE: Fork a worker for each batch
-        global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
-        
-        $dbConfig = [
-            'host' => $DB_HOST,
-            'name' => $DB_NAME,
-            'user' => $DB_USER,
-            'pass' => $DB_PASS,
-        ];
-        
-        $workerPids = [];
-        
-        foreach ($workerBatches as $workerIdx => $workerRecipients) {
-            $pid = pcntl_fork();
+            $db = Database::connect();
+            $stmt = $db->prepare("INSERT INTO jobs (user_id, query, api_key, max_results, country, email_filter, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
+            $stmt->execute([$userId, $query, $apiKey, $maxResults, $country, $emailFilter]);
             
-            if ($pid === -1) {
-                // Fork failed - log and continue with sequential fallback
-                error_log("Failed to fork worker #$workerIdx");
-                continue;
-            } elseif ($pid === 0) {
-                // Child process - send this batch
-                process_worker_batch($dbConfig, $profile, $campaignSend, $workerRecipients, $isTest);
-                // process_worker_batch calls exit()
-            } else {
-                // Parent process
-                $workerPids[] = $pid;
-            }
-        }
-        
-        // Wait for all workers
-        foreach ($workerPids as $pid) {
-            $status = 0;
-            pcntl_waitpid($pid, $status);
-        }
-        
-        // Count results from database (both sent and failed)
-        try {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND event_type = 'delivered'");
-            $stmt->execute([$campaignId]);
-            $sent = (int)$stmt->fetchColumn();
+            $jobId = (int)$db->lastInsertId();
             
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND event_type IN ('bounce', 'deferred', 'skipped_unsubscribe')");
-            $stmt->execute([$campaignId]);
-            $failed = (int)$stmt->fetchColumn();
-            
-            // Get the actual progress_sent value that workers have been updating
-            $stmt = $pdo->prepare("SELECT progress_sent FROM campaigns WHERE id = ?");
-            $stmt->execute([$campaignId]);
-            $actualProgressSent = (int)$stmt->fetchColumn();
-            
-            // Use the actual progress value if it's higher (workers may have updated it)
-            $totalProcessed = max($sent + $failed, $actualProgressSent);
-        } catch (Exception $e) {
-            $sent = 0;
-            $failed = 0;
-            $totalProcessed = 0;
+            return $jobId;
+        } catch (PDOException $e) {
+            error_log('Job creation database error: ' . $e->getMessage());
+            throw new Exception('Failed to create job: ' . $e->getMessage());
         }
-    } else {
-        // SEQUENTIAL MODE: Process all recipients sequentially (fallback or test mode)
-        // Build HTML map for all recipients
-        $htmlMap = [];
-        foreach ($validRecipients as $emailLower) {
-            $htmlMap[$emailLower] = build_tracked_html($campaignSend, $emailLower);
-        }
-        
-        try {
-            // Send all recipients
-            if (isset($profile['type']) && $profile['type'] === 'api') {
-                // API sending - send individually
-                foreach ($validRecipients as $emailLower) {
-                    $res = api_send_mail($profile, $campaignSend, $emailLower, $htmlMap[$emailLower]);
-                    
-                    if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                        $ins->execute([
-                            $campaignId,
-                            'delivered',
-                            json_encode([
-                                'rcpt' => $emailLower,
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => $profile['type'] ?? null,
-                                'smtp_code' => $res['code'] ?? null,
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                        $sent++;
-                    } else {
-                        $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-                        $ins->execute([
-                            $campaignId,
-                            $etype,
-                            json_encode([
-                                'rcpt' => $emailLower,
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => $profile['type'] ?? null,
-                                'smtp_code' => $res['code'] ?? null,
-                                'smtp_msg' => $res['msg'] ?? '',
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                        
-                        if ($etype === 'bounce') {
-                            add_to_unsubscribes($pdo, $emailLower);
-                        }
-                        $failed++;
-                    }
-                }
-            } else {
-                // SMTP batch sending with persistent connection
-                $batchResult = smtp_send_batch($profile, $campaignSend, $validRecipients, $htmlMap);
-                
-                if (isset($batchResult['results']) && is_array($batchResult['results'])) {
-                    foreach ($batchResult['results'] as $recipientEmail => $res) {
-                        if (!empty($res['ok']) && ($res['type'] ?? '') === 'delivered') {
-                            $ins->execute([
-                                $campaignId,
-                                'delivered',
-                                json_encode([
-                                    'rcpt' => $recipientEmail,
-                                    'profile_id' => $profile['id'] ?? null,
-                                    'via' => 'smtp_batch',
-                                    'smtp_code' => $res['code'] ?? null,
-                                    'test' => $isTest ? 1 : 0,
-                                ])
-                            ]);
-                            $sent++;
-                        } else {
-                            $etype = ($res['type'] === 'deferred') ? 'deferred' : 'bounce';
-                            $ins->execute([
-                                $campaignId,
-                                $etype,
-                                json_encode([
-                                    'rcpt' => $recipientEmail,
-                                    'profile_id' => $profile['id'] ?? null,
-                                    'via' => 'smtp_batch',
-                                    'smtp_code' => $res['code'] ?? null,
-                                    'smtp_msg' => $res['msg'] ?? '',
-                                    'test' => $isTest ? 1 : 0,
-                                ])
-                            ]);
-                            
-                            if ($etype === 'bounce') {
-                                add_to_unsubscribes($pdo, $recipientEmail);
-                            }
-                            $failed++;
-                        }
-                    }
-                } else {
-                    // Batch failed entirely (connection error)
-                    foreach ($validRecipients as $emailLower) {
-                        $ins->execute([
-                            $campaignId,
-                            'bounce',
-                            json_encode([
-                                'rcpt' => $emailLower,
-                                'error' => $batchResult['error'] ?? 'Connection failed',
-                                'profile_id' => $profile['id'] ?? null,
-                                'via' => 'smtp_batch',
-                                'test' => $isTest ? 1 : 0,
-                            ])
-                        ]);
-                        add_to_unsubscribes($pdo, $emailLower);
-                        $failed++;
-                    }
-                }
-            }
-        } catch (Exception $e) {
-            // Handle exception
-            foreach ($validRecipients as $emailLower) {
-                $ins->execute([
-                    $campaignId,
-                    'bounce',
-                    json_encode([
-                        'rcpt' => $emailLower,
-                        'error' => 'Exception: ' . $e->getMessage(),
-                        'profile_id' => $profile['id'] ?? null,
-                        'test' => $isTest ? 1 : 0,
-                    ])
-                ]);
-                add_to_unsubscribes($pdo, $emailLower);
-                $failed++;
-            }
-        }
-        
-        // Update progress periodically
-        if (!$isTest && ($sent + $failed) % PROGRESS_UPDATE_FREQUENCY === 0) {
-            update_campaign_progress($pdo, $campaignId, $sent + $failed, $total, 'sending');
-        }
-    } // End of if-else concurrent/sequential
-    
-    // Final status update - CRITICAL: This must always execute
-    // Wrapped in try-finally to ensure execution even if errors occur
-    try {
-        if (!$isTest) {
-            // For concurrent mode, use the actual total processed from workers
-            $progressToUpdate = isset($totalProcessed) ? $totalProcessed : ($sent + $failed);
-            
-            // Mark as completed in progress tracker
-            update_campaign_progress($pdo, $campaignId, $progressToUpdate, $total, 'completed');
-            
-            // Update main campaign status to 'sent'
-            try {
-                $stmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                $result = $stmt->execute([$campaignId]);
-                if (!$result) {
-                    error_log("Failed to update campaign status to sent for campaign ID: {$campaignId}");
-                    // Force update as fallback (using prepared statement)
-                    $fallbackStmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                    $fallbackStmt->execute([$campaignId]);
-                } else {
-                    error_log("Successfully updated campaign {$campaignId} status to sent");
-                }
-            } catch (Exception $e) {
-                error_log("Exception updating campaign status to sent: " . $e->getMessage());
-                // Force update as last resort (using prepared statement)
-                try {
-                    $fallbackStmt = $pdo->prepare("UPDATE campaigns SET status='sent', sent_at = COALESCE(sent_at, NOW()) WHERE id=?");
-                    $fallbackStmt->execute([$campaignId]);
-                    error_log("Fallback status update successful for campaign {$campaignId}");
-                } catch (Exception $e2) {
-                    error_log("Fallback status update also failed: " . $e2->getMessage());
-                }
-            }
-        }
-    } finally {
-        // Ensure we always log completion regardless of any errors
-        error_log("Campaign {$campaignId} send process completed: sent={$sent}, failed={$failed}, total={$total}");
     }
     
-    return ['sent' => $sent, 'failed' => $failed];
-}
-
-/**
- * IMAP bounce processing — unchanged
- */
-function process_imap_bounces(PDO $pdo) {
-    if (!function_exists('imap_open')) {
-        return;
+    public static function getAll(int $userId): array {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC");
+        $stmt->execute([$userId]);
+        
+        return $stmt->fetchAll();
     }
-
-    $profiles = get_profiles($pdo);
-    $ins = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-
-    foreach ($profiles as $p) {
-        $server = trim($p['bounce_imap_server'] ?? '');
-        $user   = trim($p['bounce_imap_user'] ?? '');
-        $pass   = trim($p['bounce_imap_pass'] ?? '');
-
-        if ($server === '' || $user === '' || $pass === '') continue;
-
-        $mailbox = $server;
-        if (stripos($mailbox, '{') !== 0) {
-            $hostOnly = $mailbox;
-            $mailbox = "{" . $hostOnly . ":993/imap/ssl}INBOX";
-        }
-
-        try {
-            $mbox = @imap_open($mailbox, $user, $pass, 0, 1);
-            if (!$mbox) {
-                @imap_close($mbox);
-                continue;
-            }
-
-            $msgs = @imap_search($mbox, 'UNSEEN');
-            if ($msgs === false) {
-                $msgs = @imap_search($mbox, 'ALL');
-                if ($msgs === false) $msgs = [];
-            }
-
-            foreach ($msgs as $msgno) {
-                $header = @imap_headerinfo($mbox, $msgno);
-                $body = @imap_body($mbox, $msgno);
-
-                $foundEmails = [];
-
-                if ($body) {
-                    if (preg_match_all('/Final-Recipient:\s*.*?;\s*([^\s;<>"]+)/i', $body, $m1)) {
-                        foreach ($m1[1] as $e) $foundEmails[] = $e;
-                    }
-                    if (preg_match_all('/Original-Recipient:\s*.*?;\s*([^\s;<>"]+)/i', $body, $m2)) {
-                        foreach ($m2[1] as $e) $foundEmails[] = $e;
-                    }
-                }
-
-                $hdrText = imap_fetchheader($mbox, $msgno);
-                if ($hdrText) {
-                    if (preg_match_all('/(?:To|Delivered-To|X-Original-To):\s*(.*)/i', $hdrText, $mt)) {
-                        foreach ($mt[1] as $chunk) {
-                            if (preg_match_all('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $chunk, $emails)) {
-                                foreach ($emails[0] as $e) $foundEmails[] = $e;
-                            }
-                        }
-                    }
-                }
-
-                if ($body) {
-                    if (preg_match_all('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $body, $eb)) {
-                        foreach ($eb[0] as $e) $foundEmails[] = $e;
-                    }
-                }
-
-                $foundEmails = array_unique(array_map('strtolower', array_filter(array_map('trim', $foundEmails))));
-                if (!empty($foundEmails)) {
-                    foreach ($foundEmails as $rcpt) {
-                        try {
-                            $details = [
-                                'rcpt' => $rcpt,
-                                'profile_id' => $p['id'],
-                                'source' => 'imap_bounce',
-                                'subject' => isset($header->subject) ? (string)$header->subject : '',
-                            ];
-                            $ins->execute([0, 'bounce', json_encode($details)]);
-                        } catch (Exception $e) {}
-
-                        try {
-                            add_to_unsubscribes($pdo, $rcpt);
-                        } catch (Exception $e) {}
-                    }
-                }
-
-                @imap_setflag_full($mbox, $msgno, "\\Seen");
-            }
-
-            @imap_close($mbox);
-        } catch (Exception $e) {}
-    }
-}
-
-///////////////////////
-//  API ENDPOINT FOR REAL-TIME CAMPAIGN PROGRESS
-///////////////////////
-if (isset($_GET['api']) && $_GET['api'] === 'progress' && isset($_GET['campaign_id'])) {
-    header('Content-Type: application/json');
-    $jobId = (int)$_GET['campaign_id']; // Using campaign_id for backwards compatibility
     
-    try {
-        // Try to get job progress first (for extraction jobs)
-        $stmt = $pdo->prepare("SELECT progress_extracted, progress_total, progress_status, status, active_workers FROM jobs WHERE id = ?");
+    public static function getById(int $jobId): ?array {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
         $stmt->execute([$jobId]);
-        $job = $stmt->fetch(PDO::FETCH_ASSOC);
         
-        if ($job) {
-            // This is an extraction job
-            $extracted = (int)($job['progress_extracted'] ?? 0);
-            $total = (int)($job['progress_total'] ?? 0);
-            $activeWorkers = (int)($job['active_workers'] ?? 0);
+        $result = $stmt->fetch();
+        return $result ?: null;
+    }
+    
+    public static function updateStatus(int $jobId, string $status, int $progress = 0): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE jobs SET status = ?, progress = ? WHERE id = ?");
+        $stmt->execute([$status, $progress, $jobId]);
+    }
+    
+    public static function setError(int $jobId, string $errorMessage): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+        $stmt->execute([$errorMessage, $jobId]);
+    }
+    
+    public static function getResults(int $jobId): array {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT * FROM emails WHERE job_id = ? ORDER BY created_at DESC");
+        $stmt->execute([$jobId]);
+        
+        return $stmt->fetchAll();
+    }
+    
+    public static function getEmailCount(int $jobId): int {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
+        $stmt->execute([$jobId]);
+        $result = $stmt->fetch();
+        return (int)($result['count'] ?? 0);
+    }
+    
+    public static function addEmail(int $jobId, string $email, ?string $country = null, ?string $sourceUrl = null, ?string $sourceTitle = null): bool {
+        if (BloomFilter::exists($email)) {
+            return false; // Skip duplicates
+        }
+        
+        $db = Database::connect();
+        $emailHash = hash('sha256', strtolower($email));
+        $domain = EmailExtractor::getDomain($email);
+        
+        try {
+            $stmt = $db->prepare("INSERT INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$jobId, $email, $emailHash, $domain, $country, $sourceUrl, $sourceTitle]);
             
-            echo json_encode([
-                'success' => true,
-                'progress' => [
-                    'sent' => $extracted,
-                    'extracted' => $extracted,
-                    'total' => $total,
-                    'status' => $job['progress_status'] ?? 'draft',
-                    'campaign_status' => $job['status'] ?? 'draft',
-                    'job_status' => $job['status'] ?? 'draft',
-                    'percentage' => $total > 0 ? round(($extracted / $total) * 100, 1) : 0,
-                    'active_workers' => $activeWorkers
-                ],
-                'stats' => [
-                    'extracted' => $extracted,
-                    'active_workers' => $activeWorkers
-                ]
-            ]);
-            exit;
+            BloomFilter::add($email);
+            return true;
+        } catch (PDOException $e) {
+            // Duplicate hash, skip
+            return false;
         }
-        
-        // Fallback to campaign progress (for email campaigns)
-        $progress = get_campaign_progress($pdo, $jobId);
-        $stats = get_campaign_stats($pdo, $jobId);
-        
-        echo json_encode([
-            'success' => true,
-            'progress' => $progress,
-            'stats' => [
-                'delivered' => $stats['delivered'],
-                'bounce' => $stats['bounce'],
-                'open' => $stats['open'],
-                'click' => $stats['click'],
-                'unsubscribe' => $stats['unsubscribe']
-            ]
-        ]);
-    } catch (Exception $e) {
-        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
     }
-    exit;
-}
-
-///////////////////////
-//  TRACKING ENDPOINTS (open, click, unsubscribe)
-///////////////////////
-if (isset($_GET['t']) && in_array($_GET['t'], ['open','click','unsubscribe'], true)) {
-    $t   = $_GET['t'];
-    $cid = isset($_GET['cid']) ? (int)$_GET['cid'] : 0;
-
-    if ($cid > 0) {
-        $rcpt = '';
-        if (!empty($_GET['r'])) {
-            $rcptDecoded = base64url_decode($_GET['r']);
-            if (is_string($rcptDecoded)) {
-                $rcpt = $rcptDecoded;
-            }
+    
+    /**
+     * Bulk add emails - much faster than individual inserts
+     * Returns number of emails actually added
+     */
+    public static function addEmailsBulk(int $jobId, array $emails, ?string $country = null, array $sources = []): int {
+        if (empty($emails)) {
+            return 0;
         }
-
-        $details = [
-            'rcpt' => $rcpt,
-            'ip'   => $_SERVER['REMOTE_ADDR'] ?? '',
-            'ua'   => $_SERVER['HTTP_USER_AGENT'] ?? '',
-        ];
-
-        $url = '';
-        if ($t === 'click') {
-            $uParam = $_GET['u'] ?? '';
-            if ($uParam !== '') {
-                $decoded = base64url_decode($uParam);
-                if (is_string($decoded)) {
-                    $url = $decoded;
+        
+        $db = Database::connect();
+        $added = 0;
+        
+        // Filter out duplicates using BloomFilter batch method (much faster)
+        $uniqueEmails = BloomFilter::filterExisting($emails);
+        
+        if (empty($uniqueEmails)) {
+            return 0;
+        }
+        
+        // Process in batches to avoid MySQL max_allowed_packet issues
+        $emailBatches = array_chunk($uniqueEmails, self::BULK_INSERT_BATCH_SIZE);
+        
+        foreach ($emailBatches as $batch) {
+            // Build bulk insert query for this batch
+            $values = [];
+            $params = [];
+            
+            foreach ($batch as $email) {
+                $emailHash = hash('sha256', strtolower($email));
+                $domain = EmailExtractor::getDomain($email);
+                $sourceUrl = $sources[$email]['url'] ?? null;
+                $sourceTitle = $sources[$email]['title'] ?? null;
+                
+                $values[] = "(?, ?, ?, ?, ?, ?, ?)";
+                $params[] = $jobId;
+                $params[] = $email;
+                $params[] = $emailHash;
+                $params[] = $domain;
+                $params[] = $country;
+                $params[] = $sourceUrl;
+                $params[] = $sourceTitle;
+            }
+            
+            try {
+                $sql = "INSERT IGNORE INTO emails (job_id, email, email_hash, domain, country, source_url, source_title) VALUES " . implode(", ", $values);
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                $added += $stmt->rowCount();
+            } catch (PDOException $e) {
+                error_log("Bulk insert error for batch: " . $e->getMessage());
+                // Fallback to individual inserts for this batch if bulk fails
+                foreach ($batch as $email) {
+                    $sourceUrl = $sources[$email]['url'] ?? null;
+                    $sourceTitle = $sources[$email]['title'] ?? null;
+                    if (self::addEmail($jobId, $email, $country, $sourceUrl, $sourceTitle)) {
+                        $added++;
+                    }
                 }
             }
-            $details['url'] = $url;
         }
-
-        $eventType = $t === 'open' ? 'open' : ($t === 'click' ? 'click' : 'unsubscribe');
-
-        try {
-            $stmt = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-            $stmt->execute([$cid, $eventType, json_encode($details)]);
-        } catch (Exception $e) {}
-
-        if ($t === 'unsubscribe' && $rcpt !== '') {
-            try {
-                add_to_unsubscribes($pdo, $rcpt);
-            } catch (Exception $e) { /* ignore */ }
-        }
-
-        // Special enhancement: if this is a click and we don't have an 'open' recorded for this rcpt+campaign,
-        // create an estimated open event. This helps when clients block images (Yahoo/AOL etc.).
-        if ($t === 'click' && $rcpt !== '') {
-            try {
-                if (!has_open_event_for_rcpt($pdo, $cid, $rcpt)) {
-                    $estimatedOpen = [
-                        'rcpt' => $rcpt,
-                        'ip'   => $_SERVER['REMOTE_ADDR'] ?? '',
-                        'ua'   => $_SERVER['HTTP_USER_AGENT'] ?? '',
-                        'estimated' => 1,
-                        'source' => 'click_fallback',
-                    ];
-                    $stmt2 = $pdo->prepare("INSERT INTO events (campaign_id, event_type, details) VALUES (?,?,?)");
-                    $stmt2->execute([$cid, 'open', json_encode($estimatedOpen)]);
-                }
-            } catch (Exception $e) {}
-        }
-    }
-
-    if ($t === 'open') {
-        header('Content-Type: image/gif');
-        echo base64_decode('R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==');
-        exit;
-    }
-
-    if ($t === 'click') {
-        if (!empty($url) && preg_match('~^https?://~i', $url)) {
-            // Link tracking enhancement: Replace {{email}} placeholder with actual recipient email
-            // This allows tracking links to pass the recipient's email to destination URLs
-            // Security: Validates email format and URL-encodes for safety
-            if (!empty($rcpt) && strpos($url, '{{email}}') !== false) {
-                // Validate email format to prevent malicious input
-                if (filter_var($rcpt, FILTER_VALIDATE_EMAIL) !== false) {
-                    // URL-encode the email to ensure it's safe for use in URL parameters
-                    // This prevents injection attacks and ensures proper URL formatting
-                    $url = str_replace('{{email}}', urlencode($rcpt), $url);
-                }
-                // If email is invalid, the placeholder remains in the URL (fault-tolerant)
-            }
-            header('Location: ' . $url, true, 302);
-        } else {
-            header('Content-Type: text/plain; charset=utf-8');
-            echo "OK";
-        }
-        exit;
-    }
-
-    if ($t === 'unsubscribe') {
-        header('Content-Type: text/html; charset=utf-8');
-        echo "<!doctype html><html><head><meta charset='utf-8'><title>Unsubscribed</title></head><body style='font-family:system-ui, -apple-system, sans-serif;padding:24px;'>";
-        echo "<h2>Unsubscribed</h2>";
-        echo "<p>You have been unsubscribed. If this was a mistake, please contact the sender.</p>";
-        echo "</body></html>";
-        exit;
+        
+        // Add to BloomFilter in bulk (much faster)
+        BloomFilter::addBulk($uniqueEmails);
+        
+        return $added;
     }
 }
 
-if (isset($_GET['ajax']) && $_GET['ajax'] === 'campaign_stats' && isset($_GET['id'])) {
-    $id = (int)$_GET['id'];
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(get_campaign_stats($pdo, $id));
-    exit;
-}
+// ============================================================================
+// WORKER CLASS
+// ============================================================================
 
-///////////////////////
-//  ACTIONS
-///////////////////////
-// Check both POST and GET for action parameter (API endpoints use GET, forms use POST)
-$action = $_POST['action'] ?? $_GET['action'] ?? null;
-$page   = $_GET['page'] ?? 'list';
-
-if ($action === 'check_connection_profile') {
-    $pid = (int)($_POST['profile_id'] ?? 0);
-    header('Content-Type: application/json; charset=utf-8');
-
-    if ($pid <= 0) {
-        echo json_encode(['ok'=>false,'msg'=>'Invalid profile id']);
-        exit;
-    }
-
-    $stmt = $pdo->prepare("SELECT * FROM sending_profiles WHERE id = ? LIMIT 1");
-    $stmt->execute([$pid]);
-    $profile = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$profile) {
-        echo json_encode(['ok'=>false,'msg'=>'Profile not found']);
-        exit;
-    }
-
-    try {
-        if (($profile['type'] ?? 'smtp') === 'api') {
-            $res = api_check_connection($profile);
-        } else {
-            $res = smtp_check_connection($profile);
-        }
-        echo json_encode($res);
-        exit;
-    } catch (Exception $e) {
-        echo json_encode(['ok'=>false,'msg'=>$e->getMessage()]);
-        exit;
-    }
-}
-
-// AJAX endpoint for real-time campaign progress
-if ($action === 'get_campaign_progress') {
-    $cid = (int)($_GET['campaign_id'] ?? $_POST['campaign_id'] ?? 0);
-    header('Content-Type: application/json; charset=utf-8');
+class Worker {
+    // Configuration constants
+    private const DEFAULT_RATE_LIMIT = 0.1; // seconds between API requests (optimized for maximum parallel performance)
+    private const AUTO_MAX_WORKERS = 1000; // Maximum workers to spawn automatically for maximum performance (increased for maximum parallelization)
+    private const OPTIMAL_RESULTS_PER_WORKER = 20; // 50 workers per 1000 emails = 20 emails per worker
+    private const WORKERS_PER_1000_EMAILS = 50; // Required: 50 workers for every 1000 emails
     
-    if ($cid <= 0) {
-        echo json_encode(['ok'=>false,'error'=>'Invalid campaign ID']);
-        exit;
+    /**
+     * Calculate optimal worker count based on job size
+     * Formula: 50 workers per 1000 emails
+     * Target: Process 1,000,000 emails in ≤10 minutes
+     * Automatically determines the best number of workers for maximum performance
+     * 
+     * Examples:
+     * - 1,000 emails = 50 workers
+     * - 10,000 emails = 500 workers
+     * - 100,000 emails = 1,000 workers (capped at AUTO_MAX_WORKERS)
+     * - 1,000,000 emails = 1,000 workers (calculated 50,000, but capped at AUTO_MAX_WORKERS)
+     */
+    public static function calculateOptimalWorkerCount(int $maxResults): int {
+        // Calculate based on the formula: 50 workers per 1000 emails
+        // Example: 1000 emails = 50 workers, 10,000 emails = 500 workers, 1,000,000 emails = 50,000 workers
+        $calculatedWorkers = (int)ceil(($maxResults / 1000) * self::WORKERS_PER_1000_EMAILS);
+        
+        // Cap at maximum workers to avoid resource exhaustion
+        // Note: For 1M emails, this would require 50,000 workers which exceeds AUTO_MAX_WORKERS
+        // In that case, workers will be capped and each will process more emails
+        $optimalWorkers = min($calculatedWorkers, self::AUTO_MAX_WORKERS);
+        
+        // Ensure at least 1 worker
+        return max(1, $optimalWorkers);
     }
     
-    try {
-        $campaign = get_campaign($pdo, $cid);
-        if (!$campaign) {
-            echo json_encode(['ok'=>false,'error'=>'Campaign not found']);
-            exit;
-        }
+    /**
+     * Calculate estimated time to completion based on current progress
+     * Returns array with ETA seconds, formatted ETA, and processing rate
+     */
+    public static function calculateETA(int $jobId): array {
+        $db = Database::connect();
         
-        // Get event counts
-        $stmt = $pdo->prepare("
-            SELECT 
-                SUM(CASE WHEN event_type = 'delivered' THEN 1 ELSE 0 END) as delivered,
-                SUM(CASE WHEN event_type = 'bounce' THEN 1 ELSE 0 END) as bounced,
-                SUM(CASE WHEN event_type = 'deferred' THEN 1 ELSE 0 END) as deferred,
-                SUM(CASE WHEN event_type = 'skipped_unsubscribe' THEN 1 ELSE 0 END) as skipped,
-                COUNT(*) as total_events
-            FROM events 
-            WHERE campaign_id = ?
-            AND event_type IN ('delivered', 'bounce', 'deferred', 'skipped_unsubscribe')
-        ");
-        $stmt->execute([$cid]);
-        $stats = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        // Get active worker count (workers that logged events in last 10 seconds)
-        $stmt = $pdo->prepare("
-            SELECT COUNT(DISTINCT JSON_EXTRACT(details, '$.worker_pid')) as active_workers
-            FROM events 
-            WHERE campaign_id = ?
-            AND JSON_EXTRACT(details, '$.worker_pid') IS NOT NULL
-            AND created_at >= DATE_SUB(NOW(), INTERVAL 10 SECOND)
-        ");
-        $stmt->execute([$cid]);
-        $workerCount = (int)$stmt->fetchColumn();
-        
-        $response = [
-            'ok' => true,
-            'campaign_id' => $cid,
-            'status' => $campaign['status'],
-            'progress_status' => $campaign['progress_status'] ?? 'draft',
-            'total_recipients' => (int)$campaign['total_recipients'],
-            'progress_sent' => (int)$campaign['progress_sent'],
-            'progress_total' => (int)$campaign['progress_total'],
-            'delivered' => (int)($stats['delivered'] ?? 0),
-            'bounced' => (int)($stats['bounced'] ?? 0),
-            'deferred' => (int)($stats['deferred'] ?? 0),
-            'skipped' => (int)($stats['skipped'] ?? 0),
-            'total_processed' => (int)($stats['total_events'] ?? 0),
-            'active_workers' => $workerCount,
-            'percentage' => 0,
-        ];
-        
-        if ($response['total_recipients'] > 0) {
-            $response['percentage'] = round(($response['total_processed'] / $response['total_recipients']) * 100, 1);
-        }
-        
-        echo json_encode($response);
-        exit;
-    } catch (Exception $e) {
-        echo json_encode(['ok'=>false,'error'=>$e->getMessage()]);
-        exit;
-    }
-}
-
-if ($action === 'create_job' || $action === 'create_campaign') {
-    $name = trim($_POST['name'] ?? '');
-    if ($name === '') {
-        $name = 'New Extraction Job';
-    }
-    $stmt = $pdo->prepare("
-        INSERT INTO jobs (name, status)
-        VALUES (?, 'draft')
-    ");
-    $stmt->execute([$name]);
-    $newId = (int)$pdo->lastInsertId();
-    header("Location: ?page=editor&id={$newId}");
-    exit;
-}
-
-if ($action === 'duplicate_job' || $action === 'duplicate_campaign') {
-    $jid = (int)($_POST['job_id'] ?? $_POST['campaign_id'] ?? 0);
-    if ($jid > 0) {
-        try {
-            $orig = get_job($pdo, $jid);
-            if ($orig) {
-                $newName = $orig['name'] . ' (Copy)';
-                // Create new job with clean state - no timestamps, no progress, no errors
-                $stmt = $pdo->prepare("
-                    INSERT INTO jobs (name, profile_id, target_count, status, progress_status, progress_extracted, progress_total, started_at, completed_at, error_message)
-                    VALUES (?, ?, ?, 'draft', NULL, 0, 0, NULL, NULL, NULL)
-                ");
-                $stmt->execute([
-                    $newName,
-                    $orig['profile_id'] ?? null,
-                    $orig['target_count'] ?? 100,
-                ]);
-                $newId = (int)$pdo->lastInsertId();
-                header("Location: ?page=editor&id={$newId}");
-                exit;
-            }
-        } catch (Exception $e) {}
-    }
-    header("Location: ?page=list");
-    exit;
-}
-
-if ($action === 'bulk_jobs' || $action === 'bulk_campaigns') {
-    $ids = $_POST['job_ids'] ?? $_POST['campaign_ids'] ?? [];
-    $bulk_action = $_POST['bulk_action'] ?? '';
-    if (!is_array($ids) || empty($ids)) {
-        header("Location: ?page=list");
-        exit;
-    }
-    $ids = array_map('intval', $ids);
-    if ($bulk_action === 'delete_selected') {
-        foreach ($ids as $id) {
-            try {
-                $stmt = $pdo->prepare("DELETE FROM extracted_emails WHERE job_id = ?");
-                $stmt->execute([$id]);
-                $stmt = $pdo->prepare("DELETE FROM jobs WHERE id = ?");
-                $stmt->execute([$id]);
-            } catch (Exception $e) {}
-        }
-    } elseif ($bulk_action === 'duplicate_selected') {
-        foreach ($ids as $id) {
-            try {
-                $orig = get_job($pdo, $id);
-                if ($orig) {
-                    $newName = $orig['name'] . ' (Copy)';
-                    $stmt = $pdo->prepare("
-                        INSERT INTO jobs (name, profile_id, target_count, status)
-                        VALUES (?, ?, ?, 'draft')
-                    ");
-                    $stmt->execute([
-                        $newName,
-                        $orig['profile_id'] ?? null,
-                        $orig['target_count'] ?? 100,
-                    ]);
-                }
-            } catch (Exception $e) {}
-        }
-    }
-    header("Location: ?page=list");
-    exit;
-}
-
-if ($action === 'delete_unsubscribes') {
-    // Option A: delete all unsubscribes
-    try {
-        $pdo->beginTransaction();
-        $pdo->exec("DELETE FROM unsubscribes");
-        $pdo->commit();
-    } catch (Exception $e) {
-        try { $pdo->rollBack(); } catch (Exception $_) {}
-    }
-    header("Location: ?page=activity&cleared_unsubscribes=1");
-    exit;
-}
-
-if ($action === 'delete_bounces') {
-    // Delete all events of type 'bounce'
-    try {
-        $pdo->beginTransaction();
-        $stmt = $pdo->prepare("DELETE FROM events WHERE event_type = ?");
-        $stmt->execute(['bounce']);
-        $pdo->commit();
-    } catch (Exception $e) {
-        try { $pdo->rollBack(); } catch (Exception $_) {}
-    }
-    header("Location: ?page=activity&cleared_bounces=1");
-    exit;
-}
-
-if ($action === 'delete_job' || $action === 'delete_campaign') {
-    $jid = (int)($_POST['job_id'] ?? $_POST['campaign_id'] ?? 0);
-    if ($jid > 0) {
-        try {
-            $stmt = $pdo->prepare("DELETE FROM extracted_emails WHERE job_id = ?");
-            $stmt->execute([$jid]);
-            $stmt = $pdo->prepare("DELETE FROM jobs WHERE id = ?");
-            $stmt->execute([$jid]);
-        } catch (Exception $e) {
-            // ignore
-        }
-    }
-    header("Location: ?page=list");
-    exit;
-}
-
-if ($action === 'save_job' || $action === 'save_campaign') {
-    $id        = (int)($_POST['id'] ?? 0);
-    $name      = trim($_POST['name'] ?? '');
-    $profile_id = (int)($_POST['profile_id'] ?? 0);
-    $start_immediately = isset($_POST['start_immediately']) && $_POST['start_immediately'];
-    
-    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
-
-    try {
-        $stmt = $pdo->prepare("
-            UPDATE jobs
-            SET name = ?, profile_id = ?
-            WHERE id = ?
-        ");
-        $stmt->execute([$name, $profile_id, $id]);
-        error_log("SAVE_JOB ACTION: Job {$id} updated");
-        
-        // Verify save was successful
-        $verify = $pdo->prepare("SELECT id, name, profile_id, status FROM jobs WHERE id = ?");
-        $verify->execute([$id]);
-        $saved_job = $verify->fetch(PDO::FETCH_ASSOC);
-        error_log("SAVE_JOB ACTION: Verified job after save: " . json_encode($saved_job));
-        
-        // Check if should start immediately
-        if ($start_immediately) {
-            error_log("SAVE_JOB ACTION: start_immediately flag detected, redirecting to start_job");
-            // Redirect to start_job action directly (more reliable than iframe)
-            header("Location: ?action=start_job&job_id=" . (int)$id);
-            exit;
-        } else {
-            error_log("SAVE_JOB ACTION: start_immediately flag NOT set, normal save flow");
-        }
-    } catch (Exception $e) {
-        error_log("Failed to save job id {$id}: " . $e->getMessage());
-        if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) || strpos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== false) {
-            http_response_code(500);
-            echo json_encode(['error' => 'Failed to save job']);
-            exit;
-        }
-        header("Location: ?page=editor&id={$id}&save_error=1");
-        exit;
-    }
-
-    if (isset($_POST['go_to_review'])) {
-        header("Location: ?page=review&id={$id}");
-    } else {
-        if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) || strpos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== false) {
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(['ok' => 1, 'id' => $id]);
-            exit;
-        }
-        header("Location: ?page=editor&id={$id}&saved=1");
-    }
-    exit;
-}
-
-// Start extraction job action
-if ($action === 'start_job') {
-    $job_id = (int)($_POST['job_id'] ?? $_GET['job_id'] ?? 0);
-    error_log("START_JOB ACTION: ========== STARTING ==========");
-    error_log("START_JOB ACTION: Received job_id=" . $job_id);
-    error_log("START_JOB ACTION: POST data: " . json_encode($_POST));
-    error_log("START_JOB ACTION: GET data: " . json_encode($_GET));
-    
-    if ($job_id <= 0) {
-        error_log("START_JOB ACTION: ERROR - Invalid job_id (<=0)");
-        header("Location: ?page=list&error=invalid_job_id");
-        exit;
-    }
-    
-    if ($job_id > 0) {
-        error_log("START_JOB ACTION: Calling get_job() for job_id={$job_id}");
-        $job = get_job($pdo, $job_id);
-        error_log("START_JOB ACTION: Job fetched: " . ($job ? "YES" : "NO"));
-        
-        if ($job) {
-            error_log("START_JOB ACTION: Job details: " . json_encode($job));
-            error_log("START_JOB ACTION: profile_id = " . ($job['profile_id'] ?? 'NULL') . " (empty=" . (empty($job['profile_id']) ? 'YES' : 'NO') . ")");
-        }
+        // Get job details
+        $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+        $stmt->execute([$jobId]);
+        $job = $stmt->fetch();
         
         if (!$job) {
-            error_log("START_JOB ACTION: ERROR - Job not found in database");
-            header("Location: ?page=list&error=job_not_found");
-            exit;
+            return [
+                'eta_seconds' => 0,
+                'eta_formatted' => 'Unknown',
+                'emails_per_minute' => 0,
+                'completion_percentage' => 0
+            ];
         }
         
-        if (empty($job['profile_id'])) {
-            error_log("START_JOB ACTION: ERROR - Job has no profile_id assigned");
-            header("Location: ?page=list&error=no_profile");
-            exit;
+        $emailsCollected = Job::getEmailCount($jobId);
+        $emailsRequired = (int)$job['max_results'];
+        $completionPercentage = $emailsRequired > 0 ? round(($emailsCollected / $emailsRequired) * 100, 2) : 0;
+        
+        // Calculate time elapsed since job started
+        $createdAt = strtotime($job['created_at']);
+        $currentTime = time();
+        $elapsedSeconds = $currentTime - $createdAt;
+        
+        // Avoid division by zero and handle jobs that just started
+        if ($elapsedSeconds < 1 || $emailsCollected <= 0) {
+            return [
+                'eta_seconds' => 0,
+                'eta_formatted' => 'Calculating...',
+                'emails_per_minute' => 0,
+                'completion_percentage' => $completionPercentage,
+                'elapsed_seconds' => $elapsedSeconds
+            ];
         }
         
-        if ($job && !empty($job['profile_id'])) {
-            error_log("START_JOB ACTION: Job and profile_id valid, continuing...");
-            try {
-                // Get profile information
-                $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
-                $profile_stmt->execute([$job['profile_id']]);
-                $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+        // Calculate processing rate (emails per minute)
+        $emailsPerSecond = $emailsCollected / $elapsedSeconds;
+        $emailsPerMinute = round($emailsPerSecond * 60, 2);
+        
+        // Calculate remaining emails
+        $remainingEmails = max(0, $emailsRequired - $emailsCollected);
+        
+        // Calculate ETA in seconds
+        $etaSeconds = $emailsPerSecond > 0 ? (int)ceil($remainingEmails / $emailsPerSecond) : 0;
+        
+        // Format ETA for display
+        $etaFormatted = self::formatDuration($etaSeconds);
+        
+        return [
+            'eta_seconds' => $etaSeconds,
+            'eta_formatted' => $etaFormatted,
+            'emails_per_minute' => $emailsPerMinute,
+            'completion_percentage' => $completionPercentage,
+            'elapsed_seconds' => $elapsedSeconds,
+            'elapsed_formatted' => self::formatDuration($elapsedSeconds),
+            'emails_collected' => $emailsCollected,
+            'emails_required' => $emailsRequired,
+            'remaining_emails' => $remainingEmails
+        ];
+    }
+    
+    /**
+     * Format duration in seconds to human-readable format
+     */
+    private static function formatDuration(int $seconds): string {
+        if ($seconds <= 0) {
+            return '0s';
+        }
+        
+        $hours = floor($seconds / 3600);
+        $minutes = floor(($seconds % 3600) / 60);
+        $secs = $seconds % 60;
+        
+        $parts = [];
+        if ($hours > 0) {
+            $parts[] = "{$hours}h";
+        }
+        if ($minutes > 0) {
+            $parts[] = "{$minutes}m";
+        }
+        if ($secs > 0 || empty($parts)) {
+            $parts[] = "{$secs}s";
+        }
+        
+        return implode(' ', $parts);
+    }
+    
+    /**
+     * Get system resource usage (RAM and CPU)
+     * Returns array with memory and CPU usage information
+     */
+    public static function getSystemResources(): array {
+        $resources = [
+            'memory_used_mb' => 0,
+            'memory_limit_mb' => 0,
+            'memory_usage_percent' => 0,
+            'cpu_load_average' => [],
+            'peak_memory_mb' => 0
+        ];
+        
+        // Get memory usage
+        $memoryUsed = memory_get_usage(true);
+        $peakMemory = memory_get_peak_usage(true);
+        $memoryLimit = ini_get('memory_limit');
+        
+        // Convert memory limit to bytes
+        $memoryLimitBytes = self::convertToBytes($memoryLimit);
+        
+        $resources['memory_used_mb'] = round($memoryUsed / 1024 / 1024, 2);
+        $resources['peak_memory_mb'] = round($peakMemory / 1024 / 1024, 2);
+        $resources['memory_limit_mb'] = round($memoryLimitBytes / 1024 / 1024, 2);
+        
+        if ($memoryLimitBytes > 0) {
+            $resources['memory_usage_percent'] = round(($memoryUsed / $memoryLimitBytes) * 100, 2);
+        }
+        
+        // Get CPU load average (Unix/Linux only)
+        if (function_exists('sys_getloadavg')) {
+            $loadAvg = sys_getloadavg();
+            $resources['cpu_load_average'] = [
+                '1min' => round($loadAvg[0], 2),
+                '5min' => round($loadAvg[1], 2),
+                '15min' => round($loadAvg[2], 2)
+            ];
+        }
+        
+        return $resources;
+    }
+    
+    /**
+     * Convert PHP memory limit string to bytes
+     */
+    private static function convertToBytes(string $value): int {
+        $value = trim($value);
+        if (empty($value)) {
+            return 0;
+        }
+        
+        $last = strtolower($value[strlen($value)-1]);
+        $value = (int)$value;
+        
+        switch($last) {
+            case 'g':
+                $value *= 1024;
+                // fall through
+            case 'm':
+                $value *= 1024;
+                // fall through
+            case 'k':
+                $value *= 1024;
+        }
+        
+        return $value;
+    }
+    
+    public static function getAll(): array {
+        $db = Database::connect();
+        $stmt = $db->query("SELECT * FROM workers ORDER BY created_at DESC");
+        
+        return $stmt->fetchAll();
+    }
+    
+    public static function register(string $name): int {
+        $db = Database::connect();
+        
+        try {
+            $stmt = $db->prepare("INSERT INTO workers (worker_name, status) VALUES (?, 'idle')");
+            $stmt->execute([$name]);
+            return (int)$db->lastInsertId();
+        } catch (PDOException $e) {
+            // Worker already exists
+            $stmt = $db->prepare("SELECT id FROM workers WHERE worker_name = ?");
+            $stmt->execute([$name]);
+            $result = $stmt->fetch();
+            return $result['id'];
+        }
+    }
+    
+    public static function logError(int $workerId, ?int $jobId, string $errorType, string $errorMessage, ?string $errorDetails = null, string $severity = 'error'): void {
+        $db = Database::connect();
+        
+        try {
+            // Log to worker_errors table
+            $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, error_details, severity) VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$workerId, $jobId, $errorType, $errorMessage, $errorDetails, $severity]);
+            
+            // Update worker's error count and last error
+            $stmt = $db->prepare("UPDATE workers SET error_count = error_count + 1, last_error = ? WHERE id = ?");
+            $stmt->execute([$errorMessage, $workerId]);
+            
+            error_log("Worker #{$workerId} error logged: [{$errorType}] {$errorMessage}");
+        } catch (PDOException $e) {
+            error_log("Failed to log worker error: " . $e->getMessage());
+        }
+    }
+    
+    public static function getErrors(bool $unresolvedOnly = true, int $limit = 50): array {
+        $db = Database::connect();
+        
+        $sql = "SELECT we.*, w.worker_name, j.query as job_query 
+                FROM worker_errors we 
+                LEFT JOIN workers w ON we.worker_id = w.id 
+                LEFT JOIN jobs j ON we.job_id = j.id ";
+        
+        if ($unresolvedOnly) {
+            $sql .= "WHERE we.resolved = FALSE ";
+        }
+        
+        $sql .= "ORDER BY we.created_at DESC LIMIT ?";
+        
+        $stmt = $db->prepare($sql);
+        $stmt->execute([$limit]);
+        
+        return $stmt->fetchAll();
+    }
+    
+    public static function resolveError(int $errorId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE worker_errors SET resolved = TRUE WHERE id = ?");
+        $stmt->execute([$errorId]);
+    }
+    
+    public static function detectStaleWorkers(int $timeoutSeconds = 300): array {
+        $db = Database::connect();
+        
+        // Find workers that are marked as running but haven't sent heartbeat in timeout period
+        $stmt = $db->prepare("
+            SELECT * FROM workers 
+            WHERE status = 'running' 
+            AND last_heartbeat IS NOT NULL 
+            AND TIMESTAMPDIFF(SECOND, last_heartbeat, NOW()) > ?
+        ");
+        $stmt->execute([$timeoutSeconds]);
+        
+        return $stmt->fetchAll();
+    }
+    
+    public static function markWorkerAsCrashed(int $workerId, string $reason): void {
+        $db = Database::connect();
+        
+        // Update worker status to stopped
+        $stmt = $db->prepare("UPDATE workers SET status = 'stopped', last_error = ? WHERE id = ?");
+        $stmt->execute([$reason, $workerId]);
+        
+        // Log the crash as a critical error
+        self::logError($workerId, null, 'worker_crash', $reason, null, 'critical');
+    }
+    
+    public static function updateHeartbeat(int $workerId, string $status, ?int $jobId = null, int $pagesProcessed = 0, int $emailsExtracted = 0): void {
+        $db = Database::connect();
+        
+        // Simple runtime calculation based on created_at (cached in single query)
+        $stmt = $db->prepare("
+            UPDATE workers 
+            SET status = ?, 
+                current_job_id = ?, 
+                last_heartbeat = NOW(), 
+                pages_processed = pages_processed + ?, 
+                emails_extracted = emails_extracted + ?, 
+                runtime_seconds = TIMESTAMPDIFF(SECOND, created_at, NOW())
+            WHERE id = ?
+        ");
+        $stmt->execute([$status, $jobId, $pagesProcessed, $emailsExtracted, $workerId]);
+    }
+    
+    public static function getStats(): array {
+        $db = Database::connect();
+        
+        // Get active workers count
+        $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE status = 'running'");
+        $activeWorkers = $stmt->fetch()['count'];
+        
+        // Get idle workers count
+        $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE status = 'idle'");
+        $idleWorkers = $stmt->fetch()['count'];
+        
+        // Get total pages processed
+        $stmt = $db->query("SELECT SUM(pages_processed) as total FROM workers");
+        $totalPages = $stmt->fetch()['total'] ?? 0;
+        
+        // Get total emails extracted
+        $stmt = $db->query("SELECT SUM(emails_extracted) as total FROM workers");
+        $totalEmails = $stmt->fetch()['total'] ?? 0;
+        
+        // Get average runtime and calculate extraction rate
+        $stmt = $db->query("SELECT AVG(runtime_seconds) as avg, SUM(runtime_seconds) as total_runtime FROM workers WHERE runtime_seconds > 0");
+        $runtimeData = $stmt->fetch();
+        $avgRuntime = (int)($runtimeData['avg'] ?? 0);
+        $totalRuntime = (int)($runtimeData['total_runtime'] ?? 0);
+        
+        // Calculate emails per minute rate
+        $emailsPerMinute = 0;
+        if ($totalRuntime > 0) {
+            $emailsPerMinute = round(($totalEmails / $totalRuntime) * 60, 1);
+        }
+        
+        return [
+            'active_workers' => $activeWorkers,
+            'idle_workers' => $idleWorkers,
+            'total_pages' => $totalPages,
+            'total_emails' => $totalEmails,
+            'avg_runtime' => $avgRuntime,
+            'emails_per_minute' => $emailsPerMinute
+        ];
+    }
+    
+    public static function getNextJob(?int $jobId = null): ?array {
+        $db = Database::connect();
+        
+        // Use transaction to prevent race conditions
+        $db->beginTransaction();
+        
+        try {
+            // First check job_queue for pending chunks
+            // If jobId is specified, only get queue items for that specific job
+            if ($jobId !== null) {
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute([$jobId]);
+            } else {
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute();
+            }
+            $queueItem = $stmt->fetch();
+            
+            if ($queueItem) {
+                // Mark this queue item as processing
+                $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
+                $stmt->execute([$queueItem['id']]);
                 
-                error_log("START_JOB ACTION: Profile fetched: " . ($profile ? "YES (id=" . $profile['id'] . ")" : "NO"));
+                // Get the job details
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+                $stmt->execute([$queueItem['job_id']]);
+                $job = $stmt->fetch();
                 
-                if ($profile) {
-                    // Use target from profile only
-                    $targetCount = (int)$profile['target_count'];
+                if ($job) {
+                    // Add queue info to job
+                    $job['queue_id'] = $queueItem['id'];
+                    $job['queue_start_offset'] = $queueItem['start_offset'];
+                    $job['queue_max_results'] = $queueItem['max_results'];
+                }
+                
+                $db->commit();
+                return $job ?: null;
+            }
+            
+            // Fallback to old method: check for pending jobs without queue
+            // If jobId is specified, only check that specific job
+            if ($jobId !== null) {
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
+                $stmt->execute([$jobId]);
+            } else {
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt->execute();
+            }
+            $job = $stmt->fetch();
+            
+            if ($job) {
+                $stmt = $db->prepare("UPDATE jobs SET status = 'running' WHERE id = ?");
+                $stmt->execute([$job['id']]);
+            }
+            
+            $db->commit();
+            return $job ?: null;
+        } catch (PDOException $e) {
+            $db->rollBack();
+            error_log("getNextJob error: " . $e->getMessage());
+            return null;
+        }
+    }
+    
+    public static function markQueueItemComplete(int $queueId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE job_queue SET status = 'completed', completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$queueId]);
+        error_log("✓ Marked queue item {$queueId} as completed");
+    }
+    
+    public static function markQueueItemFailed(int $queueId): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("UPDATE job_queue SET status = 'failed', completed_at = NOW() WHERE id = ?");
+        $stmt->execute([$queueId]);
+        error_log("✗ Marked queue item {$queueId} as failed");
+    }
+    
+    /**
+     * Check if all queue items for a job are complete and update job status accordingly
+     */
+    public static function checkAndUpdateJobCompletion(int $jobId): void {
+        $db = Database::connect();
+        
+        // Get total and completed queue items for this job
+        $stmt = $db->prepare("
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM job_queue 
+            WHERE job_id = ?
+        ");
+        $stmt->execute([$jobId]);
+        $counts = $stmt->fetch();
+        
+        $total = (int)$counts['total'];
+        $completed = (int)$counts['completed'];
+        $failed = (int)$counts['failed'];
+        
+        if ($total == 0) {
+            error_log("  checkAndUpdateJobCompletion: No queue items found for job {$jobId}");
+            return;
+        }
+        
+        // Calculate progress percentage
+        $progress = (int)round(($completed / $total) * 100);
+        
+        error_log("  checkAndUpdateJobCompletion: Job {$jobId} progress = {$progress}% ({$completed}/{$total} queue items completed)");
+        
+        // Update job status based on queue completion
+        if ($completed == $total) {
+            // All queue items completed
+            Job::updateStatus($jobId, 'completed', 100);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED");
+        } elseif ($completed + $failed == $total) {
+            // All queue items either completed or failed
+            Job::updateStatus($jobId, 'completed', $progress);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} marked as COMPLETED (some items failed)");
+        } else {
+            // Still processing
+            Job::updateStatus($jobId, 'running', $progress);
+            error_log("  checkAndUpdateJobCompletion: Job {$jobId} status = running, progress = {$progress}%");
+        }
+    }
+    
+    public static function processResultWithDeepScraping(
+        array $result,
+        int $jobId,
+        ?string $country,
+        ?string $emailFilter,
+        int &$processed,
+        int $maxResults
+    ): void {
+        $title = $result['title'] ?? '';
+        $link = $result['link'] ?? '';
+        $snippet = $result['snippet'] ?? '';
+        
+        // Extract emails from title, link, and snippet
+        $textToScan = $title . ' ' . $link . ' ' . $snippet;
+        $emails = EmailExtractor::extractEmails($textToScan);
+        
+        // Deep scraping: fetch page content if enabled
+        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
+        $deepScrapingThreshold = (int)(Settings::get('deep_scraping_threshold', '5'));
+        
+        if ($deepScraping && $link && count($emails) < $deepScrapingThreshold) {
+            $pageEmails = EmailExtractor::extractEmailsFromUrl($link);
+            $emails = array_merge($emails, $pageEmails);
+            $emails = array_unique($emails);
+        }
+        
+        foreach ($emails as $email) {
+            if ($processed >= $maxResults) {
+                break;
+            }
+            
+            // Apply email filter first before adding
+            if (EmailExtractor::matchesFilter($emailFilter, $email)) {
+                if (Job::addEmail($jobId, $email, $country, $link, $title)) {
+                    $processed++;
+                }
+            }
+        }
+    }
+    
+    /**
+     * Process multiple search results with parallel deep scraping
+     * Much faster than processing one-by-one
+     */
+    public static function processResultsBatchWithParallelScraping(
+        array $results,
+        int $jobId,
+        ?string $country,
+        ?string $emailFilter,
+        int &$processed,
+        int $maxResults
+    ): void {
+        $deepScraping = (bool)(Settings::get('deep_scraping', '1'));
+        $deepScrapingThreshold = (int)(Settings::get('deep_scraping_threshold', '5'));
+        
+        // First pass: extract emails from search results metadata
+        $allEmails = [];
+        $urlsToScrape = [];
+        $sources = [];
+        
+        foreach ($results as $result) {
+            $title = $result['title'] ?? '';
+            $link = $result['link'] ?? '';
+            $snippet = $result['snippet'] ?? '';
+            
+            // Extract from metadata
+            $textToScan = $title . ' ' . $link . ' ' . $snippet;
+            $emails = EmailExtractor::extractEmails($textToScan);
+            
+            foreach ($emails as $email) {
+                $allEmails[] = $email;
+                $sources[$email] = ['url' => $link, 'title' => $title];
+            }
+            
+            // Determine if we need to deep scrape this URL
+            if ($deepScraping && $link && count($emails) < $deepScrapingThreshold) {
+                $urlsToScrape[] = $link;
+            }
+        }
+        
+        // Second pass: parallel deep scraping if enabled and needed
+        if (!empty($urlsToScrape)) {
+            $scrapedResults = EmailExtractor::extractEmailsFromUrlsParallel($urlsToScrape, 3); // Reduced timeout from 5 to 3
+            
+            foreach ($scrapedResults as $url => $emails) {
+                foreach ($emails as $email) {
+                    $allEmails[] = $email;
+                    if (!isset($sources[$email])) {
+                        $sources[$email] = ['url' => $url, 'title' => ''];
+                    }
+                }
+            }
+        }
+        
+        // Remove duplicates
+        $allEmails = array_unique($allEmails);
+        
+        // Filter and add emails in bulk
+        $emailsToAdd = [];
+        foreach ($allEmails as $email) {
+            if ($processed >= $maxResults) {
+                break;
+            }
+            
+            if (EmailExtractor::matchesFilter($emailFilter, $email)) {
+                $emailsToAdd[] = $email;
+                $processed++;
+            }
+        }
+        
+        // Bulk insert for better performance
+        if (!empty($emailsToAdd)) {
+            Job::addEmailsBulk($jobId, $emailsToAdd, $country, $sources);
+        }
+    }
+    
+    public static function processJob(int $jobId, ?int $existingWorkerId = null, ?string $existingWorkerName = null): void {
+        $job = Job::getById($jobId);
+        if (!$job) {
+            return;
+        }
+        
+        echo "Processing job #{$jobId}: {$job['query']}\n";
+        
+        // Register this worker for tracking (or use existing worker)
+        if ($existingWorkerId && $existingWorkerName) {
+            $workerName = $existingWorkerName;
+            $workerId = $existingWorkerId;
+        } else {
+            $workerName = 'cli-worker-' . getmypid();
+            $workerId = self::register($workerName);
+        }
+        self::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+        
+        $apiKey = $job['api_key'];
+        $query = $job['query'];
+        $maxResults = (int)$job['max_results'];
+        $country = $job['country'];
+        $emailFilter = $job['email_filter'];
+        
+        // Check if this is a queue-based job chunk
+        $startOffset = isset($job['queue_start_offset']) ? (int)$job['queue_start_offset'] : 0;
+        $maxToProcess = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : $maxResults;
+        $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
+        
+        $processed = 0;
+        $pagesProcessed = 0;
+        $page = (int)($startOffset / 10) + 1;
+        
+        while ($processed < $maxToProcess) {
+            $data = self::searchSerper($apiKey, $query, $page, $country);
+            
+            if (!$data || !isset($data['organic'])) {
+                break;
+            }
+            
+            $pagesProcessed++;
+            $emailsBefore = $processed;
+            
+            // Use batch processing for better performance
+            if (isset($data['organic']) && count($data['organic']) > 0) {
+                self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxToProcess);
+            }
+            
+            $emailsExtractedThisPage = $processed - $emailsBefore;
+            
+            // Update worker statistics
+            self::updateHeartbeat($workerId, 'running', $jobId, 1, $emailsExtractedThisPage);
+            
+            if ($processed > 0 && $processed % 10 === 0) {
+                echo "  - Progress: {$processed}/{$maxToProcess} emails\n";
+            }
+            
+            if (!isset($data['organic']) || count($data['organic']) === 0) {
+                break;
+            }
+            
+            $page++;
+            
+            // Reduced rate limiting when using parallel scraping (already more efficient)
+            $rateLimit = (float)(Settings::get('rate_limit', (string)self::DEFAULT_RATE_LIMIT));
+            usleep((int)($rateLimit * 1000000));
+        }
+        
+        // Mark queue item as complete
+        if ($queueId) {
+            self::markQueueItemComplete($queueId);
+        }
+        
+        // Update overall job progress
+        self::updateJobProgress($jobId);
+        
+        echo "Job chunk completed! Processed {$processed} emails\n";
+        
+        // Mark worker as idle
+        self::updateHeartbeat($workerId, 'idle', null, 0, 0);
+    }
+    
+    public static function updateJobProgress(int $jobId): void {
+        $db = Database::connect();
+        
+        // Get total queue items and completed items
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM job_queue WHERE job_id = ?");
+        $stmt->execute([$jobId]);
+        $total = $stmt->fetch()['total'];
+        
+        $stmt = $db->prepare("SELECT COUNT(*) as completed FROM job_queue WHERE job_id = ? AND status = 'completed'");
+        $stmt->execute([$jobId]);
+        $completed = $stmt->fetch()['completed'];
+        
+        if ($total > 0) {
+            $progress = (int)(($completed / $total) * 100);
+            
+            // If all queue items are completed, mark job as completed
+            if ($completed === $total) {
+                Job::updateStatus($jobId, 'completed', 100);
+            } else {
+                Job::updateStatus($jobId, 'running', $progress);
+            }
+        }
+    }
+    
+    private static function searchSerper(string $apiKey, string $query, int $page = 1, ?string $country = null): ?array {
+        $url = 'https://google.serper.dev/search';
+        
+        $payload = [
+            'q' => $query,
+            'page' => $page,
+            'num' => 10
+        ];
+        
+        if ($country) {
+            $payload['gl'] = $country;
+        }
+        
+        $data = json_encode($payload);
+        
+        error_log("searchSerper: Calling API with query='{$query}', page={$page}, country={$country}");
+        
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'X-API-KEY: ' . $apiKey,
+            'Content-Type: application/json'
+        ]);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        if ($curlError) {
+            error_log("searchSerper: cURL error: {$curlError}");
+            return null;
+        }
+        
+        error_log("searchSerper: HTTP code={$httpCode}");
+        
+        if ($httpCode === 200 && $response) {
+            $result = json_decode($response, true);
+            if ($result) {
+                error_log("searchSerper: Success, got " . (isset($result['organic']) ? count($result['organic']) : 0) . " organic results");
+                return $result;
+            } else {
+                error_log("searchSerper: JSON decode failed");
+            }
+        } else {
+            error_log("searchSerper: Non-200 response or empty body. Response: " . substr($response, 0, 500));
+        }
+        
+        return null;
+    }
+    
+    public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
+        error_log("processJobImmediately called: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults}");
+        
+        try {
+            $job = Job::getById($jobId);
+            if (!$job) {
+                error_log("processJobImmediately: Job {$jobId} not found");
+                return;
+            }
+            
+            error_log("processJobImmediately: Processing job {$jobId}, query='{$job['query']}'");
+            
+            $apiKey = $job['api_key'];
+            $query = $job['query'];
+            $country = $job['country'];
+            $emailFilter = $job['email_filter'];
+            
+            $processed = 0;
+            $pagesProcessed = 0;
+            $page = (int)($startOffset / 10) + 1;
+            
+            error_log("processJobImmediately: Starting from page {$page}, will process max {$maxResults} emails");
+            
+            while ($processed < $maxResults) {
+                try {
+                    error_log("processJobImmediately: Calling searchSerper, page={$page}");
+                    $data = self::searchSerper($apiKey, $query, $page, $country);
                     
-                    // Update job status to extracting immediately (like old "sending" status)
-                    $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting', progress_total = ?, started_at = NOW() WHERE id = ?");
-                    $stmt->execute([$targetCount, $job_id]);
-                    error_log("START_JOB ACTION: Job {$job_id} status updated to 'extracting', progress_total={$targetCount}");
-                    
-                    $redirect = "?page=list&started_job=" . (int)$job_id;
-                    
-                    // Close session to allow immediate redirect
-                    session_write_close();
-                    
-                    // Use fastcgi_finish_request if available (like old email sending system)
-                    if (function_exists('fastcgi_finish_request')) {
-                        error_log("START_JOB ACTION: Using fastcgi_finish_request method");
-                        header("Location: $redirect");
-                        echo "<!doctype html><html><body>Extracting emails in background... Redirecting.</body></html>";
-                        @ob_end_flush();
-                        @flush();
-                        fastcgi_finish_request();
-                        
-                        ignore_user_abort(true);
-                        set_time_limit(0);
-                        
-                        // Execute extraction in same process (non-blocking for user)
-                        try {
-                            error_log("START_JOB ACTION: Starting perform_extraction for job {$job_id}");
-                            perform_extraction($pdo, $job_id, $job, $profile);
-                            error_log("START_JOB ACTION: perform_extraction completed for job {$job_id}");
-                        } catch (Throwable $e) {
-                            error_log("Job extraction error: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
-                            error_log("Stack trace: " . $e->getTraceAsString());
-                        }
-                        exit;
+                    if (!$data) {
+                        error_log("processJobImmediately: searchSerper returned null/false");
+                        break;
                     }
                     
-                    // Fallback: Try background worker (if fastcgi not available)
-                    error_log("START_JOB ACTION: fastcgi not available, trying background worker");
-                    $spawned = spawn_extraction_worker($pdo, $job_id);
-                    error_log("START_JOB ACTION: Worker spawn result: " . ($spawned ? "SUCCESS" : "FAILED"));
-                    
-                    if ($spawned) {
-                        header("Location: $redirect");
-                        exit;
+                    if (!isset($data['organic'])) {
+                        error_log("processJobImmediately: No organic results in response");
+                        break;
                     }
                     
-                    // Last resort: synchronous extraction (blocking but works everywhere)
-                    error_log("START_JOB ACTION: Using synchronous (blocking) method");
-                    header("Location: $redirect");
-                    echo "<!doctype html><html><body>Extracting emails... Please wait.</body></html>";
-                    @ob_end_flush();
-                    @flush();
+                    error_log("processJobImmediately: Got " . count($data['organic']) . " organic results");
                     
-                    ignore_user_abort(true);
-                    set_time_limit(0);
+                    $pagesProcessed++;
+                    $emailsBefore = $processed;
                     
                     try {
-                        perform_extraction($pdo, $job_id, $job, $profile);
-                        error_log("START_JOB ACTION: Synchronous extraction completed for job {$job_id}");
-                    } catch (Throwable $e) {
-                        error_log("Job extraction error (blocking): " . $e->getMessage());
+                        // Use batch processing with parallel scraping for much better performance
+                        self::processResultsBatchWithParallelScraping($data['organic'], $jobId, $country, $emailFilter, $processed, $maxResults);
+                    } catch (Exception $e) {
+                        error_log("Error processing batch: " . $e->getMessage());
                     }
-                    exit;
-                }
-                error_log("START_JOB ACTION: Profile not found for job {$job_id}");
-            } catch (Exception $e) {
-                error_log("Failed to start job {$job_id}: " . $e->getMessage());
-                header("Location: ?page=editor&id={$job_id}&error=" . urlencode($e->getMessage()));
-                exit;
-            }
-        } else {
-            error_log("START_JOB ACTION: Job check failed - job exists: " . ($job ? "YES" : "NO") . ", has profile_id: " . (!empty($job['profile_id']) ? "YES" : "NO"));
-        }
-    } else {
-        error_log("START_JOB ACTION: Invalid job_id: " . $job_id);
-    }
-    error_log("START_JOB ACTION: Redirecting to list page (fallback)");
-    header("Location: ?page=list");
-    exit;
-}
-
-if ($action === 'send_test_message') {
-    $id = (int)($_POST['id'] ?? 0);
-    $addresses = trim($_POST['test_addresses'] ?? '');
-    $campaign = get_campaign($pdo, $id);
-    if ($campaign && $addresses !== '') {
-        $toUpdate = false;
-        $updFields = [];
-        $updVals = [];
-
-        if (isset($_POST['subject'])) {
-            $toUpdate = true;
-            $updFields[] = "subject = ?";
-            $updVals[] = trim($_POST['subject']);
-        }
-        if (isset($_POST['preheader'])) {
-            $toUpdate = true;
-            $updFields[] = "preheader = ?";
-            $updVals[] = trim($_POST['preheader']);
-        }
-        if (isset($_POST['sender_name'])) {
-            $toUpdate = true;
-            $updFields[] = "sender_name = ?";
-            $updVals[] = trim($_POST['sender_name']);
-        }
-        $unsubscribe_enabled = isset($_POST['unsubscribe_enabled']) ? 1 : 0;
-        if ($unsubscribe_enabled != ($campaign['unsubscribe_enabled'] ?? 0)) {
-            $toUpdate = true;
-            $updFields[] = "unsubscribe_enabled = ?";
-            $updVals[] = $unsubscribe_enabled;
-        }
-
-        if ($toUpdate && !empty($updFields)) {
-            $updVals[] = $id;
-            $sql = "UPDATE campaigns SET " . implode(',', $updFields) . " WHERE id = ?";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute($updVals);
-            $campaign = get_campaign($pdo, $id);
-        }
-
-        $parts = array_filter(array_map('trim', preg_split("/\r\n|\n|\r|,/", $addresses)));
-        $valid = [];
-        foreach ($parts as $p) {
-            if (filter_var($p, FILTER_VALIDATE_EMAIL)) $valid[] = $p;
-        }
-        if (!empty($valid)) {
-            $recipientsText = implode("\n", $valid);
-
-            session_write_close();
-
-            if (function_exists('fastcgi_finish_request')) {
-                header("Location: ?page=review&id={$id}&test_sent=1");
-                echo "<!doctype html><html><body>Sending test in background... Redirecting.</body></html>";
-                @ob_end_flush();
-                @flush();
-                fastcgi_finish_request();
-
-                try {
-                    send_campaign_real($pdo, $campaign, $recipientsText, true);
-                } catch (Exception $e) {}
-                exit;
-            }
-
-            // fallback: try spawn; if spawn fails do synchronous send (web request will wait)
-            $spawned = spawn_background_send($pdo, $id, $recipientsText);
-            if (!$spawned) {
-                // synchronous fallback (guarantees it actually sends)
-                ignore_user_abort(true);
-                set_time_limit(0);
-                try {
-                    send_campaign_real($pdo, $campaign, $recipientsText, true);
-                } catch (Exception $e) {}
-            }
-        }
-    }
-    header("Location: ?page=review&id={$id}&test_sent=1");
-    exit;
-}
-
-if ($action === 'send_campaign') {
-    $id = (int)($_POST['id'] ?? 0);
-    $testRecipients = $_POST['test_recipients'] ?? '';
-    $audience_select = trim($_POST['audience_select'] ?? '');
-    $campaign = get_campaign($pdo, $id);
-    if ($campaign) {
-        $toUpdate = false;
-        $updFields = [];
-        $updVals = [];
-
-        if (isset($_POST['subject'])) {
-            $toUpdate = true;
-            $updFields[] = "subject = ?";
-            $updVals[] = trim($_POST['subject']);
-        }
-        if (isset($_POST['preheader'])) {
-            $toUpdate = true;
-            $updFields[] = "preheader = ?";
-            $updVals[] = trim($_POST['preheader']);
-        }
-        if (isset($_POST['sender_name'])) {
-            $toUpdate = true;
-            $updFields[] = "sender_name = ?";
-            $updVals[] = trim($_POST['sender_name']);
-        }
-        $unsubscribe_enabled = isset($_POST['unsubscribe_enabled']) ? 1 : 0;
-        if ($unsubscribe_enabled != ($campaign['unsubscribe_enabled'] ?? 0)) {
-            $toUpdate = true;
-            $updFields[] = "unsubscribe_enabled = ?";
-            $updVals[] = $unsubscribe_enabled;
-        }
-
-        // If rotation is OFF, allow overriding the campaign.from_email from the Review form select
-        $rotSettings = get_rotation_settings($pdo);
-        $rotationEnabled = (int)$rotSettings['rotation_enabled'] === 1;
-        if (!$rotationEnabled && isset($_POST['from_email'])) {
-            $fromOverride = trim($_POST['from_email']);
-            if ($fromOverride !== '') {
-                $toUpdate = true;
-                $updFields[] = "from_email = ?";
-                $updVals[] = $fromOverride;
-                $campaign['from_email'] = $fromOverride; // keep in-memory
-            }
-        }
-
-        if ($toUpdate && !empty($updFields)) {
-            $updVals[] = $id;
-            $sql = "UPDATE campaigns SET " . implode(',', $updFields) . " WHERE id = ?";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute($updVals);
-            $campaign = get_campaign($pdo, $id);
-        }
-
-        $allRecipients = [];
-
-        if ($audience_select !== '' && strpos($audience_select, 'list:') === 0) {
-            $lid = (int)substr($audience_select, strlen('list:'));
-            if ($lid > 0) {
-                $contacts = get_contacts_for_list($pdo, $lid);
-                foreach ($contacts as $ct) {
-                    $em = trim((string)($ct['email'] ?? ''));
-                    if ($em === '') continue;
-                    if (!filter_var($em, FILTER_VALIDATE_EMAIL)) continue;
-                    if (is_unsubscribed($pdo, $em)) continue;
-                    $allRecipients[] = strtolower($em);
-                }
-            }
-        } else {
-            $parts = array_filter(array_map('trim', preg_split("/\r\n|\n|\r|,/", $testRecipients)));
-            foreach ($parts as $p) {
-                if (!filter_var($p, FILTER_VALIDATE_EMAIL)) continue;
-                if (is_unsubscribed($pdo, $p)) continue;
-                $allRecipients[] = strtolower($p);
-            }
-        }
-
-        $allRecipients = array_values(array_unique($allRecipients));
-
-        if (empty($allRecipients)) {
-            header("Location: ?page=review&id={$id}&no_recipients=1");
-            exit;
-        }
-
-        try {
-            $totalRecipients = count($allRecipients);
-            $stmt = $pdo->prepare("UPDATE campaigns SET status='sending', total_recipients=? WHERE id=?");
-            $stmt->execute([$totalRecipients, $campaign['id']]);
-        } catch (Exception $e) {}
-
-        $recipientsTextFull = implode("\n", $allRecipients);
-
-        $redirect = "?page=list&sent=1&sent_campaign=" . (int)$campaign['id'];
-
-        session_write_close();
-
-        $rotSettings = get_rotation_settings($pdo);
-        $rotationEnabled = (int)$rotSettings['rotation_enabled'] === 1;
-        $activeProfiles = array_values(array_filter(get_profiles($pdo), function($p){ return (int)$p['active'] === 1; }));
-
-        // Check if we should use multi-profile rotation or single profile
-        if ($rotationEnabled && count($activeProfiles) > 1) {
-            // ROTATION MODE: Use ALL active profiles and distribute emails among them
-            // Use fastcgi_finish_request if available to send in background
-            if (function_exists('fastcgi_finish_request')) {
-                header("Location: $redirect");
-                echo "<!doctype html><html><body>Sending in background... Redirecting.</body></html>";
-                @ob_end_flush();
-                @flush();
-                fastcgi_finish_request();
-
-                ignore_user_abort(true);
-                set_time_limit(0);
-
-                // Send using multi-profile rotation function
-                try {
-                    send_campaign_with_rotation($pdo, $campaign, $allRecipients, $activeProfiles, false);
-                } catch (Throwable $e) {
-                    error_log("Campaign send error (rotation fastcgi): " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
-                    error_log("Stack trace: " . $e->getTraceAsString());
-                }
-                exit;
-            }
-
-            // Fallback: send synchronously (blocking)
-            header("Location: $redirect");
-            echo "<!doctype html><html><body>Sending campaign... Please wait.</body></html>";
-            @ob_end_flush();
-            @flush();
-
-            ignore_user_abort(true);
-            set_time_limit(0);
-
-            try {
-                send_campaign_with_rotation($pdo, $campaign, $allRecipients, $activeProfiles, false);
-            } catch (Throwable $e) {
-                error_log("Campaign send error (rotation blocking): " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
-                error_log("Stack trace: " . $e->getTraceAsString());
-            }
-            exit;
-        }
-
-        // SINGLE PROFILE MODE: Use one profile (rotation disabled or only 1 active profile)
-        // Determine which profile to use
-        $profile = null;
-        if (!empty($activeProfiles)) {
-            // No rotation or only one profile: find profile matching campaign's from_email or use first active
-            foreach ($activeProfiles as $p) {
-                if (strtolower($p['from_email']) === strtolower($campaign['from_email'])) {
-                    $profile = $p;
+                    
+                    $emailsExtractedThisPage = $processed - $emailsBefore;
+                    
+                    error_log("processJobImmediately: Processed {$processed}/{$maxResults} emails so far");
+                    
+                    if (!isset($data['organic']) || count($data['organic']) === 0) {
+                        break;
+                    }
+                    
+                    // Stop if we've reached the limit for this queue item
+                    if ($processed >= $maxResults) {
+                        error_log("processJobImmediately: Reached limit of {$maxResults} emails for this queue item");
+                        break;
+                    }
+                    
+                    $page++;
+                    
+                    // Reduced rate limiting when using parallel scraping
+                    $rateLimit = (float)(Settings::get('rate_limit', (string)self::DEFAULT_RATE_LIMIT));
+                    usleep((int)($rateLimit * 1000000));
+                } catch (Exception $e) {
+                    error_log("Error in page processing loop: " . $e->getMessage());
                     break;
                 }
             }
-            if (!$profile) $profile = $activeProfiles[0];
+            
+            error_log("processJobImmediately: Completed. Processed {$processed} emails from {$pagesProcessed} pages");
+            
+        } catch (Exception $e) {
+            error_log("Critical error in processJobImmediately: " . $e->getMessage());
+            throw $e;
         }
+    }
+}
 
-        if (!$profile) {
-            header("Location: ?page=review&id={$id}&send_err=no_profile");
+// ============================================================================
+// SETTINGS CLASS
+// ============================================================================
+
+class Settings {
+    public static function get(string $key, mixed $default = null): mixed {
+        $db = Database::connect();
+        $stmt = $db->prepare("SELECT setting_value FROM settings WHERE setting_key = ?");
+        $stmt->execute([$key]);
+        $result = $stmt->fetch();
+        
+        return $result ? $result['setting_value'] : $default;
+    }
+    
+    public static function set(string $key, string $value): void {
+        $db = Database::connect();
+        $stmt = $db->prepare("INSERT INTO settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?");
+        $stmt->execute([$key, $value, $value]);
+    }
+    
+    public static function getAll(): array {
+        $db = Database::connect();
+        $stmt = $db->query("SELECT * FROM settings");
+        
+        $settings = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $settings[$row['setting_key']] = $row['setting_value'];
+        }
+        
+        return $settings;
+    }
+}
+
+// ============================================================================
+// ROUTER
+// ============================================================================
+
+class Router {
+    public static function handleRequest(): void {
+        global $DB_CONFIG;
+        
+        // CLI mode
+        if (php_sapi_name() === 'cli') {
+            self::handleCLI();
+            return;
+        }
+        
+        // Check if installed
+        if (!$DB_CONFIG['installed']) {
+            self::handleSetup();
+            return;
+        }
+        
+        // Handle login/logout
+        $page = $_GET['page'] ?? 'dashboard';
+        
+        if ($page === 'login') {
+            self::handleLogin();
+            return;
+        }
+        
+        if ($page === 'logout') {
+            Auth::logout();
+            header('Location: ?page=login');
             exit;
         }
-
-        // Use fastcgi_finish_request if available to send in background
-        if (function_exists('fastcgi_finish_request')) {
-            header("Location: $redirect");
-            echo "<!doctype html><html><body>Sending in background... Redirecting.</body></html>";
-            @ob_end_flush();
-            @flush();
-            fastcgi_finish_request();
-
+        
+        // Worker endpoints don't require authentication (they use internal spawning)
+        // These are triggered by the server itself, not external users
+        if ($page === 'process-queue-worker') {
+            self::handleProcessQueueWorker();
+            return;
+        }
+        
+        // Require authentication for all other pages
+        Auth::requireAuth();
+        
+        // Route to appropriate page
+        switch ($page) {
+            case 'dashboard':
+                self::renderDashboard();
+                break;
+            case 'new-job':
+            case 'workers':
+                // Redirect old pages to dashboard
+                header('Location: ?page=dashboard');
+                exit;
+            case 'settings':
+                self::renderSettings();
+                break;
+            case 'results':
+                self::renderResults();
+                break;
+            case 'export':
+                self::handleExport();
+                break;
+            case 'process-worker':
+                self::handleWorkerProcessing();
+                break;
+            case 'start-worker':
+                self::handleStartWorker();
+                break;
+            case 'api':
+                self::handleAPI();
+                break;
+            default:
+                self::renderDashboard();
+        }
+    }
+    
+    private static function handleCLI(): void {
+        global $argv;
+        
+        // Check if this is a process-job command (spawned by UI)
+        if (isset($argv[1]) && $argv[1] === 'process-job') {
+            // Direct job processing: php app.php process-job <jobId> <startOffset> <maxResults>
+            $jobId = (int)($argv[2] ?? 0);
+            $startOffset = (int)($argv[3] ?? 0);
+            $maxResults = (int)($argv[4] ?? 100);
+            
+            if ($jobId > 0) {
+                try {
+                    Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                } catch (Exception $e) {
+                    error_log("Worker error for job {$jobId}: " . $e->getMessage());
+                }
+            }
+            exit(0);
+        }
+        
+        // Regular worker mode (polls for jobs)
+        echo "=== PHP Email Extraction System Worker ===\n";
+        
+        $workerName = $argv[1] ?? 'worker-' . uniqid();
+        // Check if job_id is provided as second argument
+        $jobId = isset($argv[2]) && is_numeric($argv[2]) ? (int)$argv[2] : null;
+        
+        echo "Worker: {$workerName}\n";
+        if ($jobId !== null) {
+            echo "Dedicated to Job ID: {$jobId}\n";
+        }
+        
+        $workerId = Worker::register($workerName);
+        echo "Worker ID: {$workerId}\n";
+        echo "Waiting for jobs...\n\n";
+        
+        // Get polling interval from settings or use default 5 seconds
+        $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
+        
+        while (true) {
+            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            
+            // Pass job_id to only get queue items for that specific job
+            $job = Worker::getNextJob($jobId);
+            
+            if ($job) {
+                Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                Worker::processJob($job['id']);
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } else if ($jobId !== null) {
+                // If dedicated to a specific job and no work found, check if job is complete
+                $jobDetails = Job::getById($jobId);
+                if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
+                    echo "Job {$jobId} is complete or not found. Exiting.\n";
+                    break;
+                }
+            }
+            
+            sleep($pollingInterval);
+        }
+    }
+    
+    private static function handleSetup(): void {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $host = $_POST['db_host'] ?? '';
+            $database = $_POST['db_name'] ?? '';
+            $username = $_POST['db_user'] ?? '';
+            $password = $_POST['db_pass'] ?? '';
+            $adminUser = $_POST['admin_user'] ?? '';
+            $adminPass = $_POST['admin_pass'] ?? '';
+            $adminEmail = $_POST['admin_email'] ?? '';
+            
+            $result = Database::install($host, $database, $username, $password, $adminUser, $adminPass, $adminEmail);
+            
+            if ($result['success']) {
+                header('Location: ?page=login');
+                exit;
+            } else {
+                $error = $result['error'];
+            }
+        }
+        
+        self::renderSetup($error ?? null);
+    }
+    
+    private static function handleLogin(): void {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $username = $_POST['username'] ?? '';
+            $password = $_POST['password'] ?? '';
+            
+            if (Auth::login($username, $password)) {
+                header('Location: ?page=dashboard');
+                exit;
+            } else {
+                $error = 'Invalid username or password';
+            }
+        }
+        
+        self::renderLogin($error ?? null);
+    }
+    
+    private static function handleAPI(): void {
+        header('Content-Type: application/json');
+        
+        $action = $_GET['action'] ?? '';
+        
+        switch ($action) {
+            case 'stats':
+                $userId = Auth::getUserId();
+                $db = Database::connect();
+                
+                $stmt = $db->prepare("SELECT COUNT(*) as total FROM jobs WHERE user_id = ?");
+                $stmt->execute([$userId]);
+                $totalJobs = $stmt->fetch()['total'];
+                
+                $stmt = $db->prepare("SELECT COUNT(*) as total FROM jobs WHERE user_id = ? AND status = 'completed'");
+                $stmt->execute([$userId]);
+                $completedJobs = $stmt->fetch()['total'];
+                
+                $stmt = $db->prepare("SELECT COUNT(*) as total FROM emails r INNER JOIN jobs j ON r.job_id = j.id WHERE j.user_id = ?");
+                $stmt->execute([$userId]);
+                $totalResults = $stmt->fetch()['total'];
+                
+                echo json_encode([
+                    'totalJobs' => $totalJobs,
+                    'completedJobs' => $completedJobs,
+                    'totalResults' => $totalResults
+                ]);
+                break;
+                
+            case 'workers':
+                echo json_encode(Worker::getAll());
+                break;
+                
+            case 'worker-stats':
+                echo json_encode(Worker::getStats());
+                break;
+                
+            case 'system-resources':
+                // Get system resource usage (RAM and CPU)
+                echo json_encode(Worker::getSystemResources());
+                break;
+                
+            case 'diagnostic':
+                // Diagnostic endpoint to check system status
+                $db = Database::connect();
+                
+                // Check exec availability
+                $execAvailable = function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))));
+                $procOpenAvailable = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
+                
+                // Check for pending queue items
+                $stmt = $db->query("SELECT COUNT(*) as count FROM job_queue WHERE status = 'pending'");
+                $pendingQueueItems = $stmt->fetch()['count'];
+                
+                // Check for active workers
+                $stmt = $db->query("SELECT COUNT(*) as count FROM workers WHERE last_heartbeat > DATE_SUB(NOW(), INTERVAL 30 SECOND)");
+                $activeWorkers = $stmt->fetch()['count'];
+                
+                // Check for running jobs
+                $stmt = $db->query("SELECT COUNT(*) as count FROM jobs WHERE status = 'running'");
+                $runningJobs = $stmt->fetch()['count'];
+                
+                echo json_encode([
+                    'exec_available' => $execAvailable,
+                    'proc_open_available' => $procOpenAvailable,
+                    'pending_queue_items' => $pendingQueueItems,
+                    'active_workers' => $activeWorkers,
+                    'running_jobs' => $runningJobs,
+                    'php_version' => PHP_VERSION,
+                    'php_sapi' => php_sapi_name(),
+                    'fastcgi_available' => function_exists('fastcgi_finish_request'),
+                    'disabled_functions' => ini_get('disable_functions')
+                ]);
+                break;
+                
+            case 'queue-stats':
+                $db = Database::connect();
+                $stmt = $db->query("SELECT COUNT(*) as pending FROM job_queue WHERE status = 'pending'");
+                $pending = $stmt->fetch()['pending'];
+                
+                $stmt = $db->query("SELECT COUNT(*) as processing FROM job_queue WHERE status = 'processing'");
+                $processing = $stmt->fetch()['processing'];
+                
+                $stmt = $db->query("SELECT COUNT(*) as completed FROM job_queue WHERE status = 'completed'");
+                $completed = $stmt->fetch()['completed'];
+                
+                echo json_encode([
+                    'pending' => $pending,
+                    'processing' => $processing,
+                    'completed' => $completed
+                ]);
+                break;
+                
+            case 'jobs':
+                echo json_encode(Job::getAll(Auth::getUserId()));
+                break;
+                
+            case 'worker-errors':
+                $unresolvedOnly = isset($_GET['unresolved_only']) ? (bool)$_GET['unresolved_only'] : true;
+                
+                // Detect and mark stale workers before returning errors
+                $staleWorkers = Worker::detectStaleWorkers(300);
+                foreach ($staleWorkers as $worker) {
+                    Worker::markWorkerAsCrashed($worker['id'], 'Worker has not sent heartbeat for over 5 minutes. Possible crash or timeout.');
+                }
+                
+                echo json_encode(Worker::getErrors($unresolvedOnly));
+                break;
+                
+            case 'job-worker-status':
+                $jobId = (int)($_GET['job_id'] ?? 0);
+                if ($jobId > 0) {
+                    $db = Database::connect();
+                    
+                    // Get job info
+                    $stmt = $db->prepare("SELECT * FROM jobs WHERE id = ?");
+                    $stmt->execute([$jobId]);
+                    $job = $stmt->fetch();
+                    
+                    // Get active workers for this job
+                    $stmt = $db->prepare("SELECT * FROM workers WHERE current_job_id = ? AND status = 'running'");
+                    $stmt->execute([$jobId]);
+                    $activeWorkers = $stmt->fetchAll();
+                    
+                    // Get total emails collected
+                    $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
+                    $stmt->execute([$jobId]);
+                    $emailsCollected = $stmt->fetch()['count'];
+                    
+                    // Calculate completion percentage
+                    $maxResults = $job['max_results'] ?? 1;
+                    $completionPercentage = min(100, round(($emailsCollected / $maxResults) * 100, 2));
+                    
+                    // Get recent errors for this job
+                    $stmt = $db->prepare("SELECT * FROM worker_errors WHERE job_id = ? AND resolved = FALSE ORDER BY created_at DESC LIMIT 5");
+                    $stmt->execute([$jobId]);
+                    $recentErrors = $stmt->fetchAll();
+                    
+                    // Detect stale workers
+                    $staleWorkers = Worker::detectStaleWorkers(300);
+                    
+                    // Calculate ETA
+                    $etaInfo = Worker::calculateETA($jobId);
+                    
+                    echo json_encode([
+                        'job' => $job,
+                        'active_workers' => count($activeWorkers),
+                        'workers' => $activeWorkers,
+                        'emails_collected' => $emailsCollected,
+                        'emails_required' => $maxResults,
+                        'completion_percentage' => $completionPercentage,
+                        'recent_errors' => $recentErrors,
+                        'stale_workers' => $staleWorkers,
+                        'eta' => $etaInfo
+                    ]);
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
+            case 'job-eta':
+                // Get ETA information for a specific job
+                $jobId = (int)($_GET['job_id'] ?? 0);
+                if ($jobId > 0) {
+                    $etaInfo = Worker::calculateETA($jobId);
+                    echo json_encode($etaInfo);
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
+            case 'process-job-workers':
+                // Trigger worker processing for a job (called via AJAX after job creation)
+                $jobId = (int)($_POST['job_id'] ?? 0);
+                
+                if ($jobId > 0) {
+                    // Get job details to calculate optimal worker count
+                    $job = Job::getById($jobId);
+                    if ($job) {
+                        $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                    } else {
+                        // Default fallback to at least 1 worker
+                        $workerCount = 1;
+                    }
+                    
+                    // Send immediate response, then process in background
+                    ignore_user_abort(true);
+                    set_time_limit(0);
+                    
+                    $response = json_encode(['success' => true, 'message' => 'Workers processing started']);
+                    
+                    header('Content-Type: application/json');
+                    header('Content-Length: ' . strlen($response));
+                    header('Connection: close');
+                    echo $response;
+                    
+                    // Flush all output buffers
+                    if (ob_get_level() > 0) {
+                        ob_end_flush();
+                    }
+                    flush();
+                    
+                    // Close the session if it's open
+                    if (session_id()) {
+                        session_write_close();
+                    }
+                    
+                    // Give time for connection to close
+                    usleep(100000); // 0.1 seconds
+                    
+                    // Now process workers in background
+                    try {
+                        error_log("Starting background worker processing for job {$jobId}");
+                        self::spawnParallelWorkers($jobId, $workerCount);
+                        error_log("Completed background worker processing for job {$jobId}");
+                    } catch (Exception $e) {
+                        error_log("Error in background worker processing for job {$jobId}: " . $e->getMessage());
+                    }
+                } else {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                }
+                break;
+                
+            case 'resolve-error':
+                $errorId = (int)($_POST['error_id'] ?? 0);
+                if ($errorId > 0) {
+                    Worker::resolveError($errorId);
+                    echo json_encode(['success' => true]);
+                } else {
+                    echo json_encode(['error' => 'Invalid error ID']);
+                }
+                break;
+                
+            case 'create-job':
+                // AJAX endpoint to create job and return immediately
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                    try {
+                        $query = $_POST['query'] ?? '';
+                        $apiKey = $_POST['api_key'] ?? '';
+                        $maxResults = (int)($_POST['max_results'] ?? 100);
+                        $country = !empty($_POST['country']) ? $_POST['country'] : null;
+                        $emailFilter = $_POST['email_filter'] ?? 'all';
+                        
+                        // Get worker count from user input, or calculate if not provided
+                        $workerCount = isset($_POST['worker_count']) && $_POST['worker_count'] > 0 
+                            ? (int)$_POST['worker_count'] 
+                            : Worker::calculateOptimalWorkerCount($maxResults);
+                        
+                        // Ensure worker count is within valid range
+                        $workerCount = max(1, min(1000, $workerCount));
+                        
+                        if (empty($query) || empty($apiKey)) {
+                            header('Content-Type: application/json');
+                            echo json_encode(['success' => false, 'error' => 'Query and API Key are required']);
+                            break;
+                        }
+                        
+                        // CHECK: Verify proc_open is available BEFORE creating job
+                        if (!function_exists('proc_open') || in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+                            $errorMsg = 'proc_open is not available on this server. Parallel worker processing requires proc_open to be enabled in PHP configuration. Please contact your hosting provider to enable proc_open function.';
+                            error_log("Job creation failed: {$errorMsg}");
+                            header('Content-Type: application/json');
+                            echo json_encode([
+                                'success' => false, 
+                                'error' => $errorMsg
+                            ]);
+                            break;
+                        }
+                        
+                        // Create job - this should be fast (< 100ms)
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        
+                        // Create queue items with specified worker count - also fast (< 100ms for bulk insert)
+                        // This divides the work among workers so they search in parallel without duplication
+                        // NOTE: This will mark job as "running" - we'll update to "failed" if workers don't spawn
+                        self::createQueueItems($jobId, $workerCount);
+                        
+                        // Return success IMMEDIATELY to prevent UI hanging
+                        // Total response time should be < 200ms
+                        $response = json_encode([
+                            'success' => true,
+                            'job_id' => $jobId,
+                            'worker_count' => $workerCount,
+                            'message' => "Job created with {$workerCount} workers"
+                        ]);
+                        
+                        header('Content-Type: application/json');
+                        header('Content-Length: ' . strlen($response));
+                        echo $response;
+                        
+                        // Flush all output to client immediately
+                        if (ob_get_level() > 0) {
+                            ob_end_flush();
+                        }
+                        flush();
+                        
+                        // Close connection to client BEFORE spawning workers
+                        if (function_exists('fastcgi_finish_request')) {
+                            fastcgi_finish_request();
+                        }
+                        
+                        // Close session to release lock
+                        if (session_id()) {
+                            session_write_close();
+                        }
+                        
+                        // At this point, the client has received response and UI is not blocked
+                        // Now we can safely spawn workers in the background
+                        error_log("Job {$jobId} created. Starting background worker spawning...");
+                        
+                    } catch (Exception $e) {
+                        echo json_encode([
+                            'success' => false,
+                            'error' => 'Error creating job: ' . $e->getMessage()
+                        ]);
+                        error_log('Job creation error: ' . $e->getMessage());
+                    }
+                } else {
+                    echo json_encode(['success' => false, 'error' => 'Invalid request method']);
+                }
+                break;
+                
+            case 'trigger-workers':
+                // Separate endpoint to trigger workers - called asynchronously
+                // This ensures the job creation endpoint returns immediately
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                    $jobId = (int)($_POST['job_id'] ?? 0);
+                    
+                    if ($jobId > 0) {
+                        // Get job to determine worker count
+                        $job = Job::getById($jobId);
+                        if ($job) {
+                            $workerCount = Worker::calculateOptimalWorkerCount((int)$job['max_results']);
+                            
+                            // Prepare response
+                            $response = json_encode([
+                                'success' => true, 
+                                'message' => 'Workers are being spawned',
+                                'worker_count' => $workerCount
+                            ]);
+                            
+                            // Send response headers and content
+                            header('Content-Type: application/json');
+                            header('Content-Length: ' . strlen($response));
+                            header('Connection: close');
+                            echo $response;
+                            
+                            // Flush all output buffers to send response immediately
+                            if (ob_get_level() > 0) {
+                                ob_end_flush();
+                            }
+                            flush();
+                            
+                            // Close the connection to client (FastCGI optimization)
+                            if (function_exists('fastcgi_finish_request')) {
+                                fastcgi_finish_request();
+                            }
+                            
+                            // Close session to release lock
+                            if (session_id()) {
+                                session_write_close();
+                            }
+                            
+                            // Now spawn workers in background (client already disconnected)
+                            ignore_user_abort(true);
+                            set_time_limit(0);
+                            
+                            try {
+                                error_log("trigger-workers: Spawning {$workerCount} workers for job {$jobId}");
+                                self::autoSpawnWorkers($workerCount, $jobId);
+                                error_log("trigger-workers: Worker spawning completed for job {$jobId}");
+                            } catch (Exception $e) {
+                                error_log('trigger-workers: Worker spawning error: ' . $e->getMessage());
+                            }
+                        } else {
+                            echo json_encode(['success' => false, 'error' => 'Job not found']);
+                        }
+                    } else {
+                        echo json_encode(['success' => false, 'error' => 'Invalid job ID']);
+                    }
+                } else {
+                    echo json_encode(['success' => false, 'error' => 'Invalid request method']);
+                }
+                break;
+                
+            case 'job-progress-sse':
+                // Server-Sent Events endpoint for real-time job progress updates
+                // This is an alternative to polling that provides instant updates
+                $jobId = (int)($_GET['job_id'] ?? 0);
+                
+                if ($jobId <= 0) {
+                    echo json_encode(['error' => 'Invalid job ID']);
+                    exit;
+                }
+                
+                // Set headers for SSE
+                header('Content-Type: text/event-stream');
+                header('Cache-Control: no-cache');
+                header('Connection: keep-alive');
+                header('X-Accel-Buffering: no'); // Disable nginx buffering
+                
+                // Disable output buffering
+                if (ob_get_level() > 0) {
+                    ob_end_clean();
+                }
+                
+                // Close session to allow parallel requests
+                if (session_id()) {
+                    session_write_close();
+                }
+                
+                // Keep connection alive and send updates
+                $maxIterations = 200; // Stop after ~10 minutes (200 * 3s)
+                $iteration = 0;
+                $lastStatus = null;
+                
+                while ($iteration < $maxIterations && connection_status() === CONNECTION_NORMAL) {
+                    $job = Job::getById($jobId);
+                    if (!$job) {
+                        echo "event: error\n";
+                        echo "data: " . json_encode(['error' => 'Job not found']) . "\n\n";
+                        flush();
+                        break;
+                    }
+                    
+                    // Get worker status
+                    $workerStatus = self::getJobWorkerStatus($jobId);
+                    
+                    // Only send update if status changed
+                    $currentStatus = json_encode($workerStatus);
+                    if ($currentStatus !== $lastStatus) {
+                        echo "event: progress\n";
+                        echo "data: " . $currentStatus . "\n\n";
+                        flush();
+                        $lastStatus = $currentStatus;
+                    }
+                    
+                    // Stop if job is complete
+                    if ($job['status'] === 'completed' || $job['status'] === 'failed') {
+                        echo "event: complete\n";
+                        echo "data: " . json_encode(['status' => $job['status']]) . "\n\n";
+                        flush();
+                        break;
+                    }
+                    
+                    $iteration++;
+                    sleep(3); // Wait 3 seconds before next update
+                }
+                
+                exit;
+                
+            default:
+                echo json_encode(['error' => 'Unknown action']);
+        }
+        
+        exit;
+    }
+    
+    private static function handleExport(): void {
+        $jobId = (int)($_GET['job_id'] ?? 0);
+        $format = $_GET['format'] ?? 'csv';
+        
+        $results = Job::getResults($jobId);
+        
+        if ($format === 'csv') {
+            header('Content-Type: text/csv');
+            header('Content-Disposition: attachment; filename="emails-' . $jobId . '.csv"');
+            
+            $output = fopen('php://output', 'w');
+            fputcsv($output, ['Email', 'Domain', 'Country', 'Source URL', 'Source Title']);
+            
+            foreach ($results as $result) {
+                fputcsv($output, [$result['email'], $result['domain'], $result['country'], $result['source_url'], $result['source_title']]);
+            }
+            
+            fclose($output);
+        } else {
+            header('Content-Type: application/json');
+            header('Content-Disposition: attachment; filename="emails-' . $jobId . '.json"');
+            echo json_encode($results, JSON_PRETTY_PRINT);
+        }
+        
+        exit;
+    }
+    
+    private static function handleWorkerProcessing(): void {
+        // This handles async HTTP worker requests (used when exec() is disabled)
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $jobId = (int)($_POST['job_id'] ?? 0);
+            $startOffset = (int)($_POST['start_offset'] ?? 0);
+            $maxResults = (int)($_POST['max_results'] ?? 100);
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            
+            if ($jobId > 0) {
+                // Log worker start
+                error_log("Worker #{$workerIndex} started for job {$jobId}, offset {$startOffset}, max {$maxResults}");
+                
+                // Close connection immediately so client doesn't wait
+                ignore_user_abort(true);
+                set_time_limit(0);
+                
+                // Calculate content before sending
+                $response = json_encode(['status' => 'processing', 'worker' => $workerIndex]);
+                
+                // Send minimal response
+                header('Content-Type: application/json');
+                header('Content-Length: ' . strlen($response));
+                header('Connection: close');
+                echo $response;
+                
+                // Flush all output buffers
+                if (ob_get_level() > 0) {
+                    ob_end_flush();
+                }
+                flush();
+                
+                // Close the session if it's open
+                if (session_id()) {
+                    session_write_close();
+                }
+                
+                // Give time for connection to close
+                usleep(100000); // 0.1 seconds
+                
+                // Now process the job in background
+                try {
+                    error_log("Worker #{$workerIndex} processing job {$jobId}");
+                    Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                    error_log("Worker #{$workerIndex} completed job {$jobId}");
+                } catch (Exception $e) {
+                    error_log("HTTP Worker #{$workerIndex} error for job {$jobId}: " . $e->getMessage());
+                }
+            }
+        }
+        exit;
+    }
+    
+    private static function handleStartWorker(): void {
+        // This starts a worker that polls the queue
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $workerName = $_POST['worker_name'] ?? 'http-worker-' . uniqid();
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            $jobId = isset($_POST['job_id']) && $_POST['job_id'] !== '' ? (int)$_POST['job_id'] : null;
+            
+            error_log("handleStartWorker: HTTP Worker {$workerName} starting..." . ($jobId ? " for job {$jobId}" : ""));
+            
+            // Close connection immediately so client doesn't wait
             ignore_user_abort(true);
             set_time_limit(0);
-
-            // Send using new connection-based function
+            
+            // Calculate content before sending
+            $response = json_encode(['status' => 'started', 'worker' => $workerName, 'job_id' => $jobId]);
+            
+            // Send minimal response
+            header('Content-Type: application/json');
+            header('Content-Length: ' . strlen($response));
+            header('Connection: close');
+            echo $response;
+            
+            // Flush all output buffers
+            if (ob_get_level() > 0) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Use fastcgi_finish_request if available (PHP-FPM)
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+                error_log("handleStartWorker: Used fastcgi_finish_request() for {$workerName}");
+            }
+            
+            // Close the session if it's open
+            if (session_id()) {
+                session_write_close();
+            }
+            
+            // Give time for connection to close
+            usleep(100000); // 0.1 seconds
+            
+            // Now run worker loop in background
             try {
-                send_campaign_with_connections($pdo, $campaign, $allRecipients, (int)$profile['id'], false);
-            } catch (Exception $e) {
-                error_log("Campaign send error: " . $e->getMessage());
-            }
-            exit;
-        }
-
-        // Fallback: send synchronously (blocking)
-        header("Location: $redirect");
-        echo "<!doctype html><html><body>Sending campaign... Please wait.</body></html>";
-        @ob_end_flush();
-        @flush();
-
-        ignore_user_abort(true);
-        set_time_limit(0);
-
-        try {
-            send_campaign_with_connections($pdo, $campaign, $allRecipients, (int)$profile['id'], false);
-        } catch (Exception $e) {
-            error_log("Campaign send error: " . $e->getMessage());
-        }
-        exit;
-
-        // OLD COMPLEX LOGIC REMOVED - keeping below for reference but not used
-        /*
-        // If rotation enabled and multiple active profiles -> batch-wise distribution per profile with parallel workers
-        if ($rotationEnabled && count($activeProfiles) > 0) {
-            $globalDefaultBatch = max(1, (int)($rotSettings['batch_size'] ?? 1));
-            $globalTargetPerMinute = max(1, (int)($rotSettings['target_per_minute'] ?? 1000));
-            $globalWorkers = max(MIN_WORKERS, (int)($rotSettings['workers'] ?? DEFAULT_WORKERS));
-            
-            // OPTIONAL logging for monitoring (NOT a limit)
-            if ($globalWorkers >= WORKERS_LOG_WARNING_THRESHOLD) {
-                error_log("Info: Rotation settings using $globalWorkers workers (NOT an error)");
-            }
-            
-            $globalMessagesPerWorker = max(MIN_MESSAGES_PER_WORKER, (int)($rotSettings['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER));
-
-            // prepare profiles meta
-            $profilesMeta = [];
-            foreach ($activeProfiles as $i => $p) {
-                $meta = [];
-                $meta['profile'] = $p;
-                $meta['batch_size'] = max(1, (int)($p['batch_size'] ?? $globalDefaultBatch));
-                $meta['send_rate'] = max(0, (int)($p['send_rate'] ?? 0)); // msg / second (0 = no throttle)
-                $meta['max_sends'] = max(0, (int)($p['max_sends'] ?? 0)); // 0 = unlimited
-                $meta['used'] = max(0, (int)($p['sends_used'] ?? 0));
-                $profilesMeta[] = $meta;
-            }
-            $pcount = count($profilesMeta);
-
-            // compute default per-profile send_rate if not set (distribute globalTargetPerMinute)
-            $perProfilePerMin = (int)ceil($globalTargetPerMinute / max(1, $pcount));
-            $defaultPerProfilePerSec = max(1, (int)ceil($perProfilePerMin / 60));
-
-            // Distribution algorithm: sequentially assign profile.batch_size per profile, skipping profiles that reached max_sends
-            $parts = array_fill(0, $pcount, []);
-            $n = count($allRecipients);
-            $idx = 0; // pointer into recipients
-            $pi = 0;  // profile index pointer
-            $roundsWithoutAssign = 0;
-            while ($idx < $n) {
-                $pm = &$profilesMeta[$pi];
-                // remaining capacity for this profile
-                if ($pm['max_sends'] > 0) {
-                    $capacity = max(0, $pm['max_sends'] - $pm['used']);
-                } else {
-                    $capacity = PHP_INT_MAX;
-                }
-
-                if ($capacity <= 0) {
-                    // skip this profile (can't accept more)
-                    $pi = ($pi + 1) % $pcount;
-                    $roundsWithoutAssign++;
-                    if ($roundsWithoutAssign >= $pcount) {
-                        // no profile can accept more sends -> break to avoid infinite loop
-                        break;
-                    }
-                    continue;
-                }
-
-                $toTake = min($pm['batch_size'], $capacity, $n - $idx);
-                $slice = array_slice($allRecipients, $idx, $toTake);
-                if (!empty($slice)) {
-                    $parts[$pi] = array_merge($parts[$pi], $slice);
-                    $pm['used'] += count($slice);
-                    $idx += count($slice);
-                    $roundsWithoutAssign = 0;
-                } else {
-                    $roundsWithoutAssign++;
-                }
-
-                // move to next profile (respect mode)
-                if (($rotSettings['mode'] ?? 'sequential') === 'random') {
-                    $pi = rand(0, $pcount - 1);
-                } else {
-                    $pi = ($pi + 1) % $pcount;
-                }
-            }
-            // If some recipients remain unassigned (e.g., all profiles exhausted), append them to last profile fallback
-            if ($idx < $n) {
-                // find any profile with capacity or fallback to first active
-                $assigned = false;
-                foreach ($profilesMeta as $j => $pmf) {
-                    if ($pmf['max_sends'] === 0 || $pmf['max_sends'] > $pmf['used']) {
-                        $parts[$j] = array_merge($parts[$j], array_slice($allRecipients, $idx));
-                        $assigned = true; break;
-                    }
-                }
-                if (!$assigned) {
-                    $parts[0] = array_merge($parts[0], array_slice($allRecipients, $idx));
-                }
-            }
-
-            // Now spawn per-profile workers / or send in-process. For each profile, determine effective send_rate (override)
-            $spawnFailures = [];
-            if (function_exists('fastcgi_finish_request')) {
-                // detach response then do sends with workers if configured
-                header("Location: $redirect");
-                echo "<!doctype html><html><body>Sending in background... Redirecting.</body></html>";
-                @ob_end_flush();
-                @flush();
-                fastcgi_finish_request();
-
-                ignore_user_abort(true);
-                set_time_limit(0);
-
-                foreach ($profilesMeta as $idx => $pm) {
-                    $p = $pm['profile'];
-                    $recips = array_values(array_unique(array_map('trim', $parts[$idx])));
-                    if (empty($recips)) continue;
-                    $recipsText = implode("\n", $recips);
-                    $effectiveRate = $pm['send_rate'] > 0 ? $pm['send_rate'] : $defaultPerProfilePerSec;
-                    $overrides = ['send_rate' => $effectiveRate];
-                    try {
-                        // Use concurrent sending if workers configured and pcntl available
-                        if ($globalWorkers > 1 && function_exists('pcntl_fork')) {
-                            send_campaign_with_connections_for_profile_concurrent($pdo, $campaign, $recips, $p, false);
-                        } else {
-                            send_campaign_real($pdo, $campaign, $recipsText, false, (int)$p['id'], $overrides);
-                        }
-                    } catch (Exception $e) {
-                        // continue
-                    }
-                }
-
-                exit;
-            }
-
-            // Otherwise attempt to spawn parallel workers per profile (passing overrides so each worker can throttle)
-            foreach ($profilesMeta as $idx => $pm) {
-                $p = $pm['profile'];
-                $recips = array_values(array_unique(array_map('trim', $parts[$idx])));
-                if (empty($recips)) continue;
-                $effectiveRate = $pm['send_rate'] > 0 ? $pm['send_rate'] : $defaultPerProfilePerSec;
-                $overrides = ['send_rate' => $effectiveRate];
-                $cycleDelay = (int)($p['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS);
+                error_log("handleStartWorker: Worker {$workerName} entering queue polling mode");
                 
-                // Spawn parallel workers for this profile's recipients
-                $result = spawn_parallel_workers($pdo, (int)$campaign['id'], $recips, $globalWorkers, $globalMessagesPerWorker, (int)$p['id'], $overrides, $cycleDelay);
+                $workerId = Worker::register($workerName);
+                error_log("handleStartWorker: Worker {$workerName} registered with ID {$workerId}");
                 
-                if (!$result['success']) {
-                    // Add failures for synchronous fallback
-                    foreach ($result['failures'] as $failure) {
-                        $recipsText = implode("\n", $failure['chunk']);
-                        $spawnFailures[] = ['profile' => $p, 'recips' => $recipsText, 'overrides' => $overrides];
-                    }
-                }
-            }
-
-            // If any spawn failed, fallback to synchronous sending for those profiles (guarantees actual send)
-            if (!empty($spawnFailures)) {
-                // send redirect first so UI isn't waiting too long
-                header("Location: $redirect");
-                echo "<!doctype html><html><body>Sending (fallback) in progress... Please wait if your browser does not redirect.</body></html>";
-                @ob_end_flush();
-                @flush();
-
-                ignore_user_abort(true);
-                set_time_limit(0);
-
-                foreach ($spawnFailures as $fail) {
-                    try {
-                        send_campaign_real($pdo, $campaign, $fail['recips'], false, (int)$fail['profile']['id'], $fail['overrides']);
-                    } catch (Exception $e) {
-                        // continue
-                    }
-                }
-
-                exit;
-            }
-
-            // All spawns succeeded -> safe to redirect immediately
-            header("Location: $redirect");
-            exit;
-        } else {
-            // Rotation disabled: send entire campaign with the selected SMTP using parallel workers
-            // Get the profile for this campaign (either forced or first active)
-            $profile = null;
-            if (!empty($activeProfiles)) {
-                // Try to find profile matching campaign's from_email
-                foreach ($activeProfiles as $p) {
-                    if (strtolower($p['from_email']) === strtolower($campaign['from_email'])) {
-                        $profile = $p;
-                        break;
-                    }
-                }
-                // Fallback to first active profile
-                if (!$profile) $profile = $activeProfiles[0];
-            }
-            
-            $workers = DEFAULT_WORKERS;
-            $messagesPerWorker = DEFAULT_MESSAGES_PER_WORKER;
-            
-            if ($profile) {
-                $workers = max(MIN_WORKERS, (int)($profile['workers'] ?? DEFAULT_WORKERS));
+                // Process queue items until empty or timeout
+                $startTime = time();
+                $maxRuntime = 300; // 5 minutes max per worker
+                $itemsProcessed = 0;
                 
-                // OPTIONAL logging for monitoring (NOT a limit)
-                if ($workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-                    error_log("Info: Profile {$profile['id']} using $workers workers for campaign " . (int)$campaign['id']);
-                }
-                
-                $messagesPerWorker = max(MIN_MESSAGES_PER_WORKER, (int)($profile['messages_per_worker'] ?? DEFAULT_MESSAGES_PER_WORKER));
-            }
-            
-            if (function_exists('fastcgi_finish_request')) {
-                header("Location: $redirect");
-                echo "<!doctype html><html><body>Sending in background... Redirecting.</body></html>";
-                @ob_end_flush();
-                @flush();
-                fastcgi_finish_request();
-
-                ignore_user_abort(true);
-                set_time_limit(0);
-
-                try {
-                    // Use concurrent sending if workers > 1 and profile is configured
-                    if ($workers > 1 && $profile && function_exists('pcntl_fork')) {
-                        send_campaign_with_connections_for_profile_concurrent($pdo, $campaign, $allRecipients, $profile, false);
-                    } else {
-                        send_campaign_real($pdo, $campaign, $recipientsTextFull);
-                    }
-                } catch (Exception $e) {}
-                exit;
-            }
-
-            // Try to spawn parallel workers
-            $cycleDelay = $profile ? (int)($profile['cycle_delay_ms'] ?? DEFAULT_CYCLE_DELAY_MS) : DEFAULT_CYCLE_DELAY_MS;
-            $result = spawn_parallel_workers($pdo, (int)$campaign['id'], $allRecipients, $workers, $messagesPerWorker, $profile ? (int)$profile['id'] : null, [], $cycleDelay);
-            if (!$result['success'] || $result['workers'] === 0) {
-                // synchronous fallback (web request will wait) to ensure delivery instead of remaining 'sending'
-                header("Location: $redirect");
-                echo "<!doctype html><html><body>Sending (fallback) in progress... Please wait if your browser does not redirect.</body></html>";
-                @ob_end_flush();
-                @flush();
-                
-                ignore_user_abort(true);
-                set_time_limit(0);
-                try {
-                    send_campaign_real($pdo, $campaign, $recipientsTextFull);
-                } catch (Exception $e) {}
-                exit;
-            }
-
-            // All workers spawned successfully
-            header("Location: $redirect");
-            exit;
-        }
-        */
-        // END OLD COMPLEX LOGIC
-
-    }
-    header("Location: $redirect");
-    exit;
-}
-
-if ($action === 'save_rotation') {
-    $rotation_enabled      = isset($_POST['rotation_enabled']) ? 1 : 0;
-    
-    // Read workers from POST - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
-    $workers               = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
-    
-    // OPTIONAL logging for monitoring (NOT a limit)
-    if ($workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Rotation settings saved with $workers workers (NOT an error)");
-    }
-    
-    $emails_per_worker   = max(MIN_EMAILS_PER_WORKER, min(MAX_EMAILS_PER_WORKER, (int)($_POST['emails_per_worker'] ?? $_POST['messages_per_worker'] ?? DEFAULT_EMAILS_PER_WORKER)));
-    
-    update_rotation_settings($pdo, [
-        'rotation_enabled'      => $rotation_enabled,
-        'workers'               => $workers,
-        'emails_per_worker'     => $emails_per_worker,
-    ]);
-
-    header("Location: ?page=list&rot_saved=1");
-    exit;
-}
-
-
-if ($action === 'save_profile') {
-    $profile_id   = (int)($_POST['profile_id'] ?? 0);
-    $profile_name = trim($_POST['profile_name'] ?? '');
-    $api_key      = trim($_POST['api_key'] ?? '');
-    $search_query = trim($_POST['search_query'] ?? '');
-    $target_count = max(1, min(10000, (int)($_POST['target_count'] ?? 100)));
-    $country      = trim($_POST['country'] ?? '');
-    $filter_business_only = isset($_POST['filter_business_only']) ? 1 : 0;
-    $active       = isset($_POST['active']) ? 1 : 0;
-    
-    // Workers field - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
-    // This determines how many parallel API calls will be made simultaneously
-    $profile_workers = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
-    
-    // OPTIONAL logging for monitoring (NOT a limit)
-    if ($profile_workers >= WORKERS_LOG_WARNING_THRESHOLD) {
-        error_log("Info: Job profile saved with $profile_workers parallel workers (NOT an error)");
-    }
-
-    try {
-        if ($profile_id > 0) {
-            $stmt = $pdo->prepare("
-                UPDATE job_profiles SET
-                  profile_name=?, api_key=?, search_query=?, target_count=?, 
-                  filter_business_only=?, country=?, active=?,
-                  workers=?
-                WHERE id=?
-            ");
-            $stmt->execute([
-                $profile_name, $api_key, $search_query, $target_count,
-                $filter_business_only, $country, $active,
-                $profile_workers,
-                $profile_id
-            ]);
-        } else {
-            $stmt = $pdo->prepare("
-                INSERT INTO job_profiles
-                  (profile_name, api_key, search_query, target_count,
-                   filter_business_only, country, active,
-                   workers)
-                VALUES (?,?,?,?,?,?,?,?)
-            ");
-            $stmt->execute([
-                $profile_name, $api_key, $search_query, $target_count,
-                $filter_business_only, $country, $active,
-                $profile_workers
-            ]);
-        }
-    } catch (Exception $e) {
-        error_log("Failed to save job profile: " . $e->getMessage());
-    }
-
-    header("Location: ?page=list&profiles=1");
-    exit;
-}
-
-if ($action === 'delete_profile') {
-    $pid = (int)($_POST['profile_id'] ?? 0);
-    if ($pid > 0) {
-        $stmt = $pdo->prepare("DELETE FROM job_profiles WHERE id = ?");
-        $stmt->execute([$pid]);
-    }
-    header("Location: ?page=list&profiles=1");
-    exit;
-}
-
-///////////////////////
-//  CONTACTS ACTIONS
-///////////////////////
-if ($action === 'create_contact_list') {
-    $listName = trim($_POST['list_name'] ?? '');
-    if ($listName !== '') {
-        $stmt = $pdo->prepare("INSERT INTO contact_lists (name, type) VALUES (?, 'list')");
-        $stmt->execute([$listName]);
-    }
-    header("Location: ?page=contacts");
-    exit;
-}
-
-if ($action === 'delete_contact_list') {
-    $lid = (int)($_POST['list_id'] ?? 0);
-    if ($lid > 0) {
-        $stmt = $pdo->prepare("DELETE FROM contacts WHERE list_id = ?");
-        $stmt->execute([$lid]);
-        $stmt = $pdo->prepare("DELETE FROM contact_lists WHERE id = ?");
-        $stmt->execute([$lid]);
-    }
-    header("Location: ?page=contacts");
-    exit;
-}
-
-if ($action === 'add_contact_manual') {
-    $lid    = (int)($_POST['list_id'] ?? 0);
-    $email  = trim($_POST['email'] ?? '');
-    $first  = trim($_POST['first_name'] ?? '');
-    $last   = trim($_POST['last_name'] ?? '');
-    if ($lid > 0 && filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $stmt = $pdo->prepare("INSERT INTO contacts (list_id, email, first_name, last_name) VALUES (?, ?, ?, ?)");
-        $stmt->execute([$lid, strtolower($email), $first, $last]);
-    }
-    header("Location: ?page=contacts&list_id=".$lid);
-    exit;
-}
-
-if ($action === 'upload_contacts_csv') {
-    $lid = (int)($_POST['list_id'] ?? 0);
-    if ($lid > 0 && isset($_FILES['csv_file']) && is_uploaded_file($_FILES['csv_file']['tmp_name'])) {
-        $path = $_FILES['csv_file']['tmp_name'];
-        if (($fh = fopen($path, 'r')) !== false) {
-            $header = fgetcsv($fh);
-            $rows   = [];
-            $emailCol = 0;
-
-            if ($header !== false) {
-                $found = null;
-                foreach ($header as $i => $col) {
-                    if (stripos($col, 'email') !== false) {
-                        $found = $i;
-                        break;
-                    }
-                }
-                if ($found === null) {
-                    $emailCol = 0;
-                    $rows[] = $header;
-                } else {
-                    $emailCol = $found;
-                }
-
-                while (($row = fgetcsv($fh)) !== false) {
-                    $rows[] = $row;
-                }
-            }
-            fclose($fh);
-
-            $ins = $pdo->prepare("INSERT INTO contacts (list_id, email) VALUES (?, ?)");
-            foreach ($rows as $row) {
-                if (!isset($row[$emailCol])) continue;
-                $email = trim($row[$emailCol]);
-                if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                    if (is_unsubscribed($pdo, $email)) continue;
-                    $ins->execute([$lid, strtolower($email)]);
-                }
-            }
-        }
-    }
-    header("Location: ?page=contacts&list_id=".$lid);
-    exit;
-}
-
-///////////////////////
-//  DATA FOR PAGES
-///////////////////////
-// Check if PDO is available before querying database
-if ($pdo === null) {
-    // PDO not initialized - database not configured yet
-    // Redirect to installation if not already there
-    if (!isset($_GET['action']) || !in_array($_GET['action'], ['install', 'do_install'])) {
-        header('Location: ' . $_SERVER['SCRIPT_NAME'] . '?action=install');
-        exit;
-    }
-    // Set empty defaults for installation page
-    $rotationSettings = ['rotation_enabled' => 0];
-    $profiles = [];
-    $contactLists = [];
-} else {
-    // PDO is available, fetch data
-    $rotationSettings = get_rotation_settings($pdo);
-    $profiles         = get_profiles($pdo);
-    $contactLists     = []; // Not used in email extraction system
-}
-
-$editProfile      = null;
-if ($page === 'list' && isset($_GET['edit_profile'])) {
-    $eid = (int)$_GET['edit_profile'];
-    foreach ($profiles as $p) {
-        if ((int)$p['id'] === $eid) {
-            $editProfile = $p;
-            break;
-        }
-    }
-}
-
-$isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
-
-
-?>
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>MAFIA MAILER - Professional Email Marketing</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --sg-blue: #1A82E2;
-      --sg-blue-dark: #0F5BB5;
-      --sg-blue-light: #E3F2FD;
-      --sg-bg: #F6F8FB;
-      --sg-border: #E3E8F0;
-      --sg-text: #1F2933;
-      --sg-muted: #6B778C;
-      --sg-success: #12B886;
-      --sg-success-light: #D3F9E9;
-      --sg-danger: #FA5252;
-      --sg-danger-light: #FFE5E5;
-      --sg-warning: #FAB005;
-      --sg-warning-light: #FFF4DB;
-      --sg-shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
-      --sg-shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-      --sg-shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-    }
-    * {
-      box-sizing: border-box;
-    }
-    html {
-      scroll-behavior: smooth;
-    }
-    body {
-      margin: 0;
-      font-family: "Open Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--sg-bg);
-      color: var(--sg-text);
-      line-height: 1.6;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
-    }
-    a { 
-      color: var(--sg-blue-dark); 
-      text-decoration: none;
-      transition: color 0.15s ease;
-    }
-    a:hover { 
-      text-decoration: underline;
-      color: var(--sg-blue);
-    }
-
-    .app-shell {
-      display: flex;
-      min-height: 100vh;
-      overflow: hidden;
-    }
-
-    /* MAIN LEFT NAV (SendGrid-style) */
-    .nav-main {
-      width: 220px;
-      background: #ffffff;
-      border-right: 1px solid var(--sg-border);
-      display: flex;
-      flex-direction: column;
-    }
-    .nav-header {
-      padding: 16px 16px 12px;
-      border-bottom: 1px solid var(--sg-border);
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .nav-avatar {
-      width: 32px;
-      height: 32px;
-      border-radius: 999px;
-      background: var(--sg-blue);
-      color: #fff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 600;
-      font-size: 14px;
-    }
-    .nav-user-info {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .nav-user-email {
-      font-size: 13px;
-      font-weight: 600;
-    }
-    .nav-user-sub {
-      font-size: 11px;
-      color: var(--sg-muted);
-    }
-    .nav-scroll {
-      flex: 1;
-      overflow-y: auto;
-      padding: 10px 8px 16px;
-    }
-    .nav-section-title {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      color: var(--sg-muted);
-      letter-spacing: .05em;
-      margin: 10px 8px 4px;
-    }
-    .nav-link {
-      display: flex;
-      align-items: center;
-      padding: 8px 12px;
-      margin: 2px 4px;
-      border-radius: 6px;
-      font-size: 14px;
-      color: var(--sg-muted);
-      transition: all 0.15s ease;
-      font-weight: 500;
-    }
-    .nav-link span {
-      flex: 1;
-    }
-    .nav-link.active {
-      background: linear-gradient(135deg, var(--sg-blue-light) 0%, #E9F3FF 100%);
-      color: var(--sg-blue-dark);
-      font-weight: 600;
-      box-shadow: var(--sg-shadow-sm);
-    }
-    .nav-link:hover {
-      background: var(--sg-bg);
-      text-decoration: none;
-      color: var(--sg-blue);
-      transform: translateX(2px);
-    }
-    .nav-link.active:hover {
-      transform: translateX(0);
-    }
-    .nav-footer {
-      padding: 10px 12px;
-      border-top: 1px solid var(--sg-border);
-      font-size: 11px;
-      color: var(--sg-muted);
-    }
-
-    /* Sending profiles slide panel */
-    .sidebar-sp {
-      position: relative;
-      width: 0;
-      flex-shrink: 0;
-      transition: width 0.25s ease;
-      overflow: hidden;
-      pointer-events: none;
-    }
-    .sidebar-sp.open {
-      width: 400px;
-      pointer-events: auto;
-    }
-    .sidebar-inner {
-      position: fixed;
-      left: 220px;
-      top: 0;
-      bottom: 0;
-      width: 400px;
-      background: #fff;
-      border-right: 1px solid var(--sg-border);
-      box-shadow: 4px 0 16px rgba(15, 91, 181, 0.12);
-      display: flex;
-      flex-direction: column;
-      transform: translateX(-100%);
-      transition: transform 0.25s ease, visibility 0.2s ease;
-      z-index: 30;
-      visibility: hidden;
-      pointer-events: none;
-    }
-    .sidebar-sp.open .sidebar-inner {
-      transform: translateX(0);
-      visibility: visible;
-      pointer-events: auto;
-    }
-
-    .page-wrapper {
-      flex: 1;
-      transition: transform 0.25s ease;
-      display: flex;
-      flex-direction: column;
-    }
-    .page-wrapper.shifted {
-      transform: translateX(400px);
-    }
-
-    .topbar {
-      height: 64px;
-      background: #fff;
-      border-bottom: 1px solid var(--sg-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 32px;
-      box-shadow: var(--sg-shadow-sm);
-      /* Sticky positioning keeps topbar visible while scrolling - intentional for better navigation */
-      position: sticky;
-      top: 0;
-      z-index: 100;
-    }
-    .topbar .brand {
-      font-weight: 700;
-      font-size: 18px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--sg-text);
-    }
-    .topbar .brand-dot {
-      width: 12px;
-      height: 12px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, var(--sg-blue) 0%, var(--sg-blue-dark) 100%);
-      box-shadow: 0 0 0 3px rgba(26,130,226,0.2);
-      animation: pulse-dot 2s ease-in-out infinite;
-    }
-    @keyframes pulse-dot {
-      0%, 100% {
-        transform: scale(1);
-      }
-      50% {
-        transform: scale(1.1);
-      }
-    }
-    .topbar-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .btn {
-      border-radius: 6px;
-      border: 1px solid transparent;
-      padding: 8px 16px;
-      font-size: 14px;
-      font-weight: 500;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      background: #fff;
-      color: var(--sg-text);
-      transition: all 0.2s ease;
-      text-decoration: none;
-    }
-    .btn:hover {
-      text-decoration: none;
-      transform: translateY(-1px);
-      box-shadow: var(--sg-shadow-sm);
-    }
-    .btn-primary {
-      background: var(--sg-blue);
-      color: #fff;
-      border-color: var(--sg-blue);
-      box-shadow: var(--sg-shadow-sm);
-    }
-    .btn-primary:hover {
-      background: var(--sg-blue-dark);
-      border-color: var(--sg-blue-dark);
-      box-shadow: var(--sg-shadow-md);
-    }
-    .btn-outline {
-      background: #fff;
-      border-color: var(--sg-border);
-      color: var(--sg-text);
-    }
-    .btn-outline:hover {
-      border-color: var(--sg-blue);
-      color: var(--sg-blue);
-      background: var(--sg-blue-light);
-    }
-    .btn-danger {
-      background: var(--sg-danger);
-      border-color: var(--sg-danger);
-      color: #fff;
-      box-shadow: var(--sg-shadow-sm);
-    }
-    .btn-danger:hover {
-      background: #E03131;
-      border-color: #E03131;
-      box-shadow: var(--sg-shadow-md);
-    }
-
-    .main-content {
-      padding: 32px 40px 40px;
-      flex: 1;
-      overflow-y: auto;
-      max-width: 1400px;
-      margin: 0 auto;
-      width: 100%;
-    }
-
-    .page-title {
-      font-size: 28px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      color: var(--sg-text);
-      letter-spacing: -0.02em;
-    }
-    .page-subtitle {
-      font-size: 14px;
-      color: var(--sg-muted);
-      margin-bottom: 24px;
-      line-height: 1.5;
-    }
-
-    .card {
-      background: #fff;
-      border-radius: 8px;
-      border: 1px solid var(--sg-border);
-      padding: 20px 24px;
-      margin-bottom: 20px;
-      box-shadow: var(--sg-shadow-sm);
-      transition: box-shadow 0.2s ease, transform 0.2s ease;
-    }
-    .card:hover {
-      box-shadow: var(--sg-shadow-md);
-    }
-    .card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--sg-border);
-    }
-    .card-title {
-      font-weight: 600;
-      font-size: 16px;
-      color: var(--sg-text);
-    }
-    .card-subtitle {
-      font-size: 13px;
-      color: var(--sg-muted);
-      margin-top: 4px;
-      line-height: 1.4;
-    }
-
-    .table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    .table th, .table td {
-      padding: 14px 12px;
-      border-bottom: 1px solid var(--sg-border);
-      text-align: left;
-    }
-    .table th {
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--sg-muted);
-      font-weight: 600;
-      background-color: var(--sg-bg);
-    }
-    .table tbody tr {
-      transition: background-color 0.15s ease;
-    }
-    .table tbody tr:hover {
-      background-color: var(--sg-bg);
-    }
-    .table tbody tr:last-child td {
-      border-bottom: none;
-    }
-    .status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      display: inline-block;
-      margin-right: 8px;
-    }
-    @keyframes pulse {
-      0%, 100% {
-        opacity: 1;
-      }
-      50% {
-        opacity: .7;
-      }
-    }
-    .status-dot.status-draft { 
-      background: #CED4DA; /* Grey */
-    }
-    .status-dot.status-queued { 
-      background: #FD7E14; /* Orange */
-      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }
-    .status-dot.status-sending { 
-      background: #FCC419; /* Yellow */
-      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }
-    .status-dot.status-sent { 
-      background: var(--sg-success); /* Green */
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 500;
-      background: var(--sg-blue-light);
-      color: var(--sg-blue-dark);
-      border: 1px solid var(--sg-blue);
-    }
-
-    .form-row {
-      display: flex;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    .form-group {
-      margin-bottom: 12px;
-      flex: 1;
-    }
-    .form-group label {
-      font-size: 12px;
-      font-weight: 600;
-      display: block;
-      margin-bottom: 4px;
-    }
-    .form-group small {
-      display: block;
-      font-size: 11px;
-      color: var(--sg-muted);
-    }
-    input[type="text"],
-    input[type="email"],
-    input[type="number"],
-    input[type="password"],
-    textarea,
-    select {
-      width: 100%;
-      padding: 10px 12px;
-      font-size: 14px;
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      outline: none;
-      transition: all 0.2s ease;
-      background: #fff;
-      color: var(--sg-text);
-    }
-    input:focus, textarea:focus, select:focus {
-      border-color: var(--sg-blue);
-      box-shadow: 0 0 0 3px rgba(26,130,226,0.1);
-      background: #fff;
-    }
-    input:hover, textarea:hover, select:hover {
-      border-color: var(--sg-blue);
-    }
-    textarea {
-      min-height: 160px;
-      resize: vertical;
-      font-family: inherit;
-    }
-    input::placeholder,
-    textarea::placeholder {
-      color: var(--sg-muted);
-    }
-
-    .sidebar-header {
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--sg-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .sidebar-header-title {
-      font-weight: 600;
-      font-size: 14px;
-    }
-
-    .sidebar-body {
-      padding: 14px 16px;
-      overflow-y: auto;
-      flex: 1;
-    }
-    .sidebar-section-title {
-      font-size: 12px;
-      font-weight: 600;
-      margin-bottom: 6px;
-      color: var(--sg-muted);
-      text-transform: uppercase;
-      letter-spacing: .05em;
-    }
-    .sidebar-foot {
-      padding: 10px 16px 14px;
-      border-top: 1px solid var(--sg-border);
-    }
-
-    .sp-rotation-card {
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      padding: 10px 10px 12px;
-      background: var(--sg-bg);
-      margin-bottom: 14px;
-    }
-    .checkbox-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 8px;
-      font-size: 13px;
-    }
-    .radio-row {
-      display: flex;
-      gap: 12px;
-      margin-bottom: 8px;
-      font-size: 13px;
-    }
-
-    .profiles-list {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .profile-card {
-      border-radius: 8px;
-      border: 1px solid var(--sg-border);
-      padding: 14px 16px;
-      font-size: 13px;
-      background: #fff;
-      transition: all 0.2s ease;
-      box-shadow: var(--sg-shadow-sm);
-    }
-    .profile-card:hover {
-      border-color: var(--sg-blue);
-      box-shadow: var(--sg-shadow-md);
-      transform: translateY(-2px);
-    }
-    .profile-card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 4px;
-    }
-    .profile-name {
-      font-weight: 600;
-      font-size: 13px;
-    }
-    .profile-meta {
-      font-size: 11px;
-      color: var(--sg-muted);
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .profile-actions {
-      display: flex;
-      gap: 6px;
-      margin-top: 4px;
-    }
-    .btn-mini {
-      font-size: 11px;
-      padding: 2px 6px;
-      border-radius: 4px;
-      border: 1px solid var(--sg-border);
-      background: #fff;
-      cursor: pointer;
-    }
-
-    .sp-form {
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      padding: 10px 10px 12px;
-      margin-bottom: 10px;
-    }
-    .hint {
-      font-size: 11px;
-      color: var(--sg-muted);
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      padding: 2px 6px;
-      border-radius: 999px;
-      font-size: 11px;
-      background: #EFF3F9;
-      color: #4B5563;
-    }
-
-    /* Header stats (new simplified look) */
-    .header-stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 20px;
-      background: #fff;
-      border: 1px solid var(--sg-border);
-      border-radius: 8px;
-      padding: 24px;
-      margin-bottom: 24px;
-      box-shadow: var(--sg-shadow-sm);
-    }
-    .stat-item {
-      text-align: center;
-      padding: 12px;
-      border-radius: 6px;
-      transition: background-color 0.2s ease, transform 0.2s ease;
-    }
-    .stat-item:hover {
-      background-color: var(--sg-bg);
-      transform: translateY(-2px);
-    }
-    .stat-item .stat-num {
-      font-size: 32px;
-      font-weight: 700;
-      color: var(--sg-blue-dark);
-      line-height: 1;
-      margin-bottom: 8px;
-    }
-    .stat-item .stat-label {
-      font-size: 12px;
-      color: var(--sg-muted);
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      font-weight: 600;
-    }
-
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    .stat-box {
-      background: #fff;
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      padding: 10px 12px;
-    }
-    .stat-label {
-      font-size: 11px;
-      text-transform: uppercase;
-      color: var(--sg-muted);
-      margin-bottom: 4px;
-    }
-    .stat-value {
-      font-size: 18px;
-      font-weight: 600;
-    }
-    .stat-sub {
-      font-size: 11px;
-      color: var(--sg-muted);
-    }
-
-    /* Contacts modal */
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(15,23,42,0.5);
-      display: flex;
-      justify-content: flex-end;
-      z-index: 40;
-      animation: fadeIn 0.2s ease;
-    }
-    @supports (backdrop-filter: blur(4px)) {
-      .modal-backdrop {
-        backdrop-filter: blur(4px);
-      }
-    }
-    @keyframes fadeIn {
-      from {
-        opacity: 0;
-      }
-      to {
-        opacity: 1;
-      }
-    }
-    .modal-panel {
-      width: 480px;
-      max-width: 100%;
-      background: #fff;
-      padding: 28px 32px;
-      box-shadow: var(--sg-shadow-lg);
-      display: flex;
-      flex-direction: column;
-      animation: slideInRight 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    @keyframes slideInRight {
-      from {
-        transform: translateX(100%);
-      }
-      to {
-        transform: translateX(0);
-      }
-    }
-
-    /* HTML Editor modal (fixed center) */
-    .html-editor-backdrop {
-      display: none; /* hidden initially */
-      position: fixed;
-      inset: 0;
-      background: rgba(15,23,42,0.6);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 80;
-      animation: fadeIn 0.2s ease;
-    }
-    @supports (backdrop-filter: blur(4px)) {
-      .html-editor-backdrop {
-        backdrop-filter: blur(4px);
-      }
-    }
-    .html-editor-backdrop.show {
-      display: flex;
-    }
-    .html-editor-panel {
-      width: 900px;
-      max-width: calc(100% - 40px);
-      max-height: 85vh;
-      overflow: auto;
-      background: #fff;
-      padding: 24px;
-      border-radius: 12px;
-      box-shadow: var(--sg-shadow-lg);
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      animation: scaleIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    @keyframes scaleIn {
-      from {
-        transform: scale(0.95);
-        opacity: 0;
-      }
-      to {
-        transform: scale(1);
-        opacity: 1;
-      }
-    }
-    .html-editor-panel textarea {
-      min-height: 420px;
-      width: 100%;
-      padding: 12px;
-      font-family: monospace;
-      font-size: 13px;
-      border: 1px solid #e6edf3;
-      border-radius: 6px;
-      resize: vertical;
-    }
-    .html-editor-actions {
-      display: flex;
-      gap: 8px;
-      justify-content: flex-end;
-    }
-
-    .toast {
-      position: fixed;
-      right: 24px;
-      top: 24px;
-      z-index: 200;
-      padding: 14px 18px;
-      border-radius: 8px;
-      color: #fff;
-      font-weight: 600;
-      font-size: 14px;
-      box-shadow: var(--sg-shadow-lg);
-      display: none;
-      opacity: 0;
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      transform: translateY(-10px);
-    }
-    .toast.show { 
-      display: block; 
-      opacity: 1;
-      transform: translateY(0);
-    }
-    .toast.success { 
-      background: var(--sg-success);
-      border: 1px solid var(--sg-success);
-    }
-    .toast.error { 
-      background: var(--sg-danger);
-      border: 1px solid var(--sg-danger);
-    }
-
-    /* ========== REVIEW PAGE ENHANCEMENTS ========== */
-    /* Make the Review page resemble SendGrid layout: left details, right preview (wider preview) */
-    
-    /* Status indicators for concurrent mode */
-    .concurrent-badge {
-      display: inline-block;
-      padding: 2px 6px;
-      font-size: 10px;
-      font-weight: 600;
-      background: #4CAF50;
-      color: white;
-      border-radius: 3px;
-      margin-left: 8px;
-      text-transform: uppercase;
-    }
-    .concurrent-badge.sequential {
-      background: #9e9e9e;
-    }
-    
-    .review-grid {
-      display: grid;
-      grid-template-columns: 1fr 680px; /* bigger preview panel */
-      gap: 18px;
-      align-items: start;
-    }
-    .review-summary {
-      background: #fff;
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      padding: 16px;
-    }
-    .review-row {
-      display: flex;
-      justify-content: space-between;
-      padding: 10px 6px;
-      border-bottom: 1px solid #f1f5f9;
-    }
-    .review-row .left { color: var(--sg-muted); font-weight:600; width:40%; }
-    .review-row .right { width:58%; text-align:right; color:var(--sg-text); }
-
-    .test-send-card {
-      margin-top: 14px;
-      background: #fff;
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      padding: 14px;
-    }
-    .test-send-card small.hint { display:block; margin-top:8px; color:var(--sg-muted); }
-
-    .preview-box {
-      border:1px solid var(--sg-border);
-      border-radius:6px;
-      background:#fff;
-      padding:10px;
-      min-height:640px; /* taller preview */
-      overflow:auto;
-    }
-
-    /*
-      ============================
-      NEW / FIXED STYLES FOR EDITOR
-      These styles make the left "modules" area show tiles (like Image 2)
-      and style the canvas placeholder and blocks for a nicer visual layout.
-      ============================
-    */
-    .editor-shell {
-      display: flex;
-      gap: 18px;
-      align-items: flex-start;
-    }
-    .editor-left {
-      width: 320px; /* make left sidebar a fixed column like SendGrid */
-      min-width: 260px;
-      max-width: 360px;
-      background: transparent;
-      padding: 12px;
-    }
-
-    /* Modules grid: tiles with icons */
-    .modules-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      align-items: start;
-      margin-bottom: 10px;
-    }
-    .module-tile {
-      background: #fff;
-      border: 1px solid var(--sg-border);
-      border-radius: 6px;
-      padding: 18px 12px;
-      text-align: center;
-      cursor: pointer;
-      color: var(--sg-muted);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 8px;
-      min-height: 84px;
-      transition: box-shadow .15s ease, border-color .15s ease, transform .08s ease;
-    }
-    .module-tile .icon {
-      font-size: 22px;
-      color: var(--sg-blue);
-      line-height: 1;
-    }
-    .module-tile:hover {
-      border-color: var(--sg-blue);
-      box-shadow: 0 6px 16px rgba(26,130,226,0.08);
-      color: var(--sg-text);
-      transform: translateY(-2px);
-    }
-    .modules-pane .sidebar-section-title {
-      margin-top: 6px;
-      margin-bottom: 12px;
-    }
-
-    /* Canvas and placeholder */
-    .editor-right {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      padding-left: 12px;
-    }
-    .canvas-area {
-      border-radius: 6px;
-      border: 1px solid var(--sg-border);
-      background: #fff;
-      min-height: 420px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 30px;
-      position: relative;
-      overflow: auto;
-    }
-    .drag-placeholder {
-      background: #FBFCFD;
-      border: 1px dashed #EEF2F6;
-      padding: 60px 40px;
-      color: #9AA6B2;
-      border-radius: 6px;
-      width: 70%;
-      text-align: center;
-      font-size: 15px;
-    }
-
-    /* Canvas block wrapper */
-    .canvas-block {
-      background: #fff;
-      border: 1px solid #f1f5f9;
-      border-radius: 6px;
-      padding: 12px;
-      margin-bottom: 12px;
-      width: 100%;
-      position: relative;
-      box-shadow: none;
-    }
-    .canvas-block + .canvas-block {
-      margin-top: 12px;
-    }
-    .block-remove {
-      position: absolute;
-      top: 8px;
-      right: 8px;
-      background: #fff;
-      border: 1px solid var(--sg-border);
-      border-radius: 4px;
-      width: 28px;
-      height: 28px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      font-size: 14px;
-      color: #666;
-    }
-    .block-remove:hover {
-      background: #fff;
-      border-color: var(--sg-blue);
-      color: var(--sg-blue-dark);
-    }
-    .block-content {
-      min-height: 40px;
-    }
-
-    /* Code module visual improvements */
-    .code-module {
-      border: 1px dashed #eef2f6;
-      border-radius: 6px;
-      overflow: hidden;
-    }
-    .code-module-header {
-      background: #1f6f9f;
-      color: #fff;
-      padding: 8px 10px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .code-module-body {
-      padding: 12px;
-      background: #fff;
-      color: #333;
-    }
-    .code-placeholder {
-      color: #9aa6b2;
-      font-style: normal;
-    }
-
-    /* Responsive design improvements */
-    @media (max-width: 1400px) {
-      .review-grid { grid-template-columns: 1fr 520px; }
-      .main-content {
-        padding: 28px 32px 32px;
-      }
-    }
-
-    @media (max-width: 1200px) {
-      .editor-left { width: 300px; height: auto; }
-      .drag-placeholder { width: 100%; }
-      .canvas-block, .drag-placeholder { width: 100%; }
-      .modules-grid { grid-template-columns: repeat(1, minmax(0,1fr)); }
-      .header-stats {
-        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-        gap: 16px;
-        padding: 20px;
-      }
-    }
-
-    @media (max-width: 900px) {
-      .form-row {
-        flex-direction: column;
-      }
-      .stats-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-      .header-stats {
-        grid-template-columns: repeat(2, 1fr);
-        gap: 12px;
-        padding: 16px;
-      }
-      .stat-item .stat-num {
-        font-size: 24px;
-      }
-      .nav-main {
-        display: none;
-      }
-      .sidebar-inner {
-        left: 0;
-        width: 100%;
-      }
-      .sidebar-sp.open {
-        width: 100%;
-      }
-      .page-wrapper.shifted {
-        transform: none;
-      }
-      .editor-shell {
-        flex-direction: column;
-      }
-      .editor-left, .editor-right { width: 100%; }
-      .review-grid { grid-template-columns: 1fr; }
-      .preview-box { min-height:420px; }
-      .main-content {
-        padding: 20px 16px 24px;
-      }
-      .page-title {
-        font-size: 24px;
-      }
-      .card {
-        padding: 16px 18px;
-      }
-    }
-    
-    @media (max-width: 600px) {
-      .header-stats {
-        grid-template-columns: 1fr;
-      }
-      .card-header .btn {
-        width: 100%;
-        justify-content: center;
-      }
-      .card-header {
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 12px;
-      }
-      .page-title {
-        font-size: 20px;
-      }
-    }
-  </style>
-</head>
-<body>
-<div class="app-shell">
-
-  <!-- LEFT NAV (SendGrid-style) -->
-  <aside class="nav-main">
-    <div class="nav-header">
-      <div class="nav-avatar"><?php echo strtoupper(substr($_SESSION['admin_username'] ?? 'A', 0, 1)); ?></div>
-      <div class="nav-user-info">
-        <div class="nav-user-email"><?php echo htmlspecialchars($_SESSION['admin_username'] ?? 'Admin'); ?></div>
-        <div class="nav-user-sub">EMAIL EXTRACTOR</div>
-      </div>
-    </div>
-    <div class="nav-scroll">
-      <div class="nav-section-title">Email Extraction</div>
-
-      <div class="nav-section-title">Jobs</div>
-      <a href="?page=list" class="nav-link <?php echo $isSingleSendsPage ? 'active' : ''; ?>">
-        <span>Extraction Jobs</span>
-      </a>
-      <a href="#" class="nav-link"><span>Export Data</span></a>
-
-      <div class="nav-section-title">Analytics</div>
-      <a href="?page=stats" class="nav-link"><span>Stats</span></a>
-    </div>
-    <div class="nav-footer">
-      <a href="?action=logout" style="color: var(--sg-danger); display: block; padding: 8px 0; font-weight: 600;">🚪 Logout</a>
-      EMAIL EXTRACTOR v1.0<br>Professional Email Extraction
-    </div>
-  </aside>
-
-  <!-- LEFT SLIDE PANEL: Job Profiles -->
-  <div class="sidebar-sp" id="spSidebar">
-    <div class="sidebar-inner">
-      <div class="sidebar-header">
-        <div class="sidebar-header-title">Job Profiles</div>
-        <button class="btn btn-outline" type="button" id="spCloseBtn">✕</button>
-      </div>
-      <div class="sidebar-body">
-        <!-- Rotation settings -->
-        <form method="post" class="sp-rotation-card">
-          <input type="hidden" name="action" value="save_rotation">
-          <div class="sidebar-section-title">Extraction Settings</div>
-          <div class="checkbox-row">
-            <input type="checkbox" name="rotation_enabled" id="rot_enabled" <?php if ($rotationSettings['rotation_enabled']) echo 'checked'; ?>>
-            <label for="rot_enabled">Enable Profile Rotation</label>
-          </div>
-          <div class="form-group">
-            <label>Workers (Parallel API Calls)</label>
-            <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo (int)($rotationSettings['workers'] ?? DEFAULT_WORKERS); ?>">
-            <small class="hint">⚠️ NO LIMIT - Higher = faster extraction. Minimum: <?php echo MIN_WORKERS; ?>. Recommended: 4-10 for typical, 10-50 for high volume.</small>
-          </div>
-          <div class="form-group">
-            <small class="hint" style="display:block; margin-top:8px;">
-              When enabled, jobs will rotate through all active extraction profiles. 
-              All workers make simultaneous API calls for maximum extraction speed.
-            </small>
-          </div>
-          <button class="btn btn-primary" type="submit">Save Settings</button>
-        </form>
-
-        <!-- Profiles list -->
-        <div class="profiles-list">
-          <div class="sidebar-section-title">Extraction Profiles</div>
-          <?php if (empty($profiles)): ?>
-            <div class="hint">No profiles yet. Create your first extraction profile below.</div>
-          <?php else: ?>
-            <?php foreach ($profiles as $p): ?>
-              <div class="profile-card" id="profile-card-<?php echo (int)$p['id']; ?>">
-                <div class="profile-card-header">
-                  <div class="profile-name"><?php echo h($p['profile_name']); ?></div>
-                  <div class="pill">SERPER.DEV</div>
-                </div>
-                <div class="profile-meta">
-                  <span>Query: <?php echo h(substr($p['search_query'] ?? '', 0, 50)); ?><?php echo strlen($p['search_query'] ?? '') > 50 ? '...' : ''; ?></span>
-                  <span>Target: <?php echo (int)($p['target_count'] ?? 100); ?> emails</span>
-                  <span>Status: <?php echo $p['active'] ? 'Active' : 'Disabled'; ?></span>
-                  <?php if (!empty($p['workers'])): ?>
-                    <span>Workers: <?php echo (int)$p['workers']; ?></span>
-                  <?php endif; ?>
-                </div>
-                <div class="profile-actions">
-                  <button type="button" class="btn-mini" onclick="testProfileConnection(<?php echo (int)$p['id']; ?>)">🔌 Test</button>
-                  <a href="?page=list&edit_profile=<?php echo (int)$p['id']; ?>" class="btn-mini">Edit</a>
-                  <form method="post" style="display:inline;">
-                    <input type="hidden" name="action" value="delete_profile">
-                    <input type="hidden" name="profile_id" value="<?php echo (int)$p['id']; ?>">
-                    <button type="submit" class="btn-mini" onclick="return confirm('Delete this profile?');">Delete</button>
-                  </form>
-                </div>
-                <div style="margin-top:8px; font-size:12px; color:var(--sg-muted);" id="profile-conn-status-<?php echo (int)$p['id']; ?>"></div>
-              </div>
-            <?php endforeach; ?>
-          <?php endif; ?>
-        </div>
-
-        <!-- Add / Edit profile -->
-        <div class="sidebar-section-title">
-          <?php echo $editProfile ? 'Edit Profile' : 'Add New Profile'; ?>
-        </div>
-        <form method="post" class="sp-form" id="profileForm">
-          <input type="hidden" name="action" value="save_profile">
-          <input type="hidden" name="profile_id" value="<?php echo $editProfile ? (int)$editProfile['id'] : 0; ?>">
-          <div class="form-group">
-            <label>Profile Name</label>
-            <input type="text" name="profile_name" required value="<?php echo $editProfile ? h($editProfile['profile_name']) : ''; ?>">
-          </div>
-          <div class="form-group">
-            <label>Serper.dev API Key</label>
-            <input type="text" name="api_key" id="profile_api_key" required value="<?php echo $editProfile ? h($editProfile['api_key']) : ''; ?>">
-            <small class="hint">Your Serper.dev API key for email extraction</small>
-          </div>
-          <div class="form-group">
-            <label>Search Query</label>
-            <textarea name="search_query" id="profile_search_query" rows="3" required><?php echo $editProfile ? h($editProfile['search_query']) : ''; ?></textarea>
-            <small class="hint">e.g., "real estate agents california"</small>
-          </div>
-          
-          <!-- Test Connection Button & Result -->
-          <div class="form-group">
-            <button type="button" class="btn btn-outline" id="testConnectionBtn" style="width:100%;">
-              🔌 Test Connection
-            </button>
-            <div id="connectionTestResult" style="margin-top:10px; display:none; padding:12px; border-radius:4px; font-size:13px;"></div>
-          </div>
-          <div class="form-group">
-            <label>Target Email Count</label>
-            <input type="number" name="target_count" min="1" max="10000" value="<?php echo $editProfile ? (int)$editProfile['target_count'] : 100; ?>">
-            <small class="hint">Number of emails to extract (1-10000)</small>
-          </div>
-          <div class="form-group">
-            <label>Country (optional)</label>
-            <input type="text" name="country" placeholder="us" value="<?php echo $editProfile ? h($editProfile['country']) : ''; ?>">
-            <small class="hint">ISO country code (e.g., us, uk, ca)</small>
-          </div>
-          <div class="checkbox-row">
-            <input type="checkbox" name="filter_business_only" id="pf_business" <?php if (!$editProfile || $editProfile['filter_business_only']) echo 'checked'; ?>>
-            <label for="pf_business">Business Emails Only (filter out free providers)</label>
-          </div>
-          <div class="form-group">
-            <label>Workers (Parallel API Calls)</label>
-            <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)$editProfile['workers'] : DEFAULT_WORKERS; ?>">
-            <small class="hint">Number of parallel API calls. Higher = faster extraction. Recommended: 4-10</small>
-          </div>
-          <div class="checkbox-row">
-            <input type="checkbox" name="active" id="pf_active" <?php if (!$editProfile || $editProfile['active']) echo 'checked'; ?>>
-            <label for="pf_active">Active</label>
-          </div>
-          <div style="display:flex; gap:8px; justify-content:flex-end;">
-            <?php if ($editProfile): ?>
-              <a href="?page=list" class="btn btn-outline">Cancel</a>
-            <?php endif; ?>
-            <button class="btn btn-primary" type="submit"><?php echo $editProfile ? 'Update' : 'Create'; ?> Profile</button>
-          </div>
-        </form>
-      </div>
-    </div>
-  </div>
-
-  <!-- MAIN PAGE -->
-  <div class="page-wrapper" id="pageWrapper">
-    <div class="topbar">
-      <div class="brand">
-        <img src="mafia-single-sends-logo.png" alt="Logo" style="width:250px;height:100px;">
-      </div>
-      <div class="topbar-actions">
-        <?php if ($page === 'list'): ?>
-          <button class="btn btn-outline" id="spOpenBtn" type="button">Job Profiles ⚙</button>
-        <?php elseif ($page === 'contacts'): ?>
-          <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
-        <?php else: ?>
-          <a href="?page=list" class="btn btn-outline">Extraction Jobs</a>
-        <?php endif; ?>
-      </div>
-    </div>
-
-    <div class="main-content">
-      <?php if ($page === 'list'): ?>
-        <?php
-          // Check if PDO is available
-          if ($pdo === null) {
-              echo '<div class="page-title">Database Error</div>';
-              echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-          } else {
-              $stmt = $pdo->query("SELECT * FROM jobs ORDER BY created_at DESC");
-              $campaigns = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        ?>
-        <div class="page-title">Extraction Jobs</div>
-        <div class="page-subtitle">Create and manage email extraction jobs using serper.dev API.</div>
-
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <div class="card-title">Extraction Jobs</div>
-              <div class="card-subtitle">Create and manage email extraction jobs.</div>
-            </div>
-            <form method="post" style="display:flex; gap:8px; align-items:center;">
-              <input type="hidden" name="action" value="create_job">
-              <input type="text" name="name" placeholder="Job name" style="font-size:13px; padding:6px 8px;">
-              <button type="submit" class="btn btn-primary">+ Create Extraction Job</button>
-            </form>
-          </div>
-
-          <!-- Bulk actions toolbar -->
-          <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
-            <form method="post" id="bulkActionsForm" style="display:flex; gap:8px; align-items:center;">
-              <input type="hidden" name="action" value="bulk_jobs">
-              <select name="bulk_action" id="bulkActionSelect" style="padding:6px;">
-                <option value="">Bulk actions</option>
-                <option value="delete_selected">Delete selected</option>
-                <option value="duplicate_selected">Duplicate selected</option>
-              </select>
-              <button type="submit" class="btn btn-outline">Apply</button>
-            </form>
-          </div>
-
-          <form method="post" id="jobsTableForm">
-            <input type="hidden" name="action" value="bulk_jobs">
-            <table class="table">
-              <thead>
-                <tr>
-                  <th style="width:36px;"><input type="checkbox" id="chkAll"></th>
-                  <th>Job Name</th>
-                  <th>Status</th>
-                  <th>Profile</th>
-                  <th>Extracted</th>
-                  <th>Target</th>
-                  <th>Progress</th>
-                  <th>Created</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <?php if (empty($campaigns)): ?>
-                  <tr>
-                    <td colspan="9" style="text-align:center; padding:20px; color:var(--sg-muted);">
-                      No jobs yet. Create your first extraction job above.
-                    </td>
-                  </tr>
-                <?php else: ?>
-                  <?php foreach ($campaigns as $c):
-                    $stats = get_job_stats($pdo, (int)$c['id']);
-                    $status = $c['status'];
-                    // Support statuses: Grey (draft) → Orange (queued) → Yellow (extracting) → Green (completed)
-                    if ($status === 'completed' || $status === 'sent') {
-                        $dotClass = 'status-sent';
-                        $statusLabel = 'Completed';
-                    } elseif ($status === 'extracting' || $status === 'sending') {
-                        $dotClass = 'status-sending';
-                        $statusLabel = 'Extracting';
-                    } elseif ($status === 'queued') {
-                        $dotClass = 'status-queued';
-                        $statusLabel = 'Queued';
-                    } else {
-                        $dotClass = 'status-draft';
-                        $statusLabel = 'Draft';
-                    }
-                    $link = ($status === 'completed' || $status === 'sent' || $status === 'extracting' || $status === 'sending' || $status === 'queued') ? '?page=stats&id='.$c['id'] : '?page=editor&id='.$c['id'];
+                while ((time() - $startTime) < $maxRuntime) {
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
                     
-                    $profileName = 'N/A';
-                    if (!empty($c['profile_id'])) {
-                        foreach ($profiles as $p) {
-                            if ($p['id'] == $c['profile_id']) {
-                                $profileName = $p['profile_name'];
+                    // Pass job_id to only get queue items for that specific job
+                    $job = Worker::getNextJob($jobId);
+                    
+                    if ($job) {
+                        error_log("handleStartWorker: Worker {$workerName} got job #{$job['id']}");
+                        Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                        
+                        try {
+                            Worker::processJob($job['id']);
+                            $itemsProcessed++;
+                            error_log("handleStartWorker: Worker {$workerName} completed job #{$job['id']} (total: {$itemsProcessed})");
+                        } catch (Exception $e) {
+                            error_log("handleStartWorker: Worker {$workerName} error processing job #{$job['id']}: " . $e->getMessage());
+                        }
+                        
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    } else {
+                        // No jobs available, sleep briefly
+                        usleep(500000); // 0.5 seconds
+                        
+                        // If dedicated to a specific job and no work found, check if job is complete
+                        if ($jobId !== null) {
+                            $jobDetails = Job::getById($jobId);
+                            if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
+                                error_log("handleStartWorker: Worker {$workerName} - Job {$jobId} is complete or not found. Exiting.");
                                 break;
                             }
                         }
                     }
                     
-                    $extracted = (int)($c['progress_extracted'] ?? 0);
-                    $target = (int)($c['progress_total'] ?? $c['target_count'] ?? 0);
-                    $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
-                  ?>
-                    <tr data-cid="<?php echo (int)$c['id']; ?>">
-                      <td><input type="checkbox" name="job_ids[]" value="<?php echo (int)$c['id']; ?>" class="job-checkbox"></td>
-                      <td>
-                        <a href="<?php echo $link; ?>">
-                          <span class="status-dot <?php echo $dotClass; ?>"></span>
-                          <?php echo h($c['name']); ?>
-                        </a>
-                      </td>
-                      <td><?php echo ucfirst($status); ?>
-                        <?php if ($status === 'sending' || $status === 'queued' || $status === 'extracting'): ?>
-                          <div id="progress-bar-<?php echo (int)$c['id']; ?>" style="margin-top:4px;">
-                            <div style="background:#eee; height:4px; border-radius:2px; overflow:hidden;">
-                              <div id="progress-fill-<?php echo (int)$c['id']; ?>" style="background:#4CAF50; height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
-                            </div>
-                            <div id="progress-text-<?php echo (int)$c['id']; ?>" style="font-size:11px; color:var(--sg-muted); margin-top:2px;">
-                              <?php echo $progress; ?>% • <?php echo $extracted; ?>/<?php echo $target; ?>
-                            </div>
-                          </div>
-                        <?php endif; ?>
-                      </td>
-                      <td><?php echo h($profileName); ?></td>
-                      <td><span id="extracted-<?php echo (int)$c['id']; ?>"><?php echo $extracted; ?></span></td>
-                      <td><?php echo $target; ?></td>
-                      <td><?php echo $progress; ?>%</td>
-                      <td><?php echo h($c['created_at'] ?? ''); ?></td>
-                      <td>
-                        <a class="btn-mini" href="<?php echo $link; ?>">Open</a>
-                        <form method="post" style="display:inline;">
-                          <input type="hidden" name="action" value="duplicate_job">
-                          <input type="hidden" name="job_id" value="<?php echo (int)$c['id']; ?>">
-                          <button type="submit" class="btn-mini">Duplicate</button>
-                        </form>
-                        <form method="post" style="display:inline;">
-                          <input type="hidden" name="action" value="delete_job">
-                          <input type="hidden" name="job_id" value="<?php echo (int)$c['id']; ?>">
-                          <button type="submit" class="btn-mini" onclick="return confirm('Delete this job and its extracted emails?');">Delete</button>
-                        </form>
-                      </td>
-                    </tr>
-                  <?php endforeach; ?>
-                <?php endif; ?>
-              </tbody>
-            </table>
-          </form>
-        </div>
-
-        <script>
-          (function(){
-            // If URL contains sent_campaign=<id>, start polling its stats to show incremental delivered updates
-            function getQueryParam(name) {
-              var params = new URLSearchParams(window.location.search);
-              return params.get(name);
+                    // If no items to process, check less frequently
+                    if ($itemsProcessed === 0 && (time() - $startTime) > 30) {
+                        error_log("handleStartWorker: Worker {$workerName} timeout - no jobs found in 30 seconds");
+                        break;
+                    }
+                }
+                
+                error_log("handleStartWorker: Worker {$workerName} shutting down after processing {$itemsProcessed} items");
+                
+            } catch (Exception $e) {
+                error_log("handleStartWorker: Worker {$workerName} fatal error: " . $e->getMessage());
             }
-            var sentCampaign = getQueryParam('sent_campaign');
-            if (sentCampaign) {
-              var cid = sentCampaign;
-              var interval = 2000;
-              var timer = setInterval(function(){
-                fetch(window.location.pathname + '?ajax=campaign_stats&id=' + encodeURIComponent(cid))
-                  .then(function(r){ return r.json(); })
-                  .then(function(data){
-                    if (!data) return;
-                    var d = document.getElementById('delivered-' + cid);
-                    var o = document.getElementById('open-' + cid);
-                    var c = document.getElementById('click-' + cid);
-                    if (d) d.innerText = data.delivered || 0;
-                    if (o) o.innerText = data.open || 0;
-                    if (c) c.innerText = data.click || 0;
-                  }).catch(function(){});
-              }, interval);
-              // stop polling after 10 minutes as safety
-              setTimeout(function(){ clearInterval(timer); }, 10 * 60 * 1000);
-            }
-
-            // Real-time progress polling for sending/queued campaigns
-            var sendingCampaigns = document.querySelectorAll('[data-cid]');
-            var progressPollers = {};
             
-            sendingCampaigns.forEach(function(row){
-              var cid = row.getAttribute('data-cid');
-              var statusDot = row.querySelector('.status-dot');
-              
-              if (statusDot && (statusDot.classList.contains('status-sending') || statusDot.classList.contains('status-queued'))) {
-                // Start polling progress for this campaign
-                progressPollers[cid] = setInterval(function(){
-                  var fd = new FormData();
-                  fd.append('action', 'get_campaign_progress');
-                  fd.append('campaign_id', cid);
-                  
-                  fetch(window.location.pathname, {
-                    method: 'POST',
-                    body: fd,
-                    credentials: 'same-origin'
-                  })
-                  .then(function(r){ return r.json(); })
-                  .then(function(data){
-                    if (!data || !data.ok) return;
-                    
-                    // Update progress bar
-                    var fillEl = document.getElementById('progress-fill-' + cid);
-                    var textEl = document.getElementById('progress-text-' + cid);
-                    var deliveredEl = document.getElementById('delivered-' + cid);
-                    var bounceEl = document.getElementById('bounce-' + cid);
-                    
-                    if (fillEl) {
-                      fillEl.style.width = data.percentage + '%';
-                    }
-                    if (textEl) {
-                      var workersText = data.active_workers + ' worker' + (data.active_workers !== 1 ? 's' : '');
-                      textEl.innerText = data.percentage + '% • ' + data.total_processed + '/' + data.total_recipients + ' • ' + workersText;
-                    }
-                    if (deliveredEl) {
-                      deliveredEl.innerText = data.delivered || 0;
-                    }
-                    if (bounceEl) {
-                      bounceEl.innerText = data.bounced || 0;
-                    }
-                    
-                    // If campaign finished, stop polling and reload page
-                    // Check multiple conditions to ensure campaign is truly complete
-                    var isProcessingComplete = data.progress_status === 'completed' ||
-                                             (data.total_recipients > 0 && data.total_processed >= data.total_recipients);
-                    
-                    if (data.status === 'sent') {
-                      // Status is already 'sent', safe to reload immediately
-                      clearInterval(progressPollers[cid]);
-                      delete progressPollers[cid];
-                      
-                      setTimeout(function(){
-                        window.location.reload();
-                      }, 1000);
-                    } else if (isProcessingComplete) {
-                      // Processing is complete but status not yet updated
-                      // Start waiting timer if not already started
-                      if (!progressPollers[cid + '_waiting']) {
-                        progressPollers[cid + '_waiting'] = Date.now();
-                        console.log('Campaign ' + cid + ' processing complete, waiting for status update...');
-                      }
-                      
-                      // If we've been waiting more than 10 seconds, reload anyway
-                      var waitTime = Date.now() - progressPollers[cid + '_waiting'];
-                      if (waitTime > 10000) {
-                        console.log('Campaign ' + cid + ' timeout waiting for status, reloading...');
-                        clearInterval(progressPollers[cid]);
-                        delete progressPollers[cid];
-                        delete progressPollers[cid + '_waiting'];
-                        window.location.reload();
-                      }
-                    }
-                  })
-                  .catch(function(err){
-                    console.error('Progress poll error:', err);
-                  });
-                }, 2000); // Poll every 2 seconds
-                
-                // Stop polling after 20 minutes as safety
-                setTimeout(function(){
-                  if (progressPollers[cid]) {
-                    clearInterval(progressPollers[cid]);
-                    delete progressPollers[cid];
-                  }
-                }, 20 * 60 * 1000);
-              }
-            });
-
-            // select all checkbox
-            var chkAll = document.getElementById('chkAll');
-            if (chkAll) {
-              chkAll.addEventListener('change', function(){
-                var boxes = document.querySelectorAll('.campaign-checkbox');
-                boxes.forEach(function(b){ b.checked = chkAll.checked; });
-              });
+            exit(0);
+        }
+    }
+    
+    private static function handleProcessQueueWorker(): void {
+        // This processes queue items for a specific job
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            $jobId = (int)($_POST['job_id'] ?? 0);
+            $workerName = $_POST['worker_name'] ?? 'queue-worker-' . uniqid();
+            $workerIndex = (int)($_POST['worker_index'] ?? 0);
+            
+            if ($jobId <= 0) {
+                echo json_encode(['status' => 'error', 'message' => 'Invalid job ID']);
+                exit;
             }
-
-            // bulk actions form should copy selected ids into its own form when submitted
-            var bulkForm = document.getElementById('bulkActionsForm');
-            bulkForm.addEventListener('submit', function(e){
-              var sel = document.querySelectorAll('.campaign-checkbox:checked');
-              if (sel.length === 0) {
-                alert('No campaigns selected.');
-                e.preventDefault();
-                return false;
-              }
-              // create hidden inputs for each selected id
-              // remove previous if any
-              Array.from(bulkForm.querySelectorAll('input[name="campaign_ids[]"]')).forEach(function(n){ n.remove(); });
-              sel.forEach(function(cb){
-                var inp = document.createElement('input');
-                inp.type = 'hidden';
-                inp.name = 'campaign_ids[]';
-                inp.value = cb.value;
-                bulkForm.appendChild(inp);
-              });
-            });
-          })();
-        </script>
-        <?php } // End PDO check ?>
-
-      <?php elseif ($page === 'editor'): ?>
-        <?php
-          if ($pdo === null) {
-              echo '<div class="page-title">Database Error</div>';
-              echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-          } else {
-              $id = (int)($_GET['id'] ?? 0);
-              $job = get_job($pdo, $id);
-              if (!$job) {
-                echo "<p>Job not found.</p>";
-              } else {
+            
+            error_log("✓ Queue Worker {$workerName} starting for job {$jobId}...");
+            
+            // Register worker immediately
+            $workerId = Worker::register($workerName);
+            
+            // Close connection immediately so client doesn't wait
+            ignore_user_abort(true);
+            set_time_limit(0);
+            
+            // Send success response immediately
+            $response = json_encode([
+                'status' => 'started', 
+                'worker' => $workerName, 
+                'worker_id' => $workerId,
+                'job_id' => $jobId
+            ]);
+            header('Content-Type: application/json');
+            header('Content-Length: ' . strlen($response));
+            header('Connection: close');
+            echo $response;
+            
+            // Flush all output buffers to send response
+            if (ob_get_level() > 0) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Close the session if it's open
+            if (session_id()) {
+                session_write_close();
+            }
+            
+            // Small delay to ensure connection closes
+            usleep(50000); // 0.05 seconds
+            
+            // Now process queue items for this job in background
+            try {
+                error_log("  Worker {$workerName} (ID: {$workerId}) starting to process queue for job {$jobId}");
+                
+                // Process queue items for this specific job
+                $startTime = time();
+                $maxRuntime = 600; // 10 minutes max per worker
+                $itemsProcessed = 0;
+                
+                // Keep processing until we run out of queue items for this job
+                while ((time() - $startTime) < $maxRuntime) {
+                    // Get next queue item for this specific job
+                    $job = Worker::getNextJob();
+                    
+                    // Check if we got a job and it's for our target job_id
+                    if (!$job) {
+                        error_log("  Worker {$workerName}: No queue items available. Exiting.");
+                        break;
+                    }
+                    
+                    $retrievedJobId = (int)$job['id'];
+                    
+                    // Only process if it's for our target job
+                    if ($retrievedJobId != $jobId) {
+                        error_log("  Worker {$workerName}: Queue item is for different job ({$retrievedJobId} != {$jobId}). Exiting.");
+                        break;
+                    }
+                    
+                    error_log("  Worker {$workerName}: Processing queue item for job {$jobId}");
+                    Worker::updateHeartbeat($workerId, 'running', $retrievedJobId, 0, 0);
+                    
+                    // Process the job (this extracts emails)
+                    Worker::processJob($retrievedJobId);
+                    
+                    $itemsProcessed++;
+                    error_log("  Worker {$workerName}: Completed queue item {$itemsProcessed} for job {$jobId}");
+                    
+                    // Check if all queue items for this job are done
+                    $db = Database::connect();
+                    $stmt = $db->prepare("SELECT COUNT(*) as pending FROM job_queue WHERE job_id = ? AND status = 'pending'");
+                    $stmt->execute([$jobId]);
+                    $pendingCount = $stmt->fetch()['pending'];
+                    
+                    if ($pendingCount == 0) {
+                        error_log("✓ Worker {$workerName}: All queue items completed for job {$jobId}. Exiting.");
+                        break;
+                    }
+                    
+                    // Small sleep between items to avoid race conditions
+                    usleep(100000); // 0.1 seconds (reduced from 0.5)
+                }
+                
+                error_log("✓ Worker {$workerName} completed successfully. Processed {$itemsProcessed} queue items for job {$jobId}.");
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            } catch (Exception $e) {
+                error_log("✗ Queue Worker {$workerName} error: " . $e->getMessage());
+                Worker::logError($workerId, $jobId, 'worker_error', $e->getMessage(), $e->getTraceAsString(), 'error');
+                Worker::updateHeartbeat($workerId, 'stopped', null, 0, 0);
+            }
+        }
+        exit;
+    }
+    
+    private static function renderSetup(?string $error): void {
         ?>
-          <div class="page-title">Job Configuration — <?php echo h($job['name']); ?></div>
-          <div class="page-subtitle">Configure your email extraction job and select profiles to execute.</div>
-
-          <!-- Status Message Display -->
-          <div id="extraction-status" style="display:none; margin-bottom:20px; padding:15px; border-radius:5px; position:relative;">
-            <button type="button" onclick="document.getElementById('extraction-status').style.display='none'" 
-                    style="position:absolute; top:10px; right:10px; background:none; border:none; font-size:20px; cursor:pointer; color:inherit; opacity:0.7;">
-              ×
-            </button>
-            <div style="display:flex; align-items:flex-start; gap:12px;">
-              <div id="status-icon" style="font-size:24px; line-height:1;"></div>
-              <div style="flex:1;">
-                <strong id="status-title" style="display:block; margin-bottom:8px; font-size:16px;"></strong>
-                <p id="status-message" style="margin:0; line-height:1.5;"></p>
-                <div id="status-details-toggle" style="margin-top:10px; display:none;">
-                  <a href="#" onclick="event.preventDefault(); document.getElementById('status-details').style.display = document.getElementById('status-details').style.display === 'none' ? 'block' : 'none'; this.textContent = document.getElementById('status-details').style.display === 'none' ? '▼ Show Technical Details' : '▲ Hide Technical Details';" style="color:inherit; opacity:0.8; text-decoration:underline; font-size:13px;">▼ Show Technical Details</a>
-                </div>
-                <pre id="status-details" style="display:none; margin:10px 0 0 0; padding:10px; background:rgba(0,0,0,0.05); border-radius:4px; font-size:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-wrap:break-word;"></pre>
-              </div>
-            </div>
-          </div>
-
-          <form method="post" id="jobForm">
-            <input type="hidden" name="action" value="save_job">
-            <input type="hidden" name="id" value="<?php echo (int)$job['id']; ?>">
-
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-              <div style="display:flex; gap:12px; align-items:center;">
-                <button class="btn btn-outline" type="submit">Save Configuration</button>
-              </div>
-              <div>
-                <a href="?page=list" class="btn btn-outline">Cancel</a>
-                <button class="btn btn-primary" type="button" id="startJobBtn">Start Extraction →</button>
-              </div>
-            </div>
-
-            <div class="card">
-              <div class="card-header">
-                <div>
-                  <div class="card-title">Job Settings</div>
-                  <div class="card-subtitle">Configure extraction parameters for this job.</div>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label>Job Name</label>
-                <input type="text" name="name" value="<?php echo h($job['name']); ?>" required>
-              </div>
-
-              <div class="form-group">
-                <label>Select Extraction Profile</label>
-                <select name="profile_id" id="profileSelect" required>
-                  <option value="">Select a profile...</option>
-                  <?php foreach ($profiles as $p): ?>
-                    <option value="<?php echo (int)$p['id']; ?>" 
-                      <?php if ($job['profile_id'] == $p['id']) echo 'selected'; ?>
-                      data-query="<?php echo h($p['search_query']); ?>"
-                      data-target="<?php echo (int)$p['target_count']; ?>">
-                      <?php echo h($p['profile_name']); ?> — Target: <?php echo (int)$p['target_count']; ?> emails
-                    </option>
-                  <?php endforeach; ?>
-                </select>
-                <small class="hint">Choose a profile with serper.dev API configuration</small>
-              </div>
-
-              <div id="profileDetails" style="display: none; margin-top: 12px; padding: 12px; background: #f8f9fa; border-radius: 4px;">
-                <div style="font-weight: 600; margin-bottom: 8px;">Profile Details:</div>
-                <div id="profileQuery" style="color: var(--sg-muted);"></div>
-                <div id="profileTarget" style="color: var(--sg-muted); margin-top: 4px;"></div>
-              </div>
-
-              <div class="checkbox-row">
-                <input type="checkbox" name="start_immediately" id="startImmediately">
-                <label for="startImmediately">Start extraction immediately after saving</label>
-              </div>
-            </div>
-          </form>
-
-          <script>
-            (function(){
-              var profileSelect = document.getElementById('profileSelect');
-              var profileDetails = document.getElementById('profileDetails');
-              var profileQuery = document.getElementById('profileQuery');
-              var profileTarget = document.getElementById('profileTarget');
-              var startJobBtn = document.getElementById('startJobBtn');
-
-              // Function to show status messages
-              function showStatus(type, title, message, details) {
-                var statusBox = document.getElementById('extraction-status');
-                var statusIcon = document.getElementById('status-icon');
-                var statusTitle = document.getElementById('status-title');
-                var statusMessage = document.getElementById('status-message');
-                var statusDetails = document.getElementById('status-details');
-                var statusDetailsToggle = document.getElementById('status-details-toggle');
-                
-                // Set colors based on type
-                if (type === 'success') {
-                  statusBox.style.backgroundColor = '#d4edda';
-                  statusBox.style.borderLeft = '4px solid #28a745';
-                  statusBox.style.color = '#155724';
-                  statusIcon.innerHTML = '✓';
-                  statusIcon.style.color = '#28a745';
-                } else if (type === 'error') {
-                  statusBox.style.backgroundColor = '#f8d7da';
-                  statusBox.style.borderLeft = '4px solid #dc3545';
-                  statusBox.style.color = '#721c24';
-                  statusIcon.innerHTML = '✗';
-                  statusIcon.style.color = '#dc3545';
-                } else if (type === 'info') {
-                  statusBox.style.backgroundColor = '#d1ecf1';
-                  statusBox.style.borderLeft = '4px solid #17a2b8';
-                  statusBox.style.color = '#0c5460';
-                  statusIcon.innerHTML = 'ℹ';
-                  statusIcon.style.color = '#17a2b8';
-                }
-                
-                statusTitle.textContent = title;
-                statusMessage.textContent = message;
-                
-                if (details) {
-                  statusDetails.textContent = details;
-                  statusDetailsToggle.style.display = 'block';
-                } else {
-                  statusDetailsToggle.style.display = 'none';
-                }
-                
-                statusBox.style.display = 'block';
-                statusBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-              }
-
-              function updateProfileDetails() {
-                var selectedOption = profileSelect.options[profileSelect.selectedIndex];
-                if (selectedOption.value) {
-                  var query = selectedOption.getAttribute('data-query');
-                  var target = selectedOption.getAttribute('data-target');
-                  profileQuery.innerText = 'Query: ' + query;
-                  profileTarget.innerText = 'Target: ' + target + ' emails';
-                  profileDetails.style.display = '';
-                } else {
-                  profileDetails.style.display = 'none';
-                }
-              }
-
-              if (profileSelect) {
-                profileSelect.addEventListener('change', updateProfileDetails);
-                updateProfileDetails(); // Initial update
-              }
-
-              // Start job button handler
-              if (startJobBtn) {
-                startJobBtn.addEventListener('click', function(e) {
-                  e.preventDefault();
-                  console.log('START EXTRACTION BUTTON: Button clicked');
-                  console.log('START EXTRACTION BUTTON: Profile selected:', profileSelect.value);
-                  
-                  // Hide any previous status messages
-                  document.getElementById('extraction-status').style.display = 'none';
-                  
-                  if (!profileSelect.value) {
-                    console.log('START EXTRACTION BUTTON: ERROR - No profile selected');
-                    showStatus('error', 
-                      '✗ Error: No Profile Selected', 
-                      'Please select an extraction profile from the dropdown before starting the job.',
-                      'START_EXTRACTION: profile_id is empty or invalid');
-                    return;
-                  }
-                  
-                  if (confirm('Start extraction job now?')) {
-                    console.log('START EXTRACTION BUTTON: User confirmed, proceeding...');
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Setup Wizard - PHP Email Extraction System</title>
+            <style><?php self::getCSS(); ?></style>
+        </head>
+        <body class="setup-page">
+            <div class="setup-container">
+                <div class="setup-card">
+                    <h1>🚀 Setup Wizard</h1>
+                    <p class="subtitle">Welcome! Let's configure your email extraction system.</p>
                     
-                    var jobForm = document.getElementById('jobForm');
-                    if (!jobForm) {
-                      console.log('START EXTRACTION BUTTON: ERROR - Job form not found');
-                      showStatus('error', 
-                        '✗ Error: Form Not Found', 
-                        'Unable to locate the job configuration form. Please refresh the page and try again.',
-                        'START_EXTRACTION: document.getElementById("jobForm") returned null');
-                      return;
-                    }
+                    <?php if ($error): ?>
+                        <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
+                    <?php endif; ?>
                     
-                    console.log('START EXTRACTION BUTTON: Job form found');
-                    
-                    // Show loading message
-                    var selectedOption = profileSelect.options[profileSelect.selectedIndex];
-                    var profileName = selectedOption.text.split(' — ')[0];
-                    showStatus('info', 
-                      '⏳ Starting Extraction...', 
-                      'Saving job configuration and starting extraction with profile: ' + profileName,
-                      null);
-                    
-                    // Create hidden input to trigger start after save
-                    var startInput = document.createElement('input');
-                    startInput.type = 'hidden';
-                    startInput.name = 'start_immediately';
-                    startInput.value = '1';
-                    jobForm.appendChild(startInput);
-                    
-                    console.log('START EXTRACTION BUTTON: Added start_immediately=1 input');
-                    console.log('START EXTRACTION BUTTON: Submitting form...');
-                    
-                    // Submit the form (will save job and redirect to start)
-                    jobForm.submit();
-                    
-                    // Show success message (form submission will redirect, but show optimistic message)
-                    setTimeout(function() {
-                      showStatus('success', 
-                        '✓ Extraction Started Successfully!', 
-                        'Job has been saved and extraction is starting. Redirecting to job list...',
-                        null);
-                    }, 100);
-                    
-                  } else {
-                    console.log('START EXTRACTION BUTTON: User cancelled');
-                  }
-                });
-              } else {
-                console.log('START EXTRACTION BUTTON: ERROR - Button not found');
-              }
-            })();
-          </script>
-
-        <?php } // End job check ?>
-        <?php } // End PDO check ?>
-
-      <?php elseif ($page === 'review'): ?>
-          <?php elseif ($page === 'review'): ?>
-            <?php
-              if ($pdo === null) {
-                  echo '<div class="page-title">Database Error</div>';
-                  echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-              } else {
-                  $id = (int)($_GET['id'] ?? 0);
-                  $campaign = get_campaign($pdo, $id);
-                  if (!$campaign) {
-                    echo "<p>Campaign not found.</p>";
-                  } else {
-                    // Prepare preview HTML (raw)
-                    $previewHtml = $campaign['html'] ?: '<div style="padding:24px;color:#6B778C;">(No content yet — add modules in the Editor)</div>';
-                    if (!empty($campaign['unsubscribe_enabled'])) {
-                    $basePreviewUrl = get_base_url() . '?t=unsubscribe&cid=' . (int)$campaign['id'];
-                    $previewHtml .= '<div style="text-align:center;margin-top:20px;color:#1F2933;font-size:13px;">';
-                    $previewHtml .= '<a href="' . $basePreviewUrl . '" style="color:#1A82E2;margin-right:8px;">Unsubscribe</a>';
-                    $previewHtml .= '<span style="color:#6B778C;">-</span>';
-                    $previewHtml .= '<a href="' . $basePreviewUrl . '" style="color:#1A82E2;margin-left:8px;">Unsubscribe Preferences</a>';
-                    $previewHtml .= '</div>';
-                }
-                $testSent = isset($_GET['test_sent']);
-                $sentFlag = isset($_GET['sent']);
-                $sendOk = isset($_GET['send_ok']);
-                $sendErr = isset($_GET['send_err']);
-            ?>
-              <div class="page-title">Review &amp; Send — <?php echo h($campaign['name']); ?></div>
-              <div class="page-subtitle">Confirm your envelope settings and preview the content before sending.</div>
-
-              <div class="review-grid">
-                <div>
-                  <div class="review-summary">
-                    <form method="post" id="sendForm">
-                      <input type="hidden" name="action" value="send_campaign">
-                      <input type="hidden" name="id" value="<?php echo (int)$campaign['id']; ?>">
-
-                      <div class="form-group">
-                        <label>Single Send Name</label>
-                        <input type="text" name="name" value="<?php echo h($campaign['name']); ?>" disabled>
-                      </div>
-
-                      <div class="form-group">
-                        <label>From Sender</label>
-                        <select name="from_email">
-                          <option value=""><?php echo $campaign['from_email'] ? h($campaign['from_email']) : 'Select sender'; ?></option>
-                          <?php foreach ($profiles as $p): ?>
-                            <option value="<?php echo h($p['from_email']); ?>" <?php if ($campaign['from_email'] === $p['from_email']) echo 'selected'; ?>>
-                              <?php echo h($p['from_email'] . ' — ' . $p['profile_name']); ?>
-                            </option>
-                          <?php endforeach; ?>
-                        </select>
-                      </div>
-
-                      <div class="form-group">
-                        <label>Subject</label>
-                        <input type="text" name="subject" value="<?php echo h($campaign['subject']); ?>">
-                      </div>
-
-                      <div class="form-group">
-                        <label>Preheader</label>
-                        <input type="text" name="preheader" value="<?php echo h($campaign['preheader']); ?>">
-                      </div>
-
-                      <div class="form-group">
-                        <label>Unsubscribe Group</label>
-                        <div style="display:flex; align-items:center; gap:10px;">
-                          <select name="unsubscribe_group" disabled>
-                            <option value="">Default</option>
-                          </select>
-                          <div class="checkbox-row" style="margin:0;">
-                            <input type="checkbox" id="rv_unsub" name="unsubscribe_enabled" <?php if (!empty($campaign['unsubscribe_enabled'])) echo 'checked'; ?>>
-                            <label for="rv_unsub" style="font-weight:600;margin:0;">Enable Unsubscribe</label>
-                          </div>
+                    <form method="POST">
+                        <div class="form-section">
+                            <h3>Database Configuration</h3>
+                            
+                            <div class="form-group">
+                                <label>Database Host</label>
+                                <input type="text" name="db_host" value="localhost" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Database Name</label>
+                                <input type="text" name="db_name" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Database Username</label>
+                                <input type="text" name="db_user" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Database Password</label>
+                                <input type="password" name="db_pass">
+                            </div>
                         </div>
-                      </div>
-
-                      <div class="form-group">
-                        <label>Schedule</label>
-                        <input type="text" value="Send Immediately" disabled>
-                      </div>
-
-                      <div class="form-group">
-                        <label>Send To Recipients</label>
-                        <select name="audience_select" id="audienceSelect" style="width:100%; padding:8px;">
-                          <option value="">Select recipients</option>
-                          <?php foreach ($contactLists as $cl):
-                            $val = 'list:'.$cl['id'];
-                          ?>
-                            <option value="<?php echo h($val); ?>"><?php echo h($cl['name']).' — '.(int)$cl['contact_count'].' contacts'; ?></option>
-                          <?php endforeach; ?>
-                          <option value="manual">Manual - Enter emails</option>
-                        </select>
-                      </div>
-
-                      <div id="manualRecipientsWrap" style="display:none; margin-top:10px;">
-                        <label style="font-weight:600; display:block; margin-bottom:6px;">Manual recipients (one per line)</label>
-                        <textarea name="test_recipients" placeholder="test1@example.com&#10;test2@example.com" rows="6" style="width:100%;"></textarea>
-                      </div>
-
-                      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
-                        <a href="?page=editor&id=<?php echo (int)$campaign['id']; ?>" class="btn btn-outline">Back to Editor</a>
-                        <button type="submit" class="btn btn-primary">Send Immediately</button>
-                      </div>
+                        
+                        <div class="form-section">
+                            <h3>Admin Account</h3>
+                            
+                            <div class="form-group">
+                                <label>Admin Username</label>
+                                <input type="text" name="admin_user" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Admin Password</label>
+                                <input type="password" name="admin_pass" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Admin Email</label>
+                                <input type="email" name="admin_email" required>
+                            </div>
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary btn-large">Install System</button>
                     </form>
-
-                    <div style="margin-top:18px;">
-                      <div style="font-weight:600; margin-bottom:8px;">Test Your Email</div>
-                      <div style="color:var(--sg-muted); margin-bottom:8px;">Test your email before sending to your recipients.</div>
-
-                      <form method="post" style="margin-top:12px;" id="testForm">
-                        <input type="hidden" name="action" value="send_test_message">
-                        <input type="hidden" name="id" value="<?php echo (int)$campaign['id']; ?>">
-                        <div>
-                          <label style="display:block; font-weight:600; margin-bottom:6px;">Send a Test Email</label>
-                          <input type="text" name="test_addresses" placeholder="Enter up to 10 email addresses, separated by commas" style="width:100%; padding:10px;">
-                        </div>
-                        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
-                          <div style="color:var(--sg-muted); font-size:12px;">You can send test messages to up to 10 addresses.</div>
-                          <button class="btn btn-primary" type="submit">Send Test Message</button>
-                        </div>
-                      </form>
-
-                      <small class="hint">Test messages are sent immediately and recorded as test events (they won't change campaign status).</small>
-                    </div>
-
-                  </div>
                 </div>
-
-                <div>
-                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                    <div style="font-weight:600;">Content preview</div>
-                    <div style="color:var(--sg-muted); font-size:12px;">Desktop | Mobile | Plain Text</div>
-                  </div>
-                  <div class="preview-box" id="previewBox">
-                    <?php echo $previewHtml; ?>
-                  </div>
+            </div>
+        </body>
+        </html>
+        <?php
+        exit;
+    }
+    
+    private static function renderLogin(?string $error): void {
+        ?>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Login - PHP Email Extraction System</title>
+            <style><?php self::getCSS(); ?></style>
+        </head>
+        <body class="login-page">
+            <div class="login-container">
+                <div class="login-card">
+                    <h1>🔐 Login</h1>
+                    <p class="subtitle">Access your email extraction dashboard</p>
+                    
+                    <?php if ($error): ?>
+                        <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
+                    <?php endif; ?>
+                    
+                    <form method="POST">
+                        <div class="form-group">
+                            <label>Username</label>
+                            <input type="text" name="username" required autofocus>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Password</label>
+                            <input type="password" name="password" required>
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary btn-large">Login</button>
+                    </form>
                 </div>
-              </div>
-
-              <script>
-                (function(){
-                  var aud = document.getElementById('audienceSelect');
-                  var manualWrap = document.getElementById('manualRecipientsWrap');
-
-                  function updateManualVisibility() {
-                    if (aud && manualWrap) {
-                      if (aud.value === 'manual') {
-                        manualWrap.style.display = '';
-                      } else {
-                        manualWrap.style.display = 'none';
-                      }
-                    }
-                  }
-                  if (aud) {
-                    aud.addEventListener('change', updateManualVisibility);
-                    updateManualVisibility();
-                  }
-
-                  var rvUnsub = document.getElementById('rv_unsub');
-                  var previewBox = document.getElementById('previewBox');
-                  if (rvUnsub && previewBox) {
-                    rvUnsub.addEventListener('change', function(){
-                      var existing = previewBox.querySelector('.preview-unsubscribe-block');
-                      if (rvUnsub.checked) {
-                        if (!existing) {
-                          var div = document.createElement('div');
-                          div.className = 'preview-unsubscribe-block';
-                          div.style.textAlign = 'center';
-                          div.style.marginTop = '20px';
-                          div.innerHTML = '<a href="<?php echo get_base_url() . '?t=unsubscribe&cid=' . (int)$campaign['id']; ?>" style="color:#1A82E2;margin-right:8px;">Unsubscribe</a> - <a href="<?php echo get_base_url() . '?t=unsubscribe&cid=' . (int)$campaign['id']; ?>" style="color:#1A82E2;margin-left:8px;">Unsubscribe Preferences</a>';
-                          previewBox.appendChild(div);
+            </div>
+        </body>
+        </html>
+        <?php
+        exit;
+    }
+    
+    private static function renderDashboard(): void {
+        $error = null;
+        $success = null;
+        
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+            if ($_POST['action'] === 'delete_job') {
+                $jobId = (int)$_POST['job_id'];
+                $db = Database::connect();
+                $stmt = $db->prepare("DELETE FROM jobs WHERE id = ? AND user_id = ?");
+                $stmt->execute([$jobId, Auth::getUserId()]);
+                header('Location: ?page=dashboard');
+                exit;
+            }
+            
+            // Handle new job creation from Dashboard
+            if ($_POST['action'] === 'create_job') {
+                try {
+                    $query = $_POST['query'] ?? '';
+                    $apiKey = $_POST['api_key'] ?? '';
+                    $maxResults = (int)($_POST['max_results'] ?? 100);
+                    $country = !empty($_POST['country']) ? $_POST['country'] : null;
+                    $emailFilter = $_POST['email_filter'] ?? 'all';
+                    
+                    // Get worker count from user input, or calculate if not provided
+                    $workerCount = isset($_POST['worker_count']) && $_POST['worker_count'] > 0 
+                        ? (int)$_POST['worker_count'] 
+                        : Worker::calculateOptimalWorkerCount($maxResults);
+                    
+                    // Ensure worker count is within valid range
+                    $workerCount = max(1, min(1000, $workerCount));
+                    
+                    // Validate required fields
+                    if (!$query || !$apiKey) {
+                        $error = 'Query and API Key are required';
+                    } else {
+                        // Create job for immediate processing
+                        $jobId = Job::create(Auth::getUserId(), $query, $apiKey, $maxResults, $country, $emailFilter);
+                        
+                        // Prepare queue items with specified worker count
+                        // This divides the work among workers so they search in parallel without duplication
+                        self::createQueueItems($jobId, $workerCount);
+                        
+                        // Send redirect response immediately (don't block UI)
+                        header('Location: ?page=dashboard&job_id=' . $jobId);
+                        
+                        // Close connection to user BEFORE spawning workers
+                        if (function_exists('fastcgi_finish_request')) {
+                            fastcgi_finish_request();
+                        } else {
+                            if (ob_get_level() > 0) {
+                                ob_end_flush();
+                            }
+                            flush();
                         }
-                      } else {
-                        if (existing) existing.remove();
-                      }
-                    });
-                  }
-
-                  // Show toast if test was sent or campaign sent flag present
-                  <?php if ($testSent): ?>
-                    document.addEventListener('DOMContentLoaded', function(){ showToast('Test message sent', 'success'); });
-                  <?php endif; ?>
-                })();
-              </script>
-
-            <?php } // End campaign check ?>
-            <?php } // End PDO check ?>
-
-          <?php elseif ($page === 'stats'): ?>
-            <?php
-              if ($pdo === null) {
-                  echo '<div class="page-title">Database Error</div>';
-                  echo '<div class="card"><div style="padding: 20px;">Database connection not available. Please check your configuration.</div></div>';
-              } else {
-                  $id = (int)($_GET['id'] ?? 0);
-                  $job = get_job($pdo, $id);
-                  if (!$job) {
-                    echo "<p>Job not found.</p>";
-                  } else {
-                    $stats = get_job_stats($pdo, $id);
-                    
-                    // Get profile information
-                    $profile = null;
-                    if (!empty($job['profile_id'])) {
-                        $profile_stmt = $pdo->prepare("SELECT * FROM job_profiles WHERE id = ?");
-                        $profile_stmt->execute([$job['profile_id']]);
-                        $profile = $profile_stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        // Now spawn workers in background after response sent
+                        ignore_user_abort(true);
+                        set_time_limit(300);
+                        self::autoSpawnWorkers($workerCount, $jobId);
+                        
+                        exit;
                     }
-                    
-                    $extracted = (int)($job['progress_extracted'] ?? 0);
-                    $target = (int)($job['progress_total'] ?? $job['target_count'] ?? 0);
-                    $progress = $target > 0 ? round(($extracted / $target) * 100) : 0;
+                } catch (Exception $e) {
+                    $error = 'Error creating job: ' . $e->getMessage();
+                    error_log('Job creation error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+                }
+            }
+        }
+        
+        $jobs = Job::getAll(Auth::getUserId());
+        $newJobId = (int)($_GET['job_id'] ?? 0); // Check if redirected from job creation
+        
+        self::renderLayout('Dashboard', function() use ($jobs, $newJobId, $error, $success) {
             ?>
-              <div class="page-title">Job Stats — <?php echo h($job['name']); ?></div>
-              <div class="page-subtitle">Extraction results and progress for this job.</div>
-
-              <!-- Error Alert Display - Shows Actual Error Message -->
-              <?php if (!empty($job['error_message'])): ?>
-              <div class="card" style="margin-bottom:20px; border-left:4px solid #dc3545; background:#f8d7da;">
-                <div style="padding:20px;">
-                  <h3 style="margin:0 0 15px 0; color:#721c24; font-size:20px;">⚠️ Extraction Failed - Complete Diagnostic Information</h3>
-                  
-                  <!-- Full Error Message + API Log Box -->
-                  <div style="background:#fff; padding:15px; border:1px solid #f5c6cb; border-radius:4px; margin:15px 0; max-height:400px; overflow-y:auto;">
-                    <strong style="display:block; margin-bottom:10px; color:#721c24;">Full Error Details + API Log:</strong>
-                    <pre style="color:#721c24; margin:0; padding:10px; background:#f9f9f9; border:1px solid #e0e0e0; border-radius:3px; font-family:monospace; font-size:13px; line-height:1.5; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars($job['error_message']); ?></pre>
-                  </div>
-                  
-                  <!-- Collapsible Error Code Meanings -->
-                  <details style="margin:15px 0; cursor:pointer;">
-                    <summary style="font-weight:bold; color:#721c24; cursor:pointer; padding:10px; background:#fef5f6; border-radius:3px; border:1px solid #f5c6cb;">📖 Error Code Meanings (Click to expand)</summary>
-                    <ul style="margin:10px 0 0 0; padding:10px 10px 10px 35px; background:#fff; border-radius:3px; color:#721c24;">
-                      <li style="margin:6px 0;"><strong>HTTP 401</strong> = Invalid or expired API key</li>
-                      <li style="margin:6px 0;"><strong>HTTP 429</strong> = Rate limit exceeded (too many requests)</li>
-                      <li style="margin:6px 0;"><strong>HTTP 500</strong> = serper.dev server error</li>
-                      <li style="margin:6px 0;"><strong>cURL error</strong> = Network connectivity problem</li>
-                      <li style="margin:6px 0;"><strong>Invalid JSON</strong> = Malformed API response</li>
-                      <li style="margin:6px 0;"><strong>Connection timeout</strong> = Server can't reach serper.dev (firewall/network issue)</li>
+            <?php if ($error): ?>
+                <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
+            <?php endif; ?>
+            
+            <?php if ($success): ?>
+                <div class="alert alert-success"><?php echo htmlspecialchars($success); ?></div>
+            <?php endif; ?>
+            
+            <!-- New Job Creation Card -->
+            <div class="card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
+                <h2 style="color: white; margin-top: 0;">✨ Create New Email Extraction Job</h2>
+                
+                <!-- Query Templates -->
+                <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                    <h3 style="color: white; margin: 0 0 10px 0; font-size: 16px;">💡 High-Yield Query Templates</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
+                        <button type="button" class="query-template" data-query="real estate agents" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🏘️ Real Estate Agents
+                        </button>
+                        <button type="button" class="query-template" data-query="dentists near me" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🦷 Dentists
+                        </button>
+                        <button type="button" class="query-template" data-query="lawyers attorney" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            ⚖️ Lawyers
+                        </button>
+                        <button type="button" class="query-template" data-query="restaurants contact" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🍽️ Restaurants
+                        </button>
+                        <button type="button" class="query-template" data-query="plumbers contact email" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            🔧 Plumbers
+                        </button>
+                        <button type="button" class="query-template" data-query="marketing agencies" 
+                                style="padding: 8px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; border-radius: 4px; cursor: pointer; font-size: 13px;">
+                            📢 Marketing Agencies
+                        </button>
+                    </div>
+                    <small style="display: block; margin-top: 8px; color: rgba(255,255,255,0.8); font-size: 12px;">
+                        💡 Tip: Add location terms like "california" or "new york" for better targeting
+                    </small>
+                </div>
+                
+                <form id="dashboard-job-form" style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 8px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Search Query *</label>
+                            <input type="text" name="query" id="dashboard-query" placeholder="e.g., real estate agents california" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Use specific industry + location for best results</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Serper.dev API Key *</label>
+                            <input type="text" name="api_key" id="dashboard-api-key" placeholder="Your API key" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Get free key at <a href="https://serper.dev" target="_blank" style="color: white;">serper.dev</a></small>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Target Emails *</label>
+                            <input type="number" name="max_results" id="dashboard-max-results" value="1000" min="1" max="100000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Recommended: 1000-10000 for quality</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Worker Count *</label>
+                            <input type="number" name="worker_count" id="dashboard-worker-count" value="100" min="1" max="1000" required 
+                                   style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Number of parallel workers (1-1000)</small>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Email Filter</label>
+                            <select name="email_filter" id="dashboard-email-filter" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                                <option value="all">All Types</option>
+                                <option value="business" selected>Business Only (Recommended)</option>
+                                <option value="gmail">Gmail Only</option>
+                                <option value="yahoo">Yahoo Only</option>
+                            </select>
+                            <small style="color: rgba(255,255,255,0.8); font-size: 11px;">Business emails have higher value</small>
+                        </div>
+                        
+                        <div>
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600; color: white;">Country Target (Optional)</label>
+                            <select name="country" id="dashboard-country" style="width: 100%; padding: 10px; border: none; border-radius: 6px;">
+                                <option value="">All Countries</option>
+                                <option value="us">🇺🇸 United States</option>
+                                <option value="uk">🇬🇧 United Kingdom</option>
+                                <option value="ca">🇨🇦 Canada</option>
+                                <option value="au">🇦🇺 Australia</option>
+                                <option value="de">🇩🇪 Germany</option>
+                                <option value="fr">🇫🇷 France</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-bottom: 15px; padding: 12px; background: rgba(255,255,255,0.1); border-radius: 6px;">
+                        <small style="color: rgba(255,255,255,0.9); font-size: 11px;">
+                            💡 <strong>Tip:</strong> More workers = faster extraction. Each worker searches in parallel without duplication.
+                        </small>
+                    </div>
+                    
+                    <button type="submit" id="dashboard-submit-btn" class="btn btn-large" 
+                            style="background: white; color: #667eea; font-weight: 600; width: 100%; padding: 15px;">
+                        🚀 Start Extraction
+                    </button>
+                </form>
+                
+                <!-- Performance Tips -->
+                <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; margin-top: 15px;">
+                    <h3 style="color: white; margin: 0 0 10px 0; font-size: 14px;">⚡ Performance Tips</h3>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: rgba(255,255,255,0.9);">
+                        <li>🚀 Workers spawn automatically based on job size (up to 1000 workers for maximum speed)</li>
+                        <li>Business email filter removes junk and social media emails</li>
+                        <li>Specific queries (industry + location) yield better quality emails</li>
+                        <li>System automatically filters famous sites and placeholder emails</li>
                     </ul>
-                  </details>
-                  
-                  <div style="margin:15px 0;">
-                    <strong style="display:block; margin-bottom:8px; color:#721c24;">🔧 Troubleshooting Steps:</strong>
-                    <ol style="margin:0; padding-left:25px; color:#721c24;">
-                      <li style="margin:5px 0;">Copy the full error details shown above</li>
-                      <li style="margin:5px 0;">Verify your API key at <a href="https://serper.dev/dashboard" target="_blank" style="color:#721c24; text-decoration:underline;">serper.dev/dashboard</a></li>
-                      <li style="margin:5px 0;">Test your search query at <a href="https://serper.dev/playground" target="_blank" style="color:#721c24; text-decoration:underline;">serper.dev/playground</a></li>
-                      <li style="margin:5px 0;">Check your API usage and remaining quota</li>
-                      <li style="margin:5px 0;">Verify your server has internet connectivity to serper.dev</li>
-                      <li style="margin:5px 0;">Check error.log file on server for additional technical details</li>
-                    </ol>
-                  </div>
+                    <small style="display: block; margin-top: 8px; color: rgba(255,255,255,0.7); font-size: 11px;">
+                        * Performance depends on query quality, network speed, API limits, and data availability
+                    </small>
                 </div>
-              </div>
-              <?php endif; ?>
-
-              <div class="card" style="margin-bottom:18px;">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">Summary</div>
-                  </div>
-                  <a href="?page=list" class="btn btn-outline">← Back to Jobs</a>
+            </div>
+            
+            <?php if ($newJobId > 0): ?>
+                <!-- Job Progress Widget -->
+                <div id="job-progress-widget" class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                    <h2 style="color: white; margin-top: 0;">📊 Job Processing</h2>
+                    <div id="progress-content" style="font-size: 14px;">
+                        <p>🔄 Starting workers...</p>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                        <div id="progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                            <span id="progress-text">0%</span>
+                        </div>
+                    </div>
+                    <div id="progress-details" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="emails-collected">0</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="emails-required">-</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="active-workers-count">0</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                            <div style="font-size: 20px; font-weight: bold;" id="job-status">pending</div>
+                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 15px; text-align: right;">
+                        <a href="?page=results&job_id=<?php echo $newJobId; ?>" style="color: white; text-decoration: underline;">View Full Results</a>
+                    </div>
                 </div>
-                <div class="form-row">
-                  <div class="form-group">
-                    <label>Profile</label>
-                    <div><?php echo $profile ? h($profile['profile_name']) : 'N/A'; ?></div>
-                  </div>
-                  <div class="form-group">
-                    <label>Search Query</label>
-                    <div><?php echo $profile ? h($profile['search_query']) : 'N/A'; ?></div>
-                  </div>
-                  <div class="form-group">
-                    <label>Started at</label>
-                    <div><?php echo $job['started_at'] ? h($job['started_at']) : '<span class="hint">Not started</span>'; ?></div>
-                  </div>
-                  <div class="form-group">
-                    <label>Completed at</label>
-                    <div><?php echo $job['completed_at'] ? h($job['completed_at']) : '<span class="hint">Not completed</span>'; ?></div>
-                  </div>
+            <?php endif; ?>
+            
+            <!-- Worker Statistics -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="active-workers">-</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
                 </div>
-              </div>
-
-              <!-- Last API Response Details (Debug Info) -->
-              <?php if (!empty($job['error_message']) && strpos($job['error_message'], 'API LOG:') !== false): ?>
-              <div class="card" style="margin-bottom:18px;">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">🔍 Last API Response</div>
-                    <div class="card-subtitle">Diagnostic information from the last API call attempt</div>
-                  </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="worker-emails">-</div>
+                        <div class="stat-label">Worker Emails Extracted</div>
+                    </div>
                 </div>
-                <div style="padding:16px;">
-                  <?php
-                    // Parse error message to extract API log details
-                    $errorLines = explode("\n", $job['error_message']);
-                    $httpCode = null;
-                    $responseLength = null;
-                    $responsePreview = null;
+                <div class="stat-card">
+                    <div class="stat-icon">⚡</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="extraction-rate">-</div>
+                        <div class="stat-label">Emails/Min</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-jobs">-</div>
+                        <div class="stat-label">Total Jobs</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="completed-jobs">-</div>
+                        <div class="stat-label">Completed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-results">-</div>
+                        <div class="stat-label">Total Emails</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Recent Jobs</h2>
+                <?php if (empty($jobs)): ?>
+                    <p class="empty-state">No jobs yet. <a href="?page=new-job">Create your first job</a></p>
+                <?php else: ?>
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Query</th>
+                                <th>Status</th>
+                                <th>Progress</th>
+                                <th>Emails</th>
+                                <th>Filter</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($jobs as $job): ?>
+                                <tr>
+                                    <td>#<?php echo $job['id']; ?></td>
+                                    <td><?php echo htmlspecialchars($job['query']); ?></td>
+                                    <td><span class="status-badge status-<?php echo $job['status']; ?> job-status-badge-<?php echo $job['id']; ?>"><?php echo ucfirst($job['status']); ?></span></td>
+                                    <td>
+                                        <div class="progress-bar">
+                                            <div class="progress-fill job-progress-fill-<?php echo $job['id']; ?>" style="width: <?php echo $job['progress']; ?>%"></div>
+                                        </div>
+                                        <span class="progress-text job-progress-text-<?php echo $job['id']; ?>"><?php echo $job['progress']; ?>%</span>
+                                        
+                                        <?php if ($job['status'] === 'running' || $job['status'] === 'pending'): ?>
+                                        <!-- Live Job Progress Details -->
+                                        <div class="live-progress-details" id="live-progress-<?php echo $job['id']; ?>" style="margin-top: 8px; padding: 8px; background: #f7fafc; border-radius: 4px; font-size: 11px; display: none;">
+                                            <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+                                                <div style="flex: 1; min-width: 80px;">
+                                                    <div style="font-weight: 600; color: #10b981;" class="job-emails-collected-<?php echo $job['id']; ?>">0</div>
+                                                    <div style="color: #718096;">Collected</div>
+                                                </div>
+                                                <div style="flex: 1; min-width: 80px;">
+                                                    <div style="font-weight: 600; color: #3182ce;" class="job-emails-target-<?php echo $job['id']; ?>">-</div>
+                                                    <div style="color: #718096;">Target</div>
+                                                </div>
+                                                <div style="flex: 1; min-width: 80px;">
+                                                    <div style="font-weight: 600; color: #8b5cf6;" class="job-active-workers-<?php echo $job['id']; ?>">0</div>
+                                                    <div style="color: #718096;">Workers</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <?php
+                                        $db = Database::connect();
+                                        $stmt = $db->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = ?");
+                                        $stmt->execute([$job['id']]);
+                                        $count = $stmt->fetch()['count'];
+                                        echo '<span class="job-email-count-' . $job['id'] . '">' . $count . '</span>';
+                                        ?>
+                                    </td>
+                                    <td><?php echo $job['email_filter'] ? ucfirst($job['email_filter']) : 'All'; ?></td>
+                                    <td><?php echo date('Y-m-d H:i', strtotime($job['created_at'])); ?></td>
+                                    <td>
+                                        <a href="?page=results&job_id=<?php echo $job['id']; ?>" class="btn btn-sm">View</a>
+                                        <form method="POST" style="display: inline;">
+                                            <input type="hidden" name="action" value="delete_job">
+                                            <input type="hidden" name="job_id" value="<?php echo $job['id']; ?>">
+                                            <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('Delete this job?')">Delete</button>
+                                        </form>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php endif; ?>
+            </div>
+            
+            <script>
+                // Query template buttons event delegation
+                document.addEventListener('DOMContentLoaded', function() {
+                    document.querySelectorAll('.query-template').forEach(function(btn) {
+                        btn.addEventListener('click', function() {
+                            document.getElementById('dashboard-query').value = this.dataset.query;
+                        });
+                    });
+                });
+                
+                function updateStats() {
+                    fetch('?page=api&action=stats')
+                        .then(res => res.json())
+                        .then(data => {
+                            document.getElementById('total-jobs').textContent = data.totalJobs;
+                            document.getElementById('completed-jobs').textContent = data.completedJobs;
+                            document.getElementById('total-results').textContent = data.totalResults;
+                        });
                     
-                    foreach ($errorLines as $line) {
-                      if (preg_match('/HTTP Code:\s*(\d+)/', $line, $matches)) {
-                        $httpCode = $matches[1];
-                      }
-                      if (preg_match('/Response length:\s*([\d,]+)\s*bytes/', $line, $matches)) {
-                        $responseLength = $matches[1];
-                      }
-                      if (preg_match('/First \d+ chars of response:\s*(.+)/', $line, $matches)) {
-                        $responsePreview = $matches[1];
-                      }
-                      if (preg_match('/FULL ERROR RESPONSE:\s*(.+)/', $line, $matches)) {
-                        $responsePreview = $matches[1];
-                      }
+                    // Update worker statistics
+                    fetch('?page=api&action=worker-stats')
+                        .then(res => res.json())
+                        .then(stats => {
+                            document.getElementById('active-workers').textContent = stats.active_workers || 0;
+                            document.getElementById('worker-emails').textContent = stats.total_emails || 0;
+                            
+                            // Display extraction rate
+                            if (stats.emails_per_minute > 0) {
+                                document.getElementById('extraction-rate').textContent = stats.emails_per_minute;
+                            } else {
+                                document.getElementById('extraction-rate').textContent = '-';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching worker stats:', err));
+                }
+                
+                updateStats();
+                setInterval(updateStats, 3000); // Update every 3 seconds for real-time feeling
+                
+                // Update live progress for all running/pending jobs
+                function updateAllJobsLiveProgress() {
+                    // Get all running and pending jobs
+                    const runningJobs = <?php 
+                        $runningJobIds = [];
+                        foreach ($jobs as $job) {
+                            if ($job['status'] === 'running' || $job['status'] === 'pending') {
+                                $runningJobIds[] = $job['id'];
+                            }
+                        }
+                        echo json_encode($runningJobIds);
+                    ?>;
+                    
+                    if (runningJobs.length === 0) {
+                        return;
                     }
-                  ?>
-                  
-                  <div class="form-row">
-                    <?php if ($httpCode): ?>
-                    <div class="form-group">
-                      <label>HTTP Status Code</label>
-                      <div style="font-family:monospace; font-size:14px; font-weight:600; color:<?php echo ($httpCode == '200') ? '#15803d' : '#dc2626'; ?>;">
-                        <?php echo h($httpCode); ?>
-                        <?php 
-                          if ($httpCode == '200') echo ' <span style="color:#15803d;">✓ OK</span>';
-                          elseif ($httpCode == '401') echo ' <span style="color:#dc2626;">❌ Unauthorized</span>';
-                          elseif ($httpCode == '429') echo ' <span style="color:#dc2626;">❌ Rate Limit</span>';
-                          else echo ' <span style="color:#dc2626;">❌ Error</span>';
-                        ?>
-                      </div>
-                    </div>
-                    <?php endif; ?>
                     
-                    <?php if ($responseLength): ?>
-                    <div class="form-group">
-                      <label>Response Size</label>
-                      <div style="font-family:monospace; font-size:14px;"><?php echo h($responseLength); ?> bytes</div>
-                    </div>
-                    <?php endif; ?>
-                    
-                    <div class="form-group">
-                      <label>Extraction Time</label>
-                      <div style="font-family:monospace; font-size:14px;">
-                        <?php 
-                          if ($job['started_at'] && $job['completed_at']) {
-                            $start = new DateTime($job['started_at']);
-                            $end = new DateTime($job['completed_at']);
-                            $diff = $start->diff($end);
-                            echo $diff->s . ' seconds';
-                          } else {
-                            echo '<span class="hint">N/A</span>';
-                          }
-                        ?>
-                      </div>
-                    </div>
-                  </div>
-                  
-                  <?php if ($responsePreview): ?>
-                  <div style="margin-top:16px;">
-                    <label style="display:block; margin-bottom:8px; font-weight:600;">API Response Preview:</label>
-                    <pre style="background:#f9f9f9; border:1px solid #e0e0e0; border-radius:4px; padding:12px; margin:0; font-size:12px; line-height:1.4; max-height:200px; overflow-y:auto; white-space:pre-wrap; word-wrap:break-word;"><?php echo htmlspecialchars(substr($responsePreview, 0, 1000)); ?></pre>
-                  </div>
-                  <?php endif; ?>
-                  
-                  <div style="margin-top:16px; padding:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:4px; font-size:13px; color:#1e40af;">
-                    <strong>💡 Tip:</strong> Use the "Check Connection" button in Job Profiles to test your API key and search query before running extraction.
-                  </div>
-                </div>
-              </div>
-              <?php endif; ?>
-
-              <!-- Real-time Job Progress -->
-              <?php 
-                $jobStatus = $job['status'];
-                $activeWorkers = (int)($job['active_workers'] ?? 0);
-                if ($jobStatus === 'queued' || $jobStatus === 'extracting'):
-              ?>
-              <div class="card" style="margin-bottom:18px;" id="progressCard">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">Extraction Progress</div>
-                    <div class="card-subtitle">Real-time extraction progress (updates automatically)</div>
-                  </div>
-                </div>
-                <div style="padding:16px;">
-                  <div style="margin-bottom:12px; font-size:18px; font-weight:600;">
-                    <span id="progressText"><?php echo $extracted; ?> / <?php echo $target; ?> extracted (<?php echo $progress; ?>%)</span>
-                  </div>
-                  <div style="background:#E4E7EB; border-radius:4px; height:24px; overflow:hidden; position:relative;">
-                    <div id="progressBar" style="background:linear-gradient(90deg, #1A82E2, #3B9EF3); height:100%; width:<?php echo $progress; ?>%; transition:width 0.3s;"></div>
-                  </div>
-                  <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
-                    <div style="color:#6B778C; font-size:13px;" id="progressStatus">Status: <?php echo ucfirst($jobStatus); ?></div>
-                    <div style="color:#1A82E2; font-size:13px; font-weight:600;" id="workerStatus">
-                      <span id="activeWorkerCount"><?php echo $activeWorkers; ?></span> worker<?php echo $activeWorkers !== 1 ? 's' : ''; ?> active
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <?php endif; ?>
-
-              <!-- Simplified header stats for extraction -->
-              <div class="header-stats">
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo $target; ?></div>
-                  <div class="stat-label">Target Emails</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo $extracted; ?></div>
-                  <div class="stat-label">Extracted</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo $progress; ?>%</div>
-                  <div class="stat-label">Progress</div>
-                </div>
-                <div class="stat-item">
-                  <div class="stat-num"><?php echo $jobStatus === 'completed' ? 'Complete' : ucfirst($jobStatus); ?></div>
-                  <div class="stat-label">Status</div>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card-header">
-                  <div>
-                    <div class="card-title">Extracted Emails</div>
-                    <div class="card-subtitle">List of all emails extracted for this job (most recent first).</div>
-                  </div>
-                  <div>
-                    <a href="?page=list" class="btn btn-outline">Download CSV</a>
-                  </div>
-                </div>
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Email</th>
-                      <th>Source Query</th>
-                      <th>Extracted At</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php
-                      $stmt = $pdo->prepare("SELECT * FROM extracted_emails WHERE job_id = ? ORDER BY extracted_at DESC LIMIT 100");
-                      $stmt->execute([$id]);
-                      $emails = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                      if (empty($emails)):
-                    ?>
-                      <tr>
-                        <td colspan="3" style="text-align:center; padding:16px; color:var(--sg-muted);">
-                          No emails extracted yet.
-                        </td>
-                      </tr>
-                    <?php else: ?>
-                      <?php foreach ($emails as $em): ?>
-                        <tr>
-                          <td><?php echo h($em['email']); ?></td>
-                          <td><?php echo h($em['source'] ?? 'N/A'); ?></td>
-                          <td><?php echo h($em['extracted_at']); ?></td>
-                        </tr>
-                      <?php endforeach; ?>
-                      <?php if (count($emails) >= 100): ?>
-                        <tr>
-                          <td colspan="3" style="text-align:center; padding:12px; color:var(--sg-muted);">
-                            Showing first 100 results. Export to CSV for full list.
-                          </td>
-                        </tr>
-                      <?php endif; ?>
-                    <?php endif; ?>
-                  </tbody>
-                </table>
-              </div>
-
-              <!-- Real-time Progress JavaScript -->
-              <script>
-                (function(){
-                  var campaignId = <?php echo (int)$id; ?>;
-                  var progressCard = document.getElementById('progressCard');
-                  var progressBar = document.getElementById('progressBar');
-                  var progressText = document.getElementById('progressText');
-                  var progressStatus = document.getElementById('progressStatus');
-                  var workerCount = document.getElementById('activeWorkerCount');
-                  
-                  if (progressCard) {
-                    // Poll progress API every 2 seconds
-                    var pollInterval = setInterval(function(){
-                      fetch('?api=progress&campaign_id=' + campaignId)
-                        .then(function(r){ return r.json(); })
-                        .then(function(data){
-                          if (data.success && data.progress) {
-                            var prog = data.progress;
-                            var stats = data.stats || {};
+                    // Update each running job
+                    runningJobs.forEach(jobId => {
+                        fetch('?page=api&action=job-worker-status&job_id=' + jobId)
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.error) {
+                                    return;
+                                }
+                                
+                                const job = data.job;
+                                const emailsCollected = data.emails_collected || 0;
+                                const emailsRequired = data.emails_required || 0;
+                                const completionPercentage = data.completion_percentage || 0;
+                                const activeWorkers = data.active_workers || 0;
+                                
+                                // Update progress bar
+                                const progressFill = document.querySelector('.job-progress-fill-' + jobId);
+                                const progressText = document.querySelector('.job-progress-text-' + jobId);
+                                if (progressFill) {
+                                    progressFill.style.width = completionPercentage + '%';
+                                }
+                                if (progressText) {
+                                    progressText.textContent = completionPercentage + '%';
+                                }
+                                
+                                // Update email count
+                                const emailCount = document.querySelector('.job-email-count-' + jobId);
+                                if (emailCount) {
+                                    emailCount.textContent = emailsCollected;
+                                }
+                                
+                                // Update status badge
+                                const statusBadge = document.querySelector('.job-status-badge-' + jobId);
+                                if (statusBadge && job.status) {
+                                    // Remove old status class
+                                    statusBadge.className = statusBadge.className.replace(/status-\w+/g, '').trim();
+                                    // Add new status class
+                                    statusBadge.className = 'status-badge status-' + job.status + ' job-status-badge-' + jobId;
+                                    // Update status text
+                                    statusBadge.textContent = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+                                }
+                                
+                                // Show and update live progress details
+                                const liveProgress = document.getElementById('live-progress-' + jobId);
+                                if (liveProgress) {
+                                    liveProgress.style.display = 'block';
+                                    
+                                    const collectedEl = document.querySelector('.job-emails-collected-' + jobId);
+                                    const targetEl = document.querySelector('.job-emails-target-' + jobId);
+                                    const workersEl = document.querySelector('.job-active-workers-' + jobId);
+                                    
+                                    if (collectedEl) collectedEl.textContent = emailsCollected;
+                                    if (targetEl) targetEl.textContent = emailsRequired;
+                                    if (workersEl) workersEl.textContent = activeWorkers;
+                                    
+                                    // Hide live progress if job is completed
+                                    if (job.status === 'completed' || job.status === 'failed') {
+                                        liveProgress.style.display = 'none';
+                                    }
+                                }
+                            })
+                            .catch(err => console.error('Error updating job ' + jobId + ':', err));
+                    });
+                }
+                
+                // Initial update
+                updateAllJobsLiveProgress();
+                
+                // Update all running jobs every 3 seconds
+                setInterval(updateAllJobsLiveProgress, 3000);
+                
+                // Job progress widget logic
+                <?php if ($newJobId > 0): ?>
+                const jobId = <?php echo $newJobId; ?>;
+                let progressInterval = null;
+                
+                // Function to update job progress
+                function updateJobProgress() {
+                    fetch('?page=api&action=job-worker-status&job_id=' + jobId)
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.error) {
+                                console.error('Error fetching job status:', data.error);
+                                return;
+                            }
+                            
+                            const job = data.job;
+                            const emailsCollected = data.emails_collected;
+                            const emailsRequired = data.emails_required;
+                            const completionPercentage = data.completion_percentage;
+                            const activeWorkers = data.active_workers;
                             
                             // Update progress bar
-                            if (progressBar) {
-                              progressBar.style.width = prog.percentage + '%';
-                            }
+                            document.getElementById('progress-bar').style.width = completionPercentage + '%';
+                            document.getElementById('progress-text').textContent = completionPercentage + '%';
                             
-                            // Update progress text (for extraction jobs)
-                            if (progressText) {
-                              var extractedCount = prog.extracted || prog.sent || 0;
-                              progressText.textContent = extractedCount + ' / ' + prog.total + ' extracted (' + prog.percentage + '%)';
-                            }
+                            // Update details
+                            document.getElementById('emails-collected').textContent = emailsCollected;
+                            document.getElementById('emails-required').textContent = emailsRequired;
+                            document.getElementById('active-workers-count').textContent = activeWorkers;
+                            document.getElementById('job-status').textContent = job.status;
                             
-                            // Update status
-                            if (progressStatus) {
-                              progressStatus.textContent = 'Status: ' + (prog.job_status || prog.status || 'extracting').charAt(0).toUpperCase() + (prog.job_status || prog.status || 'extracting').slice(1);
+                            // Update progress content message
+                            let message = '';
+                            if (job.status === 'completed') {
+                                message = '✅ Job completed! ' + emailsCollected + ' emails extracted.';
+                                if (progressInterval) {
+                                    clearInterval(progressInterval);
+                                    progressInterval = null;
+                                }
+                                // Reload stats after completion
+                                updateStats();
+                            } else if (job.status === 'running') {
+                                message = '⚡ Processing... ' + activeWorkers + ' workers active.';
+                            } else if (job.status === 'failed') {
+                                message = '❌ Job failed. Check errors below.';
+                                if (progressInterval) {
+                                    clearInterval(progressInterval);
+                                    progressInterval = null;
+                                }
+                            } else {
+                                message = '🔄 Initializing workers...';
                             }
-                            
-                            // Update active worker count
-                            if (workerCount && typeof prog.active_workers !== 'undefined') {
-                              workerCount.textContent = prog.active_workers;
-                              var workerStatus = document.getElementById('workerStatus');
-                              if (workerStatus) {
-                                workerStatus.style.color = prog.active_workers > 0 ? '#1A82E2' : '#6B778C';
-                              }
-                            }
-                            
-                            // Stop polling and reload page if job is completed
-                            if (prog.job_status === 'completed' || prog.campaign_status === 'completed') {
-                              clearInterval(pollInterval);
-                              setTimeout(function(){
-                                window.location.reload();
-                              }, 2000);
-                            }
-                          }
+                            document.getElementById('progress-content').innerHTML = '<p>' + message + '</p>';
                         })
-                        .catch(function(err){
-                          console.error('Progress poll error:', err);
+                        .catch(error => {
+                            console.error('Error updating job progress:', error);
                         });
-                    }, 2000);
-                  }
-                })();
-              </script>
-
-            <?php } // End campaign check ?>
-            <?php } // End PDO check for stats ?>
-
-          <?php elseif ($page === 'contacts'): ?>
-            <?php
-              // Contacts feature not available in email extraction system
-              // Redirect to jobs list
-              header('Location: ?page=list');
-              exit;
-            ?>
-
-          <?php elseif ($page === 'activity'): ?>
-            <?php
-              // Activity page not available in email extraction system
-              // Redirect to jobs list
-              header('Location: ?page=list');
-              exit;
-            ?>
-
-          <?php elseif ($page === 'tracking'): ?>
-            <?php
-              // Tracking page not available in email extraction system
-              // Redirect to jobs list
-              header('Location: ?page=list');
-              exit;
-            ?>
-          <?php else: ?>
-            <p>Unknown page.</p>
-          <?php endif; ?>
-        </div>
-      </div>
-    </div>
-
-    <script>
-      (function(){
-        var spOpenBtn = document.getElementById('spOpenBtn');
-        var spCloseBtn = document.getElementById('spCloseBtn');
-        var spSidebar = document.getElementById('spSidebar');
-        var pageWrapper = document.getElementById('pageWrapper');
-
-        function openSidebar() {
-          spSidebar.classList.add('open');
-          pageWrapper.classList.add('shifted');
-        }
-        function closeSidebar() {
-          spSidebar.classList.remove('open');
-          pageWrapper.classList.remove('shifted');
-        }
-
-        if (spOpenBtn) spOpenBtn.addEventListener('click', openSidebar);
-        if (spCloseBtn) spCloseBtn.addEventListener('click', closeSidebar);
-
-        // Toggle profile fields when switching type
-        var pfType = document.getElementById('pf_type');
-        if (pfType) {
-          pfType.addEventListener('change', function() {
-            var v = pfType.value;
-            var smtpFields = document.getElementById('pf_smtp_fields');
-            var apiFields = document.getElementById('pf_api_fields');
-            if (v === 'api') {
-              smtpFields.style.display = 'none';
-              apiFields.style.display = '';
-            } else {
-              smtpFields.style.display = '';
-              apiFields.style.display = 'none';
-            }
-          });
-        }
-
-        // Open sidebar if editing profile
-        <?php if ($editProfile): ?>
-          openSidebar();
-        <?php endif; ?>
-
-        // Toast helper exposed to global scope
-        window.showToast = function(msg, type){
-          var t = document.getElementById('globalToast');
-          if(!t) return;
-          t.innerText = msg;
-          t.className = 'toast show ' + (type === 'error' ? 'error' : 'success');
-          setTimeout(function(){
-            t.className = 'toast';
-          }, 2000);
-        };
-
-        // Show notifications for query params (e.g., test_sent, sent)
-        (function(){
-          var params = new URLSearchParams(window.location.search);
-          if (params.has('test_sent')) {
-            showToast('Test message(s) sent', 'success');
-          }
-          if (params.has('sent')) {
-            showToast('Campaign queued for sending', 'success');
-          }
-          if (params.has('save_error')) {
-            showToast('Save error', 'error');
-          }
-          if (params.has('no_recipients')) {
-            showToast('No recipients to send to (all invalid or unsubscribed)', 'error');
-          }
-          if (params.has('cleared_unsubscribes')) {
-            showToast('All unsubscribes cleared', 'success');
-          }
-          if (params.has('cleared_bounces')) {
-            showToast('All bounces cleared', 'success');
-          }
-        })();
-
-        // Wire up Check Connection buttons (AJAX)
-        document.querySelectorAll('.check-conn-btn').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            var pid = btn.getAttribute('data-pid');
-            var statusEl = document.getElementById('profile-conn-status-' + pid);
-            if (!statusEl) return;
-            statusEl.innerText = 'Checking...';
-            var fd = new FormData();
-            fd.append('action', 'check_connection_profile');
-            fd.append('profile_id', pid);
-
-            fetch(window.location.pathname + window.location.search, {
-              method: 'POST',
-              body: fd,
-              credentials: 'same-origin'
-            }).then(function(r){ return r.json(); })
-              .then(function(json){
-                if (json && json.ok) {
-                  statusEl.style.color = 'green';
-                  statusEl.innerText = json.msg || 'OK';
-                  showToast('Connection OK', 'success');
-                } else {
-                  statusEl.style.color = 'red';
-                  statusEl.innerText = (json && json.msg) ? json.msg : 'Connection failed';
-                  showToast('Connection failed', 'error');
                 }
-              }).catch(function(err){
-                statusEl.style.color = 'red';
-                statusEl.innerText = 'Connection error';
-                showToast('Connection error', 'error');
-              });
-          });
-        });
-
-      })();
-      
-      // Test Connection Button Handler
-      (function() {
-        const testBtn = document.getElementById('testConnectionBtn');
-        const resultDiv = document.getElementById('connectionTestResult');
-        const apiKeyInput = document.getElementById('profile_api_key');
-        const searchQueryInput = document.getElementById('profile_search_query');
-        
-        if (testBtn && resultDiv && apiKeyInput && searchQueryInput) {
-          testBtn.addEventListener('click', function() {
-            const apiKey = apiKeyInput.value.trim();
-            const searchQuery = searchQueryInput.value.trim();
-            
-            if (!apiKey) {
-              resultDiv.style.display = 'block';
-              resultDiv.style.background = '#fee';
-              resultDiv.style.color = '#c00';
-              resultDiv.style.border = '1px solid #fcc';
-              resultDiv.innerHTML = '❌ Please enter an API key';
-              return;
-            }
-            
-            if (!searchQuery) {
-              resultDiv.style.display = 'block';
-              resultDiv.style.background = '#fee';
-              resultDiv.style.color = '#c00';
-              resultDiv.style.border = '1px solid #fcc';
-              resultDiv.innerHTML = '❌ Please enter a search query';
-              return;
-            }
-            
-            // Show loading state
-            testBtn.disabled = true;
-            testBtn.innerHTML = '⏳ Testing...';
-            resultDiv.style.display = 'block';
-            resultDiv.style.background = '#eff6ff';
-            resultDiv.style.color = '#1e40af';
-            resultDiv.style.border = '1px solid #bfdbfe';
-            resultDiv.innerHTML = '⏳ Connecting to serper.dev...';
-            
-            // Test connection
-            fetch('?action=test_connection', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-              body: 'api_key=' + encodeURIComponent(apiKey) + '&search_query=' + encodeURIComponent(searchQuery)
-            })
-            .then(r => {
-              // Check if response is OK and is JSON
-              if (!r.ok) {
-                throw new Error('HTTP ' + r.status + ': ' + r.statusText);
-              }
-              const contentType = r.headers.get('content-type');
-              if (!contentType || !contentType.includes('application/json')) {
-                // Response is not JSON, likely an error page
-                return r.text().then(text => {
-                  throw new Error('Server returned non-JSON response. Check server logs for errors.');
+                
+                // Start progress monitoring immediately
+                updateJobProgress();
+                progressInterval = setInterval(updateJobProgress, 3000); // Update every 3 seconds
+                <?php endif; ?>
+                
+                // Dashboard form AJAX submission
+                document.getElementById('dashboard-job-form').addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    
+                    // Get form data
+                    const formData = new FormData(this);
+                    
+                    // Disable submit button
+                    const submitBtn = document.getElementById('dashboard-submit-btn');
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = '⏳ Creating Job...';
+                    
+                    // Send AJAX request
+                    fetch('?page=api&action=create-job', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            // Trigger workers asynchronously (fire-and-forget)
+                            fetch('?page=api&action=trigger-workers', {
+                                method: 'POST',
+                                body: new URLSearchParams({ job_id: data.job_id }),
+                                keepalive: true
+                            }).catch(error => {
+                                console.error('Worker trigger error (non-blocking):', error);
+                            });
+                            
+                            // Show live progress widget (same as New Job page)
+                            const progressWidget = document.createElement('div');
+                            progressWidget.innerHTML = `
+                                <div class="alert alert-success" style="margin-bottom: 20px;">
+                                    <strong>✓ Job #${data.job_id} created successfully with ${data.worker_count} workers!</strong>
+                                </div>
+                                <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                                    <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
+                                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                                        <div id="dashboard-progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                                            <span id="dashboard-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-emails-collected">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-emails-target">Loading...</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-active-workers">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="dashboard-job-status">starting</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top: 15px; text-align: right;">
+                                        <a href="?page=results&job_id=${data.job_id}" class="btn" style="background: white; color: #10b981; margin-right: 10px;">View Full Results</a>
+                                        <a href="?page=workers" class="btn" style="background: rgba(255,255,255,0.2); color: white;">View Workers</a>
+                                    </div>
+                                </div>
+                            `;
+                            
+                            // Insert progress widget before form
+                            const form = document.getElementById('dashboard-job-form');
+                            form.parentNode.insertBefore(progressWidget, form);
+                            
+                            // Scroll to show the widget
+                            progressWidget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            
+                            // Start live updates (efficient polling)
+                            let updateCount = 0;
+                            const maxUpdates = 200;
+                            
+                            function updateDashboardProgress() {
+                                if (updateCount++ >= maxUpdates) return;
+                                
+                                fetch('?page=api&action=job-worker-status&job_id=' + data.job_id)
+                                    .then(response => response.json())
+                                    .then(status => {
+                                        if (status.error) return;
+                                        
+                                        const percentage = status.completion_percentage || 0;
+                                        const collected = status.emails_collected || 0;
+                                        const target = status.emails_required || 0;
+                                        const workers = status.active_workers || 0;
+                                        const jobStatus = status.job ? status.job.status : 'running';
+                                        
+                                        document.getElementById('dashboard-progress-bar').style.width = percentage + '%';
+                                        document.getElementById('dashboard-progress-text').textContent = percentage + '%';
+                                        document.getElementById('dashboard-emails-collected').textContent = collected;
+                                        document.getElementById('dashboard-emails-target').textContent = target;
+                                        document.getElementById('dashboard-active-workers').textContent = workers;
+                                        document.getElementById('dashboard-job-status').textContent = jobStatus;
+                                        
+                                        if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+                                            setTimeout(updateDashboardProgress, 3000);
+                                        } else if (jobStatus === 'completed') {
+                                            document.getElementById('dashboard-job-status').textContent = '✅ Completed';
+                                        }
+                                    })
+                                    .catch(error => {
+                                        console.error('Progress update error:', error);
+                                        setTimeout(updateDashboardProgress, 5000);
+                                    });
+                            }
+                            
+                            setTimeout(updateDashboardProgress, 1000);
+                            
+                            // Reset button and form
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                            submitBtn.style.background = 'white';
+                            form.reset();
+                        } else {
+                            // Show error in styled notification
+                            const errorDiv = document.createElement('div');
+                            errorDiv.className = 'alert alert-error';
+                            errorDiv.style.marginBottom = '20px';
+                            errorDiv.innerHTML = '<strong>✗ Error:</strong><br>' + (data.error || 'Unknown error occurred');
+                            
+                            // Insert error before form
+                            const form = document.getElementById('dashboard-job-form');
+                            form.parentNode.insertBefore(errorDiv, form);
+                            
+                            // Auto-remove after 5 seconds
+                            setTimeout(() => errorDiv.remove(), 5000);
+                            
+                            // Re-enable submit button
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                        }
+                    })
+                    .catch(error => {
+                        // Show error in styled notification
+                        const errorDiv = document.createElement('div');
+                        errorDiv.className = 'alert alert-error';
+                        errorDiv.style.marginBottom = '20px';
+                        errorDiv.innerHTML = '<strong>✗ Error:</strong><br>Failed to create job: ' + error.message;
+                        
+                        // Insert error before form
+                        const form = document.getElementById('dashboard-job-form');
+                        form.parentNode.insertBefore(errorDiv, form);
+                        
+                        // Auto-remove after 5 seconds
+                        setTimeout(() => errorDiv.remove(), 5000);
+                        
+                        // Re-enable submit button
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = '🚀 Start Extraction';
+                        
+                        console.error('Error creating job:', error);
+                    });
                 });
-              }
-              return r.json();
-            })
-            .then(data => {
-              testBtn.disabled = false;
-              testBtn.innerHTML = '🔌 Test Connection';
-              
-              if (data.success) {
-                resultDiv.style.background = '#f0fdf4';
-                resultDiv.style.color = '#15803d';
-                resultDiv.style.border = '1px solid #bbf7d0';
-                resultDiv.innerHTML = 
-                  '<strong>✓ Connection Successful!</strong><br>' +
-                  '<small>HTTP ' + data.http_code + ' | ' +
-                  data.elapsed_ms + 'ms | ' +
-                  data.result_count + ' results</small>';
-              } else {
-                resultDiv.style.background = '#fee';
-                resultDiv.style.color = '#c00';
-                resultDiv.style.border = '1px solid #fcc';
-                resultDiv.innerHTML = 
-                  '<strong>❌ Connection Failed</strong><br>' +
-                  '<small>' + (data.error || 'Unknown error') + '</small>' +
-                  (data.http_code ? '<br><small>HTTP ' + data.http_code + ' | ' + data.elapsed_ms + 'ms</small>' : '');
-              }
-            })
-            .catch(err => {
-              testBtn.disabled = false;
-              testBtn.innerHTML = '🔌 Test Connection';
-              resultDiv.style.background = '#fee';
-              resultDiv.style.color = '#c00';
-              resultDiv.style.border = '1px solid #fcc';
-              resultDiv.innerHTML = '❌ Network error: ' + err.message;
-            });
-          });
-        }
-      })();
-      
-      // Test connection for profile in list
-      function testProfileConnection(profileId) {
-        const statusDiv = document.getElementById('profile-conn-status-' + profileId);
-        if (!statusDiv) return;
-        
-        // Show loading state
-        statusDiv.style.display = 'block';
-        statusDiv.style.padding = '8px';
-        statusDiv.style.borderRadius = '4px';
-        statusDiv.style.background = '#eff6ff';
-        statusDiv.style.color = '#1e40af';
-        statusDiv.style.border = '1px solid #bfdbfe';
-        statusDiv.innerHTML = '⏳ Testing connection...';
-        
-        // Test connection
-        fetch('?action=test_connection', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-          body: 'profile_id=' + profileId
-        })
-        .then(r => {
-          // Check if response is OK and is JSON
-          if (!r.ok) {
-            throw new Error('HTTP ' + r.status + ': ' + r.statusText);
-          }
-          const contentType = r.headers.get('content-type');
-          if (!contentType || !contentType.includes('application/json')) {
-            // Response is not JSON, likely an error page
-            return r.text().then(text => {
-              throw new Error('Server returned non-JSON response. Check server logs for errors.');
-            });
-          }
-          return r.json();
-        })
-        .then(data => {
-          if (data.success) {
-            statusDiv.style.background = '#f0fdf4';
-            statusDiv.style.color = '#15803d';
-            statusDiv.style.border = '1px solid #bbf7d0';
-            statusDiv.innerHTML = 
-              '<strong>✓ Connection OK</strong> | HTTP ' + data.http_code + ' | ' +
-              data.elapsed_ms + 'ms | ' + data.result_count + ' results';
-          } else {
-            statusDiv.style.background = '#fee';
-            statusDiv.style.color = '#c00';
-            statusDiv.style.border = '1px solid #fcc';
-            statusDiv.innerHTML = 
-              '<strong>❌ Failed:</strong> ' + (data.error || 'Unknown error') +
-              (data.http_code ? ' | HTTP ' + data.http_code : '');
-          }
-          
-          // Auto-hide after 10 seconds
-          setTimeout(() => {
-            statusDiv.style.display = 'none';
-          }, 10000);
-        })
-        .catch(err => {
-          statusDiv.style.background = '#fee';
-          statusDiv.style.color = '#c00';
-          statusDiv.style.border = '1px solid #fcc';
-          statusDiv.innerHTML = '❌ Network error: ' + err.message;
-          
-          // Auto-hide after 10 seconds
-          setTimeout(() => {
-            statusDiv.style.display = 'none';
-          }, 10000);
+            </script>
+            <?php
         });
-      }
-    </script>
+    }
+    
+    /**
+     * دالة تشغيل العمال بالتوازي (Parallel Workers)
+     * تقوم بإنشاء queue items وتشغيل العمال مباشرة من Dashboard
+     * بدون الحاجة لصفحة Workers منفصلة
+     */
+    /**
+     * Create queue items for a job without spawning workers
+     * This allows sending response to user before starting background processing
+     */
+    private static function createQueueItems(int $jobId, int $workerCount): void {
+        $job = Job::getById($jobId);
+        if (!$job) {
+            error_log("✗ ERROR: Cannot create queue items - Job {$jobId} not found");
+            return;
+        }
+        
+        $maxResults = (int)$job['max_results'];
+        $resultsPerWorker = (int)ceil($maxResults / $workerCount);
+        
+        error_log("Creating queue for job {$jobId}: {$maxResults} total results, {$workerCount} workers, ~{$resultsPerWorker} per worker");
+        
+        // Create queue items for parallel processing
+        $db = Database::connect();
+        $queueItemsCreated = 0;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            $startOffset = $i * $resultsPerWorker;
+            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            
+            if ($workerMaxResults > 0) {
+                // Insert queue item
+                $stmt = $db->prepare("INSERT INTO job_queue (job_id, start_offset, max_results, status) VALUES (?, ?, ?, 'pending')");
+                $stmt->execute([$jobId, $startOffset, $workerMaxResults]);
+                $queueItemsCreated++;
+                error_log("  Queue item {$i}: offset {$startOffset}, max {$workerMaxResults}");
+            }
+        }
+        
+        // Mark job as running immediately
+        error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}");
+        Job::updateStatus($jobId, 'running', 0);
+    }
+    
+    /**
+     * Spawn workers for a job (creates queue items AND spawns workers)
+     * Note: This blocks until workers are spawned. Use createQueueItems() + autoSpawnWorkers() 
+     * separately if you need to send response to user first.
+     */
+    private static function spawnParallelWorkers(int $jobId, int $workerCount): void {
+        $job = Job::getById($jobId);
+        if (!$job) {
+            error_log("✗ ERROR: Cannot spawn workers - Job {$jobId} not found");
+            return;
+        }
+        
+        $maxResults = (int)$job['max_results'];
+        $resultsPerWorker = (int)ceil($maxResults / $workerCount);
+        
+        error_log("Creating queue for job {$jobId}: {$maxResults} total results, {$workerCount} workers, ~{$resultsPerWorker} per worker");
+        
+        // Create queue items for parallel processing
+        // إنشاء queue items للمعالجة المتوازية
+        $db = Database::connect();
+        $queueItemsCreated = 0;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            $startOffset = $i * $resultsPerWorker;
+            $workerMaxResults = min($resultsPerWorker, $maxResults - $startOffset);
+            
+            if ($workerMaxResults > 0) {
+                // Insert queue item
+                $stmt = $db->prepare("INSERT INTO job_queue (job_id, start_offset, max_results, status) VALUES (?, ?, ?, 'pending')");
+                $stmt->execute([$jobId, $startOffset, $workerMaxResults]);
+                $queueItemsCreated++;
+                error_log("  Queue item {$i}: offset {$startOffset}, max {$workerMaxResults}");
+            }
+        }
+        
+        // Mark job as running immediately - workers will process the queue
+        error_log("✓ Created {$queueItemsCreated} queue items for job {$jobId}. Spawning workers now...");
+        Job::updateStatus($jobId, 'running', 0);
+        
+        // Spawn workers asynchronously in background (NOT synchronously!)
+        // This allows workers to run in parallel, not sequentially
+        // تشغيل العمال بشكل غير متزامن في الخلفية (وليس بشكل متزامن!)
+        self::autoSpawnWorkers($workerCount, $jobId);
+        
+        error_log("✓ Triggered async spawning of {$workerCount} workers for job {$jobId}");
+    }
+    
+    /**
+     * DEPRECATED: This function runs workers synchronously (one after another)
+     * which causes the entire process to hang and be extremely slow.
+     * DO NOT USE - Use autoSpawnWorkers() instead which spawns workers in background.
+     * 
+     * Kept here only for reference. Will be removed in future versions.
+     */
+    /*
+    private static function spawnWorkersDirectly(int $jobId, int $workerCount): int {
+        // For environments where HTTP loopback connections are blocked (common hosting restriction)
+        // Process workers inline since curl to self fails
+        
+        error_log("Spawning {$workerCount} workers for job {$jobId} using inline processing");
+        
+        $successCount = 0;
+        $errors = [];
+        $db = Database::connect();
+        
+        // Process all queue items for this job inline
+        // This works even when HTTP loopback is blocked
+        for ($i = 0; $i < $workerCount; $i++) {
+            $workerName = 'worker-' . $jobId . '-' . $i . '-' . time();
+            
+            try {
+                error_log("✓ Starting inline worker {$i} for job {$jobId}");
+                
+                // Register worker
+                $workerId = Worker::register($workerName);
+                
+                // Get next queue item for this job
+                $job = Worker::getNextJob();
+                
+                if ($job && (int)$job['id'] == $jobId) {
+                    // Process this queue item with queue parameters
+                    Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+                    error_log("  Worker {$workerName}: Processing queue item for job {$jobId}");
+                    
+                    // Get queue parameters from the job
+                    $startOffset = isset($job['queue_start_offset']) ? (int)$job['queue_start_offset'] : 0;
+                    $maxResults = isset($job['queue_max_results']) ? (int)$job['queue_max_results'] : (int)$job['max_results'];
+                    $queueId = isset($job['queue_id']) ? (int)$job['queue_id'] : null;
+                    
+                    error_log("    Queue item: offset={$startOffset}, max={$maxResults}, queue_id={$queueId}");
+                    
+                    // Process using the immediate method with queue parameters
+                    Worker::processJobImmediately($jobId, $startOffset, $maxResults);
+                    
+                    // Mark queue item as complete if we have queue_id
+                    if ($queueId) {
+                        Worker::markQueueItemComplete($queueId);
+                        
+                        // Check if all queue items are complete and update job status
+                        Worker::checkAndUpdateJobCompletion($jobId);
+                    }
+                    
+                    Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                    $successCount++;
+                    error_log("✓ Worker {$i} completed processing queue item {$queueId} for job {$jobId}");
+                } else {
+                    // No queue item available for this job
+                    $successCount++; // Still count as success - worker was ready
+                    error_log("  Worker {$i} registered but no queue item available yet for job {$jobId}");
+                }
+                
+            } catch (Exception $e) {
+                $errorMsg = "Worker {$i} processing exception: " . $e->getMessage();
+                $errors[] = $errorMsg;
+                error_log("✗ {$errorMsg}");
+                
+                // Log to database for UI display
+                $stmt = $db->prepare("INSERT INTO worker_errors (worker_id, job_id, error_type, error_message, severity) VALUES (NULL, ?, 'processing_error', ?, 'error')");
+                $stmt->execute([$jobId, $errorMsg]);
+            }
+        }
+        
+        // Log summary
+        if ($successCount > 0) {
+            error_log("✓ Successfully processed {$successCount}/{$workerCount} queue items for job {$jobId}");
+        } else if (!empty($errors)) {
+            $summaryMsg = "All workers failed. Errors: " . implode("; ", $errors);
+            error_log("✗ CRITICAL: {$summaryMsg}");
+        }
+        
+        return $successCount;
+    }
+    */
+    
+    private static function autoSpawnWorkers(int $workerCount, ?int $jobId = null): int {
+        error_log("autoSpawnWorkers: Spawning {$workerCount} workers for job " . ($jobId ?? 'any'));
+        
+        // Use proc_open for parallel processing (compatible with cPanel)
+        if (function_exists('proc_open') && !in_array('proc_open', explode(',', ini_get('disable_functions')))) {
+            error_log("autoSpawnWorkers: Using proc_open for PARALLEL processing");
+            $spawnedCount = self::spawnWorkersViaProcOpen($workerCount, $jobId);
+            
+            if ($spawnedCount === 0 && $jobId) {
+                // No workers spawned - mark job as failed
+                $errorMsg = "Failed to spawn any workers using proc_open. Check server logs for details.";
+                error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
+                Job::updateStatus($jobId, 'failed', 0);
+                Job::setError($jobId, $errorMsg);
+            } elseif ($spawnedCount < $workerCount && $jobId) {
+                // Some workers failed to spawn - log warning but continue
+                error_log("autoSpawnWorkers: WARNING - Only {$spawnedCount}/{$workerCount} workers spawned successfully");
+            }
+            
+            error_log("autoSpawnWorkers: Completed - {$spawnedCount}/{$workerCount} workers spawned");
+            return $spawnedCount;
+        } else {
+            $errorMsg = "proc_open is not available. Please enable proc_open in PHP configuration for parallel worker processing.";
+            error_log("autoSpawnWorkers: ERROR - {$errorMsg}");
+            
+            // Mark job as failed with clear error message
+            if ($jobId) {
+                Job::updateStatus($jobId, 'failed', 0);
+                Job::setError($jobId, $errorMsg);
+            }
+            
+            throw new Exception($errorMsg);
+        }
+    }
+    
+    private static function spawnWorkersViaExec(int $workerCount, ?int $jobId = null): void {
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            // Build command to run worker in queue mode
+            // Include job_id if specified so worker only processes that job
+            $workerName = 'auto-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+            
+            // Pass job_id as second argument if specified
+            $jobIdArg = $jobId !== null ? ' ' . escapeshellarg((string)$jobId) : '';
+            
+            $cmd = sprintf(
+                '%s %s %s%s > /dev/null 2>&1 &',
+                escapeshellarg($phpBinary),
+                escapeshellarg($scriptPath),
+                escapeshellarg($workerName),
+                $jobIdArg
+            );
+            
+            // Execute in background
+            if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                // Windows
+                pclose(popen("start /B " . $cmd, "r"));
+            } else {
+                // Unix/Linux
+                exec($cmd);
+            }
+            
+            error_log("Spawned worker: {$workerName}" . ($jobId ? " for job {$jobId}" : ""));
+        }
+    }
+    
+    private static function spawnWorkersViaProcOpen(int $workerCount, ?int $jobId = null): int {
+        $phpBinary = PHP_BINARY;
+        $scriptPath = __FILE__;
+        
+        error_log("spawnWorkersViaProcOpen: Spawning {$workerCount} workers using proc_open()" . ($jobId ? " for job {$jobId}" : ""));
+        
+        $spawnedCount = 0;
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            try {
+                // Build command to run worker in queue mode
+                // Include job_id if specified so worker only processes that job
+                $workerName = 'proc-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                
+                // Build command arguments
+                $args = [$phpBinary, $scriptPath, $workerName];
+                if ($jobId !== null) {
+                    $args[] = (string)$jobId;
+                }
+                
+                // Descriptors for proc_open (redirect stdin, stdout, stderr to /dev/null)
+                $descriptors = [
+                    0 => ['pipe', 'r'],  // stdin
+                    1 => ['file', '/dev/null', 'w'],  // stdout
+                    2 => ['file', '/dev/null', 'w']   // stderr
+                ];
+                
+                // For Windows, use different null device
+                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                    $descriptors = [
+                        0 => ['pipe', 'r'],
+                        1 => ['file', 'NUL', 'w'],
+                        2 => ['file', 'NUL', 'w']
+                    ];
+                }
+                
+                // Spawn process - pass args directly for better compatibility
+                $process = proc_open($args, $descriptors, $pipes, null, null, ['bypass_shell' => true]);
+                
+                if (is_resource($process)) {
+                    // Close stdin pipe if it was created
+                    if (isset($pipes[0]) && is_resource($pipes[0])) {
+                        fclose($pipes[0]);
+                    }
+                    
+                    // Don't call proc_close - let it run in background
+                    // The process will continue running even after parent terminates
+                    $spawnedCount++;
+                    error_log("spawnWorkersViaProcOpen: Spawned worker {$spawnedCount}/{$workerCount}: {$workerName}");
+                } else {
+                    error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
+                }
+            } catch (Exception $e) {
+                error_log("spawnWorkersViaProcOpen: Exception spawning worker {$i}: " . $e->getMessage());
+            }
+        }
+        
+        error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
+        return $spawnedCount;
+    }
+    
+    private static function spawnWorkersViaHttp(int $workerCount, ?int $jobId = null): int {
+        // Get the current URL
+        $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/app.php';
+        $baseUrl = $protocol . '://' . $host . $scriptName;
+        
+        error_log("spawnWorkersViaHttp: Spawning {$workerCount} HTTP workers to {$baseUrl}" . ($jobId ? " for job {$jobId}" : ""));
+        
+        // Use curl_multi for truly async requests
+        $multiHandle = curl_multi_init();
+        $handles = [];
+        
+        for ($i = 0; $i < $workerCount; $i++) {
+            $workerName = 'http-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+            
+            // Create async HTTP request to trigger worker
+            $ch = curl_init($baseUrl . '?page=start-worker');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'worker_name' => $workerName,
+                'worker_index' => $i,
+                'job_id' => $jobId // Pass job_id to worker
+            ]));
+            curl_setopt($ch, CURLOPT_TIMEOUT, 3); // 3 seconds timeout
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2); // 2 seconds connection timeout
+            curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+            
+            curl_multi_add_handle($multiHandle, $ch);
+            $handles[$i] = $ch;
+            
+            error_log("spawnWorkersViaHttp: Queued HTTP worker #{$i}: {$workerName}");
+        }
+        
+        // Execute all requests in parallel
+        $running = null;
+        do {
+            curl_multi_exec($multiHandle, $running);
+            curl_multi_select($multiHandle, 0.1);
+        } while ($running > 0);
+        
+        // Check results and clean up
+        $successCount = 0;
+        foreach ($handles as $i => $ch) {
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+            
+            // Accept HTTP 200 or 0 (timeout is OK for async workers)
+            if ($httpCode === 200 || $httpCode === 0) {
+                error_log("spawnWorkersViaHttp: Worker #{$i} triggered successfully (HTTP {$httpCode})");
+                $successCount++;
+            } else {
+                error_log("spawnWorkersViaHttp: Worker #{$i} failed - HTTP {$httpCode}, Error: {$error}");
+            }
+            
+            curl_multi_remove_handle($multiHandle, $ch);
+            curl_close($ch);
+        }
+        
+        curl_multi_close($multiHandle);
+        
+        error_log("spawnWorkersViaHttp: Successfully triggered {$successCount}/{$workerCount} HTTP workers");
+        return $successCount;
+    }
+    
+    /**
+     * Inline fallback worker - processes queue items directly when async methods fail
+     * This ensures jobs make progress even in restricted hosting environments
+     */
+    private static function startInlineFallbackWorker(): void {
+        error_log("startInlineFallbackWorker: Starting inline worker as fallback");
+        
+        // Close connection immediately so user doesn't wait
+        if (!headers_sent()) {
+            ignore_user_abort(true);
+            set_time_limit(300); // 5 minutes
+            
+            // Try to send response and close connection
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+                error_log("startInlineFallbackWorker: Used fastcgi_finish_request()");
+            }
+        }
+        
+        $workerName = 'inline-worker-' . uniqid();
+        $workerId = null;
+        
+        try {
+            $db = Database::connect();
+            $workerId = Worker::register($workerName);
+            error_log("startInlineFallbackWorker: Registered worker {$workerName} (ID: {$workerId})");
+            
+            // Process up to 3 queue items inline
+            $maxItems = 3;
+            $processed = 0;
+            
+            for ($i = 0; $i < $maxItems; $i++) {
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                
+                $job = Worker::getNextJob();
+                
+                if ($job) {
+                    error_log("startInlineFallbackWorker: Processing job #{$job['id']}");
+                    Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                    
+                    try {
+                        Worker::processJob($job['id']);
+                        $processed++;
+                        error_log("startInlineFallbackWorker: Completed job #{$job['id']} ({$processed}/{$maxItems})");
+                    } catch (Exception $e) {
+                        error_log("startInlineFallbackWorker: Error processing job #{$job['id']}: " . $e->getMessage());
+                        Worker::logError($workerId, $job['id'], 'inline_processing_error', $e->getMessage(), $e->getTraceAsString());
+                    }
+                } else {
+                    error_log("startInlineFallbackWorker: No more jobs in queue");
+                    break;
+                }
+            }
+            
+            Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            error_log("startInlineFallbackWorker: Completed - processed {$processed} jobs");
+            
+        } catch (Exception $e) {
+            error_log("startInlineFallbackWorker: Fatal error: " . $e->getMessage());
+            
+            // Clean up worker registration if it was created
+            if ($workerId !== null) {
+                try {
+                    $db = Database::connect();
+                    $stmt = $db->prepare("UPDATE workers SET status = 'stopped', last_error = ? WHERE id = ?");
+                    $stmt->execute(['Fatal error: ' . $e->getMessage(), $workerId]);
+                } catch (Exception $cleanupError) {
+                    error_log("startInlineFallbackWorker: Cleanup error: " . $cleanupError->getMessage());
+                }
+            }
+        }
+    }
+    
+    /**
+     * Process workers in background after closing connection
+     * This method works without exec, HTTP workers, or cron
+     * Connection must be closed BEFORE calling this method
+     * 
+     * All workers process their assigned queue items in parallel (within single PHP process)
+     */
+    private static function processWorkersInBackground(int $workerCount, ?int $jobId = null): void {
+        error_log("processWorkersInBackground: Starting background processing for {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
+        
+        // Connection should already be closed by caller
+        // Just ensure we can continue after user disconnect
+        ignore_user_abort(true);
+        set_time_limit(600); // 10 minutes max to allow more processing time
+        
+        // Now process work in background - user has already received response
+        try {
+            $db = Database::connect();
+            
+            // FIRST: Register ALL workers and assign each one a queue item immediately
+            $workers = [];
+            for ($i = 0; $i < $workerCount; $i++) {
+                $workerName = 'bg-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
+                $workerId = Worker::register($workerName);
+                if ($workerId) {
+                    // Immediately get a queue item for this worker
+                    $queueItem = Worker::getNextJob($jobId);
+                    
+                    $workers[] = [
+                        'id' => $workerId, 
+                        'name' => $workerName, 
+                        'queue_item' => $queueItem,
+                        'processed' => 0
+                    ];
+                    
+                    if ($queueItem) {
+                        // Mark as running with assigned job
+                        Worker::updateHeartbeat($workerId, 'running', $jobId, 0, 0);
+                        error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId}) - assigned queue item");
+                    } else {
+                        // No queue item available for this worker
+                        Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                        error_log("processWorkersInBackground: Registered worker {$i}/{$workerCount}: {$workerName} (ID: {$workerId}) - NO queue item available");
+                    }
+                }
+            }
+            
+            error_log("processWorkersInBackground: ALL {$workerCount} workers registered with queue items assigned");
+            
+            // SECOND: Process assigned queue items for each worker
+            $totalProcessed = 0;
+            $startTime = time();
+            $maxRuntime = 600; // 10 minutes total
+            $lastHeartbeatUpdate = time();
+            
+            // Process all workers' queue items
+            $workersWithWork = array_filter($workers, function($w) { return $w['queue_item'] !== null; });
+            error_log("processWorkersInBackground: " . count($workersWithWork) . " workers have queue items to process");
+            
+            foreach ($workers as &$worker) {
+                // Check timeout
+                if ((time() - $startTime) >= $maxRuntime) {
+                    error_log("processWorkersInBackground: Max runtime reached, stopping");
+                    break;
+                }
+                
+                // Update heartbeats periodically
+                if (time() - $lastHeartbeatUpdate >= 30) {
+                    foreach ($workers as $w) {
+                        Worker::updateHeartbeat($w['id'], $w['queue_item'] ? 'running' : 'idle', $jobId, 0, 0);
+                    }
+                    $lastHeartbeatUpdate = time();
+                }
+                
+                if (!$worker['queue_item']) {
+                    continue; // Skip workers with no queue items
+                }
+                
+                $workerId = $worker['id'];
+                $workerName = $worker['name'];
+                $job = $worker['queue_item'];
+                
+                // NOTE: Don't check target here - let all workers process their assigned queue items
+                // Target check happens after all workers complete their initial assignments
+                
+                error_log("processWorkersInBackground: Worker {$workerName} processing assigned queue item");
+                Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                
+                try {
+                    // Pass worker ID and name so processJob uses existing worker instead of creating new one
+                    Worker::processJob($job['id'], $workerId, $workerName);
+                    $worker['processed']++;
+                    $totalProcessed++;
+                    error_log("processWorkersInBackground: Worker {$workerName} completed queue item (total processed: {$totalProcessed})");
+                    
+                    // After processing, try to get another queue item (only if target not yet reached)
+                    if ($jobId) {
+                        $jobDetails = Job::getById($jobId);
+                        if ($jobDetails) {
+                            $emailsCollected = Job::getEmailCount($jobId);
+                            $maxResults = (int)$jobDetails['max_results'];
+                            
+                            if ($emailsCollected >= $maxResults) {
+                                error_log("processWorkersInBackground: Job {$jobId} reached target after worker {$workerName} ({$emailsCollected}/{$maxResults})");
+                                Worker::checkAndUpdateJobCompletion($jobId);
+                                $worker['queue_item'] = null; // Don't get more items
+                            } else {
+                                // Try to get another queue item for this worker
+                                $nextQueueItem = Worker::getNextJob($jobId);
+                                if ($nextQueueItem) {
+                                    $worker['queue_item'] = $nextQueueItem;
+                                    error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
+                                } else {
+                                    $worker['queue_item'] = null;
+                                    error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
+                                }
+                            }
+                        }
+                    } else {
+                        // No job ID specified, try to get another queue item
+                        $nextQueueItem = Worker::getNextJob($jobId);
+                        if ($nextQueueItem) {
+                            $worker['queue_item'] = $nextQueueItem;
+                            error_log("processWorkersInBackground: Worker {$workerName} got another queue item");
+                        } else {
+                            $worker['queue_item'] = null;
+                            error_log("processWorkersInBackground: Worker {$workerName} - no more queue items");
+                        }
+                    }
+                    
+                } catch (Exception $e) {
+                    error_log("processWorkersInBackground: Worker {$workerName} error: " . $e->getMessage());
+                    Worker::logError($workerId, $job['id'], 'background_processing_error', $e->getMessage(), $e->getTraceAsString());
+                    $worker['queue_item'] = null; // Don't retry same item
+                }
+                
+                Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            }
+            
+            // Final job completion check
+            if ($jobId) {
+                Worker::checkAndUpdateJobCompletion($jobId);
+            }
+            
+            // Mark all workers as idle when done
+            foreach ($workers as $worker) {
+                Worker::updateHeartbeat($worker['id'], 'idle', null, 0, 0);
+            }
+            
+            error_log("processWorkersInBackground: Completed - total {$totalProcessed} queue items processed by " . count($workersWithWork) . " workers");
+            
+        } catch (Exception $e) {
+            error_log("processWorkersInBackground: Fatal error: " . $e->getMessage());
+        }
+    }
+    
+    private static function renderNewJob(): void {
+        self::renderLayout('New Job', function() {
+            ?>
+            <!-- Alert area for messages -->
+            <div id="alert-area"></div>
+            
+            <!-- Loading overlay with improved feedback -->
+            <div id="loading-overlay" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 9999; align-items: center; justify-content: center;">
+                <div style="background: white; padding: 40px; border-radius: 12px; text-align: center; max-width: 500px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);">
+                    <div class="spinner" style="width: 60px; height: 60px; border: 5px solid #f3f3f3; border-top: 5px solid #3182ce; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 20px;"></div>
+                    <h2 id="loading-title" style="color: #2d3748; margin-bottom: 10px;">🚀 Creating Job...</h2>
+                    <p id="loading-message" style="color: #4a5568; margin-top: 10px;">
+                        Setting up your extraction job... This should take less than 1 second!
+                    </p>
+                    <div id="loading-progress" style="margin-top: 20px; padding: 15px; background: #f7fafc; border-radius: 8px; display: none;">
+                        <p style="font-weight: 600; color: #2d3748; margin-bottom: 5px;">
+                            <span id="worker-count-display">0</span> workers ready to start
+                        </p>
+                        <p style="color: #4a5568; font-size: 14px; margin: 0;">
+                            Workers will process your job in the background...
+                        </p>
+                    </div>
+                    <p style="margin-top: 15px; font-size: 13px; color: #718096;">
+                        💡 <strong>Tip:</strong> Your job will continue processing even if you close this page!
+                    </p>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Create New Email Extraction Job</h2>
+                <p style="margin-bottom: 20px; color: #4a5568;">
+                    ⚡ <strong>Parallel Processing Power:</strong> Workers calculated automatically using formula: <strong>50 workers per 1000 emails</strong><br>
+                    📊 Examples: 1,000 emails = 50 workers | 10,000 emails = 500 workers | 1,000,000 emails = 1,000 workers (capped)<br>
+                    🎯 Target: Process 1,000,000 emails in ≤10 minutes with maximum parallelization!
+                </p>
+                <form id="job-form">
+                    <div class="form-group">
+                        <label>Search Query *</label>
+                        <input type="text" name="query" id="query" placeholder="e.g., real estate agents california" required>
+                        <small>Enter search terms to find pages containing emails</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Serper.dev API Key *</label>
+                        <input type="text" name="api_key" id="api_key" placeholder="Your API key from serper.dev" required>
+                        <small>Get your API key from <a href="https://serper.dev" target="_blank">serper.dev</a></small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Maximum Emails</label>
+                        <input type="number" name="max_results" id="max_results" value="100" min="1" max="100000">
+                        <small>Target number of emails to extract (1-100,000)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Worker Count</label>
+                        <input type="number" name="worker_count" id="worker_count" value="50" min="1" max="1000" required>
+                        <small>Number of parallel workers (1-1000). More workers = faster extraction without search duplication.</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Country Target (Optional)</label>
+                        <select name="country" id="country">
+                            <option value="">All Countries</option>
+                            <option value="us">United States</option>
+                            <option value="uk">United Kingdom</option>
+                            <option value="ca">Canada</option>
+                            <option value="au">Australia</option>
+                            <option value="de">Germany</option>
+                            <option value="fr">France</option>
+                            <option value="es">Spain</option>
+                            <option value="it">Italy</option>
+                            <option value="jp">Japan</option>
+                            <option value="cn">China</option>
+                            <option value="in">India</option>
+                            <option value="br">Brazil</option>
+                        </select>
+                        <small>Target search results from a specific country</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Email Type Filter</label>
+                        <select name="email_filter" id="email_filter">
+                            <option value="all">All Email Types</option>
+                            <option value="gmail">Gmail Only</option>
+                            <option value="yahoo">Yahoo Only</option>
+                            <option value="business">Business Domains Only</option>
+                        </select>
+                        <small>Filter extracted emails by domain type</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary" id="submit-btn">🚀 Start Extraction</button>
+                    <a href="?page=dashboard" class="btn">Cancel</a>
+                </form>
+            </div>
+            
+            <div class="card">
+                <h2>ℹ️ How It Works - SendGrid-Inspired Architecture</h2>
+                <p style="margin-bottom: 15px; padding: 15px; background: #ebf8ff; border-left: 4px solid #3182ce; border-radius: 4px;">
+                    <strong>🎯 Zero UI Blocking:</strong> Inspired by SendGrid's campaign system, job creation returns instantly (< 200ms) while workers process in the background. Your UI never hangs!
+                </p>
+                <ol style="padding-left: 20px;">
+                    <li><strong>Instant Job Creation:</strong> Job and queue items created in < 200ms</li>
+                    <li><strong>Async Worker Spawning:</strong> Workers spawn after response is sent to client</li>
+                    <li><strong>Dynamic Scaling:</strong> Formula: 50 workers per 1000 emails (max 1000 workers)</li>
+                    <li><strong>Parallel Processing:</strong> Job split into chunks for concurrent processing</li>
+                    <li><strong>Real-time Updates:</strong> Progress updates via efficient polling (SSE available)</li>
+                    <li><strong>Bulk Operations:</strong> URLs scraped in parallel, emails inserted in bulk</li>
+                    <li><strong>Smart Caching:</strong> BloomFilter reduces duplicate checks by ~90%</li>
+                    <li><strong>ETA Calculation:</strong> Real-time estimated time to completion based on current processing rate</li>
+                </ol>
+                <p style="margin-top: 15px;">
+                    <strong>⚡ Performance Optimizations:</strong>
+                </p>
+                <ul style="padding-left: 20px; color: #4a5568;">
+                    <li><strong>Non-Blocking I/O:</strong> FastCGI finish request for instant client disconnect</li>
+                    <li><strong>Automatic Worker Scaling:</strong> 50 workers per 1000 emails (up to 1000 workers cap)</li>
+                    <li><strong>Parallel HTTP Requests:</strong> Up to 100 simultaneous connections per worker with curl_multi</li>
+                    <li><strong>Connection Reuse:</strong> HTTP keep-alive and HTTP/2 support</li>
+                    <li><strong>Memory Caching:</strong> 10K-item BloomFilter cache in memory</li>
+                    <li><strong>Bulk Database Operations:</strong> Batch inserts for maximum throughput</li>
+                    <li><strong>Rate Limiting:</strong> Configurable (default 0.1s) with parallel processing</li>
+                    <li><strong>Dynamic ETA:</strong> Live calculation of estimated completion time and processing rate</li>
+                </ul>
+                <p style="margin-top: 15px; padding: 15px; background: #f0fff4; border-left: 4px solid #10b981; border-radius: 4px;">
+                    <strong>✨ SendGrid-Style Experience:</strong> Click "🚀 Start Extraction" and get instant feedback. The UI responds immediately, workers process in background, and you see live progress updates every 3 seconds with ETA. You can even navigate away and come back later - your job continues running!
+                </p>
+            </div>
+            
+            <style>
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+            </style>
+            
+            <script>
+                // Progress update method configuration
+                // Managed via Settings page: Settings → Progress Update Method
+                // false = Polling (recommended, works everywhere)
+                // true = Server-Sent Events (real-time, modern browsers)
+                const USE_SSE = <?php echo Settings::get('use_sse') === '1' ? 'true' : 'false'; ?>;
+                
+                document.getElementById('job-form').addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    
+                    // Get form data
+                    const formData = new FormData(this);
+                    
+                    // Show loading overlay
+                    const loadingOverlay = document.getElementById('loading-overlay');
+                    loadingOverlay.style.display = 'flex';
+                    
+                    // Disable submit button
+                    const submitBtn = document.getElementById('submit-btn');
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = '⏳ Creating...';
+                    
+                    // Track request start time
+                    const startTime = Date.now();
+                    
+                    // Send AJAX request to create job
+                    fetch('?page=api&action=create-job', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        // Calculate response time
+                        const responseTime = Date.now() - startTime;
+                        console.log('Job creation response time:', responseTime + 'ms');
+                        
+                        // Hide loading overlay immediately (UI should never hang)
+                        loadingOverlay.style.display = 'none';
+                        
+                        if (data.success) {
+                            // Trigger workers asynchronously (fire-and-forget)
+                            // This doesn't block the UI - we don't wait for response
+                            fetch('?page=api&action=trigger-workers', {
+                                method: 'POST',
+                                body: new URLSearchParams({ job_id: data.job_id }),
+                                keepalive: true  // Ensures request completes even if user navigates away
+                            }).catch(error => {
+                                console.error('Worker trigger error (non-blocking):', error);
+                                // Don't show error to user - workers may still start via other means
+                            });
+                            
+                            // Show live progress widget
+                            const alertArea = document.getElementById('alert-area');
+                            alertArea.innerHTML = `
+                                <div class="alert alert-success" style="margin-bottom: 20px;">
+                                    <strong>✓ Job #${data.job_id} created successfully in ${responseTime}ms!</strong><br>
+                                    <small>Workers spawned: ${data.worker_count} (Formula: 50 workers per 1000 emails) | Status updates every 3 seconds</small>
+                                </div>
+                                <div class="card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; margin-bottom: 20px;">
+                                    <h2 style="color: white; margin-top: 0;">📊 Live Job Progress</h2>
+                                    <div style="background: rgba(255,255,255,0.2); border-radius: 8px; height: 24px; margin: 15px 0; overflow: hidden;">
+                                        <div id="live-progress-bar" style="background: white; color: #10b981; height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px;">
+                                            <span id="live-progress-text">0%</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px;">
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-emails-collected">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Emails Collected</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-emails-target">${data.job_id ? 'Loading...' : '-'}</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Target</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-active-workers">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Active Workers</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-job-status">starting</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">Status</div>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 10px;">
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-eta">Calculating...</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⏱️ ETA</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-elapsed">0s</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⏰ Elapsed</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-rate">0</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">⚡ Emails/Min</div>
+                                        </div>
+                                        <div style="background: rgba(255,255,255,0.15); padding: 10px; border-radius: 6px;">
+                                            <div style="font-size: 20px; font-weight: bold;" id="live-remaining">-</div>
+                                            <div style="font-size: 12px; opacity: 0.9;">📩 Remaining</div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top: 15px; text-align: right;">
+                                        <a href="?page=results&job_id=${data.job_id}" class="btn" style="background: white; color: #10b981; margin-right: 10px;">View Full Results</a>
+                                        <a href="?page=workers" class="btn" style="background: rgba(255,255,255,0.2); color: white;">View Workers</a>
+                                    </div>
+                                </div>
+                            `;
+                            
+                            // Scroll to top to show the message
+                            window.scrollTo(0, 0);
+                            
+                            // Start live updates using either SSE or polling
+                            if (USE_SSE && typeof(EventSource) !== 'undefined') {
+                                // Use Server-Sent Events for real-time updates
+                                console.log('Using Server-Sent Events for real-time updates');
+                                startSSEUpdates(data.job_id);
+                            } else {
+                                // Fall back to polling
+                                console.log('Using polling for updates');
+                                startPollingUpdates(data.job_id);
+                            }
+                            
+                            // Re-enable and reset the form for creating another job
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                            document.getElementById('job-form').reset();
+                        } else {
+                            // Show error alert
+                            alert('✗ Error: ' + (data.error || 'Unknown error occurred'));
+                            
+                            // Re-enable submit button
+                            submitBtn.disabled = false;
+                            submitBtn.textContent = '🚀 Start Extraction';
+                        }
+                    })
+                    .catch(error => {
+                        // Hide loading overlay
+                        loadingOverlay.style.display = 'none';
+                        
+                        // Show error alert
+                        alert('✗ Error: Failed to create job - ' + error.message);
+                        
+                        // Re-enable submit button
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = '🚀 Start Extraction';
+                        
+                        console.error('Error creating job:', error);
+                    });
+                });
+                
+                // Function to start Server-Sent Events updates
+                function startSSEUpdates(jobId) {
+                    const eventSource = new EventSource('?page=api&action=job-progress-sse&job_id=' + jobId);
+                    
+                    eventSource.addEventListener('progress', function(event) {
+                        const status = JSON.parse(event.data);
+                        updateProgressUI(status);
+                    });
+                    
+                    eventSource.addEventListener('complete', function(event) {
+                        const data = JSON.parse(event.data);
+                        console.log('Job completed:', data.status);
+                        if (data.status === 'completed') {
+                            document.getElementById('live-job-status').textContent = '✅ Completed';
+                        }
+                        eventSource.close();
+                    });
+                    
+                    eventSource.addEventListener('error', function(event) {
+                        console.error('SSE error, falling back to polling');
+                        eventSource.close();
+                        startPollingUpdates(jobId);
+                    });
+                }
+                
+                // Function to start polling updates
+                function startPollingUpdates(jobId) {
+                    let updateCount = 0;
+                    const maxUpdates = 200; // Stop after ~10 minutes (200 * 3s)
+                    
+                    function updateLiveProgress() {
+                        if (updateCount++ >= maxUpdates) {
+                            return; // Stop updating after max updates
+                        }
+                        
+                        fetch('?page=api&action=job-worker-status&job_id=' + jobId)
+                            .then(response => response.json())
+                            .then(status => {
+                                if (status.error) return;
+                                
+                                updateProgressUI(status);
+                                
+                                const jobStatus = status.job ? status.job.status : 'running';
+                                
+                                // Continue updates if job is not complete
+                                if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+                                    setTimeout(updateLiveProgress, 3000);
+                                } else {
+                                    // Job complete - show message
+                                    if (jobStatus === 'completed') {
+                                        document.getElementById('live-job-status').textContent = '✅ Completed';
+                                    }
+                                }
+                            })
+                            .catch(error => {
+                                console.error('Progress update error:', error);
+                                setTimeout(updateLiveProgress, 5000); // Retry with longer delay
+                            });
+                    }
+                    
+                    // Start updates immediately
+                    setTimeout(updateLiveProgress, 1000); // First update after 1 second
+                }
+                
+                // Function to update progress UI
+                function updateProgressUI(status) {
+                    const percentage = status.completion_percentage || 0;
+                    const collected = status.emails_collected || 0;
+                    const target = status.emails_required || 0;
+                    const workers = status.active_workers || 0;
+                    const jobStatus = status.job ? status.job.status : 'running';
+                    
+                    // Update basic UI elements
+                    document.getElementById('live-progress-bar').style.width = percentage + '%';
+                    document.getElementById('live-progress-text').textContent = percentage + '%';
+                    document.getElementById('live-emails-collected').textContent = collected.toLocaleString();
+                    document.getElementById('live-emails-target').textContent = target.toLocaleString();
+                    document.getElementById('live-active-workers').textContent = workers;
+                    document.getElementById('live-job-status').textContent = jobStatus;
+                    
+                    // Update ETA information if available
+                    if (status.eta) {
+                        const eta = status.eta;
+                        const etaElement = document.getElementById('live-eta');
+                        const elapsedElement = document.getElementById('live-elapsed');
+                        const rateElement = document.getElementById('live-rate');
+                        const remainingElement = document.getElementById('live-remaining');
+                        
+                        if (etaElement) {
+                            etaElement.textContent = eta.eta_formatted || 'Calculating...';
+                        }
+                        if (elapsedElement) {
+                            elapsedElement.textContent = eta.elapsed_formatted || '0s';
+                        }
+                        if (rateElement) {
+                            rateElement.textContent = eta.emails_per_minute ? eta.emails_per_minute.toFixed(1) : '0';
+                        }
+                        if (remainingElement) {
+                            remainingElement.textContent = eta.remaining_emails ? eta.remaining_emails.toLocaleString() : '0';
+                        }
+                    }
+                }
+            </script>
+            <?php
+        });
+    }
+    
+    private static function renderSettings(): void {
+        if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            foreach ($_POST as $key => $value) {
+                if (strpos($key, 'setting_') === 0) {
+                    $settingKey = substr($key, 8);
+                    Settings::set($settingKey, $value);
+                }
+            }
+            $success = 'Settings saved successfully!';
+        }
+        
+        $settings = Settings::getAll();
+        $successMsg = $success ?? null;
+        
+        self::renderLayout('Settings', function() use ($settings, $successMsg) {
+            ?>
+            <?php if ($successMsg): ?>
+                <div class="alert alert-success"><?php echo $successMsg; ?></div>
+            <?php endif; ?>
+            
+            <div class="card">
+                <h2>System Settings</h2>
+                <form method="POST">
+                    <div class="form-group">
+                        <label>Default API Key</label>
+                        <input type="text" name="setting_default_api_key" value="<?php echo htmlspecialchars($settings['default_api_key'] ?? ''); ?>">
+                        <small>Used as default for new jobs</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Default Max Results</label>
+                        <input type="number" name="setting_default_max_results" value="<?php echo htmlspecialchars($settings['default_max_results'] ?? '100'); ?>">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Rate Limit (seconds between requests)</label>
+                        <!-- Default: 0.1 (see Worker::DEFAULT_RATE_LIMIT) -->
+                        <input type="number" step="0.01" name="setting_rate_limit" value="<?php echo htmlspecialchars($settings['rate_limit'] ?? '0.1'); ?>">
+                        <small>Optimized for maximum performance: 0.1 seconds with curl_multi parallel processing (100k emails in ~3 min)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Deep Scraping</label>
+                        <select name="setting_deep_scraping">
+                            <option value="1" <?php echo ($settings['deep_scraping'] ?? '1') === '1' ? 'selected' : ''; ?>>Enabled</option>
+                            <option value="0" <?php echo ($settings['deep_scraping'] ?? '1') === '0' ? 'selected' : ''; ?>>Disabled</option>
+                        </select>
+                        <small>When enabled, workers will fetch and scan page content for emails (slower but more comprehensive)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Deep Scraping Threshold</label>
+                        <input type="number" name="setting_deep_scraping_threshold" value="<?php echo htmlspecialchars($settings['deep_scraping_threshold'] ?? '5'); ?>" min="1" max="20">
+                        <small>Only fetch page content if fewer than this many emails found in search result (1-20)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Progress Update Method</label>
+                        <select name="setting_use_sse">
+                            <option value="0" <?php echo ($settings['use_sse'] ?? '0') === '0' ? 'selected' : ''; ?>>Polling (Recommended)</option>
+                            <option value="1" <?php echo ($settings['use_sse'] ?? '0') === '1' ? 'selected' : ''; ?>>Server-Sent Events (SSE)</option>
+                        </select>
+                        <small>Polling: Updates every 3 seconds, works everywhere. SSE: Real-time updates, requires modern browser and server support.</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">Save Settings</button>
+                </form>
+            </div>
+            
+            <div class="card">
+                <h2>System Information</h2>
+                <table class="info-table">
+                    <tr>
+                        <th>PHP Version</th>
+                        <td><?php echo PHP_VERSION; ?></td>
+                    </tr>
+                    <tr>
+                        <th>Database</th>
+                        <td>MySQL</td>
+                    </tr>
+                    <tr>
+                        <th>Session ID</th>
+                        <td><?php echo session_id(); ?></td>
+                    </tr>
+                    <tr>
+                        <th>User</th>
+                        <td><?php echo htmlspecialchars($_SESSION['username']); ?></td>
+                    </tr>
+                </table>
+            </div>
+            <?php
+        });
+    }
+    
+    private static function renderWorkers(): void {
+        self::renderLayout('Workers Control', function() {
+            ?>
+            <!-- Worker Statistics Dashboard -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="active-workers">-</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">💤</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="idle-workers">-</div>
+                        <div class="stat-label">Idle Workers</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📋</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="pending-queue">-</div>
+                        <div class="stat-label">Pending in Queue</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚙️</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="processing-queue">-</div>
+                        <div class="stat-label">Processing Now</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">📄</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-pages">-</div>
+                        <div class="stat-label">Pages Processed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📧</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="total-worker-emails">-</div>
+                        <div class="stat-label">Emails Extracted</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚡</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="extraction-rate">-</div>
+                        <div class="stat-label">Emails/Min Rate</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏱️</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="avg-runtime">-</div>
+                        <div class="stat-label">Avg Runtime</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="completed-queue">-</div>
+                        <div class="stat-label">Completed</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="queue-rate">-</div>
+                        <div class="stat-label">Queue Progress</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🕐</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="last-update">-</div>
+                        <div class="stat-label">Last Update</div>
+                    </div>
+                </div>
+                <div class="stat-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
+                    <div class="stat-icon" style="opacity: 0.9;">🚀</div>
+                    <div class="stat-content">
+                        <div class="stat-value" style="color: white;">curl_multi</div>
+                        <div class="stat-label" style="color: rgba(255,255,255,0.9);">Parallel Mode</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- System Resource Monitoring -->
+            <div class="card">
+                <h2>💻 System Resources</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">🧠</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="memory-usage">-</div>
+                            <div class="stat-label">Memory Usage</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="memory-percent">-</div>
+                            <div class="stat-label">Memory %</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">⚡</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="cpu-load">-</div>
+                            <div class="stat-label">CPU Load (1m)</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📈</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="peak-memory">-</div>
+                            <div class="stat-label">Peak Memory</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h2>Active Workers</h2>
+                    <div class="worker-status-indicator">
+                        <span class="status-dot" id="worker-status-dot"></span>
+                        <span id="worker-status-text">Monitoring...</span>
+                    </div>
+                </div>
+                <div id="workers-list">Loading...</div>
+            </div>
+            
+            <div class="card">
+                <h2>🚨 System Alerts & Errors</h2>
+                <div id="worker-errors-list">Loading...</div>
+            </div>
+            
+            <div class="card">
+                <h2>Start New Worker</h2>
+                <p>Workers are spawned automatically when jobs are created. You can also manually start additional workers using this command:</p>
+                <pre class="code-block">php <?php echo __FILE__; ?> worker-name</pre>
+                <p>Example:</p>
+                <pre class="code-block">php <?php echo __FILE__; ?> worker-1</pre>
+                <p style="margin-top: 15px; color: #718096;">
+                    <strong>⚡ Automatic Worker Spawning:</strong>
+                </p>
+                <ul style="color: #718096; padding-left: 20px;">
+                    <li>✅ <strong>Formula:</strong> 50 workers per 1000 emails (20 emails per worker)</li>
+                    <li>✅ <strong>Examples:</strong> 1,000 emails → 50 workers | 10,000 emails → 500 workers | 1,000,000 emails → 1,000 workers (capped)</li>
+                    <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
+                    <li>✅ Workers scale dynamically for maximum parallel performance</li>
+                    <li>✅ <strong>Target:</strong> Process 1,000,000 emails in ≤10 minutes</li>
+                </ul>
+                <p style="margin-top: 15px; color: #718096;">
+                    <strong>Performance Features:</strong>
+                </p>
+                <ul style="color: #718096; padding-left: 20px;">
+                    <li>✅ <strong>curl_multi</strong> for parallel HTTP requests (up to 100 simultaneous)</li>
+                    <li>✅ <strong>Bulk operations</strong> for database inserts and email validation</li>
+                    <li>✅ <strong>In-memory caching</strong> for BloomFilter (10K item cache)</li>
+                    <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
+                    <li>✅ <strong>Real-time ETA</strong> calculation based on processing rate</li>
+                    <li>✅ Automatic performance tracking and error logging</li>
+                </ul>
+            </div>
+            
+            <script>
+                function formatRuntime(seconds) {
+                    if (seconds < 60) return seconds + 's';
+                    if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+                    return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
+                }
+                
+                function updateWorkerErrors() {
+                    fetch('?page=api&action=worker-errors&unresolved_only=1')
+                        .then(res => res.json())
+                        .then(errors => {
+                            const container = document.getElementById('worker-errors-list');
+                            
+                            if (errors.length === 0) {
+                                container.innerHTML = '<p class="empty-state" style="padding: 20px;">✓ No unresolved errors. All systems running smoothly!</p>';
+                                return;
+                            }
+                            
+                            let html = '';
+                            errors.forEach(error => {
+                                const severity = error.severity || 'error';
+                                let icon = '⚠️';
+                                let alertClass = 'alert-error';
+                                
+                                if (severity === 'critical') {
+                                    icon = '🚨';
+                                    alertClass = 'alert-critical';
+                                } else if (severity === 'warning') {
+                                    icon = '⚠️';
+                                    alertClass = 'alert-warning';
+                                }
+                                
+                                html += `
+                                    <div class="alert ${alertClass}" style="margin-bottom: 10px;">
+                                        <div style="display: flex; justify-content: space-between; align-items: start;">
+                                            <div style="flex: 1;">
+                                                <strong>${icon} ${error.error_type || 'Error'}</strong><br>
+                                                ${error.error_message || 'Unknown error'}
+                                                ${error.worker_name ? '<br><small>Worker: ' + error.worker_name + '</small>' : ''}
+                                                ${error.job_query ? '<br><small>Job: ' + error.job_query + '</small>' : ''}
+                                                ${error.created_at ? '<br><small>Time: ' + new Date(error.created_at).toLocaleString() + '</small>' : ''}
+                                                ${error.error_details ? '<br><small style="color: #666;">Details: ' + error.error_details + '</small>' : ''}
+                                            </div>
+                                            <button class="btn btn-sm" onclick="resolveWorkerError(${error.id})" style="margin-left: 10px;">Resolve</button>
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                            
+                            container.innerHTML = html;
+                        })
+                        .catch(err => {
+                            console.error('Error fetching worker errors:', err);
+                        });
+                }
+                
+                function resolveWorkerError(errorId) {
+                    fetch('?page=api&action=resolve-error', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'error_id=' + errorId
+                    })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateWorkerErrors();
+                        }
+                    })
+                    .catch(err => console.error('Error resolving error:', err));
+                }
+                
+                function updateWorkerStats() {
+                    fetch('?page=api&action=worker-stats')
+                        .then(res => res.json())
+                        .then(stats => {
+                            document.getElementById('active-workers').textContent = stats.active_workers;
+                            document.getElementById('idle-workers').textContent = stats.idle_workers;
+                            document.getElementById('total-pages').textContent = stats.total_pages;
+                            document.getElementById('total-worker-emails').textContent = stats.total_emails;
+                            document.getElementById('avg-runtime').textContent = formatRuntime(stats.avg_runtime);
+                            
+                            // Display extraction rate
+                            if (stats.emails_per_minute > 0) {
+                                document.getElementById('extraction-rate').textContent = stats.emails_per_minute;
+                            } else {
+                                document.getElementById('extraction-rate').textContent = '-';
+                            }
+                            
+                            // Update status indicator
+                            const statusDot = document.getElementById('worker-status-dot');
+                            const statusText = document.getElementById('worker-status-text');
+                            
+                            if (stats.active_workers > 0) {
+                                statusDot.style.background = '#48bb78';
+                                statusText.textContent = stats.active_workers + ' worker(s) active';
+                            } else if (stats.idle_workers > 0) {
+                                statusDot.style.background = '#ecc94b';
+                                statusText.textContent = 'Workers idle';
+                            } else {
+                                statusDot.style.background = '#cbd5e0';
+                                statusText.textContent = 'No workers';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching worker stats:', err));
+                    
+                    // Update queue stats
+                    fetch('?page=api&action=queue-stats')
+                        .then(res => res.json())
+                        .then(queue => {
+                            document.getElementById('pending-queue').textContent = queue.pending;
+                            document.getElementById('processing-queue').textContent = queue.processing;
+                            document.getElementById('completed-queue').textContent = queue.completed;
+                            
+                            // Calculate processing rate
+                            const total = queue.pending + queue.processing + queue.completed;
+                            if (total > 0) {
+                                const rate = Math.round((queue.completed / total) * 100) + '%';
+                                document.getElementById('queue-rate').textContent = rate;
+                            } else {
+                                document.getElementById('queue-rate').textContent = '0%';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching queue stats:', err));
+                    
+                    // Update system resources
+                    fetch('?page=api&action=system-resources')
+                        .then(res => res.json())
+                        .then(resources => {
+                            document.getElementById('memory-usage').textContent = resources.memory_used_mb + ' MB';
+                            document.getElementById('memory-percent').textContent = resources.memory_usage_percent + '%';
+                            document.getElementById('peak-memory').textContent = resources.peak_memory_mb + ' MB';
+                            
+                            if (resources.cpu_load_average && resources.cpu_load_average['1min']) {
+                                document.getElementById('cpu-load').textContent = resources.cpu_load_average['1min'];
+                            } else {
+                                document.getElementById('cpu-load').textContent = 'N/A';
+                            }
+                        })
+                        .catch(err => console.error('Error fetching system resources:', err));
+                }
+                
+                function updateWorkers() {
+                    fetch('?page=api&action=workers')
+                        .then(res => res.json())
+                        .then(workers => {
+                            const container = document.getElementById('workers-list');
+                            
+                            if (workers.length === 0) {
+                                container.innerHTML = '<p class="empty-state">No workers registered yet. Start a worker using the command below.</p>';
+                                return;
+                            }
+                            
+                            let html = '<table class="data-table"><thead><tr><th>Worker</th><th>Status</th><th>Current Job</th><th>Pages</th><th>Emails</th><th>Runtime</th><th>Last Heartbeat</th></tr></thead><tbody>';
+                            
+                            workers.forEach(worker => {
+                                const lastHeartbeat = worker.last_heartbeat ? new Date(worker.last_heartbeat).toLocaleString() : 'Never';
+                                const jobInfo = worker.current_job_id ? '<a href="?page=results&job_id=' + worker.current_job_id + '">#' + worker.current_job_id + '</a>' : '-';
+                                const runtime = formatRuntime(worker.runtime_seconds || 0);
+                                
+                                html += `<tr>
+                                    <td><strong>${worker.worker_name}</strong></td>
+                                    <td><span class="status-badge status-${worker.status}">${worker.status}</span></td>
+                                    <td>${jobInfo}</td>
+                                    <td>${worker.pages_processed || 0}</td>
+                                    <td>${worker.emails_extracted || 0}</td>
+                                    <td>${runtime}</td>
+                                    <td>${lastHeartbeat}</td>
+                                </tr>`;
+                            });
+                            
+                            html += '</tbody></table>';
+                            container.innerHTML = html;
+                            
+                            // Update last update time
+                            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                        })
+                        .catch(err => {
+                            console.error('Error fetching workers:', err);
+                        });
+                }
+                
+                // Initial load
+                updateWorkerStats();
+                updateWorkers();
+                updateWorkerErrors();
+                
+                // Update every 3 seconds
+                setInterval(() => {
+                    updateWorkerStats();
+                    updateWorkers();
+                    updateWorkerErrors();
+                }, 3000);
+            </script>
+            <?php
+        });
+    }
+    
+    private static function renderResults(): void {
+        $jobId = (int)($_GET['job_id'] ?? 0);
+        
+        if (!$jobId) {
+            header('Location: ?page=dashboard');
+            exit;
+        }
+        
+        $job = Job::getById($jobId);
+        $results = Job::getResults($jobId);
+        
+        self::renderLayout('Results', function() use ($job, $results, $jobId) {
+            ?>
+            <div class="card">
+                <h2>Job #<?php echo $jobId; ?>: <?php echo htmlspecialchars($job['query']); ?></h2>
+                
+                <div class="job-info">
+                    <span class="status-badge status-<?php echo $job['status']; ?>"><?php echo ucfirst($job['status']); ?></span>
+                    <span>Progress: <?php echo $job['progress']; ?>%</span>
+                    <span>Emails: <?php echo count($results); ?></span>
+                    <?php if ($job['country']): ?>
+                        <span>Country: <?php echo strtoupper($job['country']); ?></span>
+                    <?php endif; ?>
+                    <?php if ($job['email_filter']): ?>
+                        <span>Filter: <?php echo ucfirst($job['email_filter']); ?></span>
+                    <?php endif; ?>
+                </div>
+                
+                <!-- Progress Bar -->
+                <div style="margin: 20px 0;">
+                    <div class="progress-bar" style="height: 30px; border-radius: 5px;">
+                        <div class="progress-fill" style="width: <?php echo $job['progress']; ?>%; height: 100%; background: linear-gradient(90deg, #4CAF50, #8BC34A); border-radius: 5px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
+                            <?php if ($job['progress'] > 0): ?>
+                                <?php echo $job['progress']; ?>%
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                    <small style="color: #666; margin-top: 5px; display: block;">
+                        <?php if ($job['status'] === 'running'): ?>
+                            ⚡ Workers are processing... Check php_errors.log for detailed progress
+                        <?php elseif ($job['status'] === 'completed'): ?>
+                            ✓ Job completed successfully
+                        <?php elseif ($job['status'] === 'pending'): ?>
+                            ⏳ Waiting for workers to start...
+                        <?php endif; ?>
+                    </small>
+                </div>
+                
+                <div class="action-bar">
+                    <a href="?page=export&job_id=<?php echo $jobId; ?>&format=csv" class="btn">Export CSV</a>
+                    <a href="?page=export&job_id=<?php echo $jobId; ?>&format=json" class="btn">Export JSON</a>
+                    <a href="?page=dashboard" class="btn">Back to Dashboard</a>
+                </div>
+            </div>
+            
+            <!-- Worker Searcher Status Section -->
+            <div class="card">
+                <h2>⚙️ Worker Searcher Status</h2>
+                
+                <!-- Alerts Section -->
+                <div id="worker-alerts" style="margin-bottom: 20px;"></div>
+                
+                <div class="stats-grid" style="margin-bottom: 20px;">
+                    <div class="stat-card">
+                        <div class="stat-icon">👥</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-active-workers">-</div>
+                            <div class="stat-label">Active Workers</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📧</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-emails-collected">-</div>
+                            <div class="stat-label">Emails Collected</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">🎯</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-emails-required">-</div>
+                            <div class="stat-label">Emails Required</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="job-completion-percentage">-</div>
+                            <div class="stat-label">Completion %</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Active Workers Details -->
+                <div id="job-workers-details"></div>
+            </div>
+            
+            <div class="card">
+                <h2>Extracted Emails</h2>
+                <?php if (empty($results)): ?>
+                    <p class="empty-state">No emails extracted yet. Workers are processing in the background...</p>
+                <?php else: ?>
+                    <div class="results-list">
+                        <?php foreach ($results as $result): ?>
+                            <div class="result-item">
+                                <h3>📧 <?php echo htmlspecialchars($result['email']); ?></h3>
+                                <p class="result-snippet">
+                                    <strong>Domain:</strong> <?php echo htmlspecialchars($result['domain']); ?>
+                                    <?php if ($result['country']): ?>
+                                        | <strong>Country:</strong> <?php echo strtoupper($result['country']); ?>
+                                    <?php endif; ?>
+                                </p>
+                                <?php if ($result['source_title']): ?>
+                                    <p class="result-snippet"><strong>Source:</strong> <?php echo htmlspecialchars($result['source_title']); ?></p>
+                                <?php endif; ?>
+                                <?php if ($result['source_url']): ?>
+                                    <p class="result-url"><a href="<?php echo htmlspecialchars($result['source_url']); ?>" target="_blank"><?php echo htmlspecialchars($result['source_url']); ?></a></p>
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+            </div>
+            
+            <script>
+                const jobId = <?php echo $jobId; ?>;
+                
+                function updateJobWorkerStatus() {
+                    fetch(`?page=api&action=job-worker-status&job_id=${jobId}`)
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data.error) {
+                                console.error('Error fetching worker status:', data.error);
+                                return;
+                            }
+                            
+                            // Update stats
+                            document.getElementById('job-active-workers').textContent = data.active_workers || 0;
+                            document.getElementById('job-emails-collected').textContent = data.emails_collected || 0;
+                            document.getElementById('job-emails-required').textContent = data.emails_required || 0;
+                            document.getElementById('job-completion-percentage').textContent = data.completion_percentage + '%';
+                            
+                            // Display alerts for errors
+                            const alertsDiv = document.getElementById('worker-alerts');
+                            if (data.recent_errors && data.recent_errors.length > 0) {
+                                let alertsHtml = '';
+                                data.recent_errors.forEach(error => {
+                                    const severity = error.severity || 'error';
+                                    let icon = '⚠️';
+                                    if (severity === 'critical') icon = '🚨';
+                                    else if (severity === 'warning') icon = '⚠️';
+                                    
+                                    alertsHtml += `
+                                        <div class="alert alert-${severity}" style="margin-bottom: 10px;">
+                                            <div style="display: flex; justify-content: space-between; align-items: start;">
+                                                <div>
+                                                    <strong>${icon} ${error.error_type || 'Error'}</strong><br>
+                                                    ${error.error_message || 'Unknown error'}
+                                                    ${error.worker_name ? '<br><small>Worker: ' + error.worker_name + '</small>' : ''}
+                                                    ${error.created_at ? '<br><small>Time: ' + new Date(error.created_at).toLocaleString() + '</small>' : ''}
+                                                </div>
+                                                <button class="btn btn-sm" onclick="resolveError(${error.id})">Resolve</button>
+                                            </div>
+                                        </div>
+                                    `;
+                                });
+                                alertsDiv.innerHTML = alertsHtml;
+                            } else if (data.stale_workers && data.stale_workers.length > 0) {
+                                let alertsHtml = '<div class="alert alert-warning">⚠️ <strong>Stale Workers Detected</strong><br>';
+                                data.stale_workers.forEach(worker => {
+                                    alertsHtml += `Worker "${worker.worker_name}" has not sent heartbeat recently. It may have crashed.<br>`;
+                                });
+                                alertsHtml += '</div>';
+                                alertsDiv.innerHTML = alertsHtml;
+                            } else {
+                                alertsDiv.innerHTML = '';
+                            }
+                            
+                            // Display active workers details
+                            const workersDiv = document.getElementById('job-workers-details');
+                            if (data.workers && data.workers.length > 0) {
+                                let html = '<h3 style="margin: 20px 0 10px 0;">Active Workers</h3>';
+                                html += '<table class="data-table"><thead><tr><th>Worker</th><th>Pages</th><th>Emails</th><th>Last Heartbeat</th></tr></thead><tbody>';
+                                
+                                data.workers.forEach(worker => {
+                                    const lastHeartbeat = worker.last_heartbeat ? new Date(worker.last_heartbeat).toLocaleString() : 'Never';
+                                    html += `<tr>
+                                        <td><strong>${worker.worker_name}</strong></td>
+                                        <td>${worker.pages_processed || 0}</td>
+                                        <td>${worker.emails_extracted || 0}</td>
+                                        <td>${lastHeartbeat}</td>
+                                    </tr>`;
+                                });
+                                
+                                html += '</tbody></table>';
+                                workersDiv.innerHTML = html;
+                            } else {
+                                workersDiv.innerHTML = '<p style="color: #718096; margin-top: 10px;">No active workers currently processing this job.</p>';
+                            }
+                        })
+                        .catch(err => {
+                            console.error('Error fetching job worker status:', err);
+                        });
+                }
+                
+                function resolveError(errorId) {
+                    fetch('?page=api&action=resolve-error', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'error_id=' + errorId
+                    })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateJobWorkerStatus();
+                        }
+                    })
+                    .catch(err => console.error('Error resolving error:', err));
+                }
+                
+                // Initial load
+                updateJobWorkerStatus();
+                
+                // Update every 3 seconds
+                setInterval(updateJobWorkerStatus, 3000);
+                
+                // Auto-refresh results if job is still running
+                <?php if ($job['status'] === 'running' || $job['status'] === 'pending'): ?>
+                setInterval(function() {
+                    location.reload();
+                }, 30000); // Reload every 30 seconds instead of 5
+                <?php endif; ?>
+            </script>
+            <?php
+        });
+    }
+    
+    private static function renderLayout(string $title, callable $content): void {
+        ?>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title><?php echo htmlspecialchars($title); ?> - PHP Email Extraction System</title>
+            <style><?php self::getCSS(); ?></style>
+        </head>
+        <body>
+            <div class="sidebar">
+                <div class="logo">
+                    <h1>📧 Email Scraper</h1>
+                </div>
+                <nav class="nav">
+                    <a href="?page=dashboard" class="nav-item <?php echo ($_GET['page'] ?? 'dashboard') === 'dashboard' ? 'active' : ''; ?>">
+                        📊 Dashboard
+                    </a>
+                    <a href="?page=settings" class="nav-item <?php echo ($_GET['page'] ?? '') === 'settings' ? 'active' : ''; ?>">
+                        🔧 Settings
+                    </a>
+                    <a href="?page=logout" class="nav-item">
+                        🚪 Logout
+                    </a>
+                </nav>
+                <div class="sidebar-footer">
+                    <small>User: <?php echo htmlspecialchars($_SESSION['username']); ?></small>
+                </div>
+            </div>
+            
+            <div class="main-content">
+                <header class="header">
+                    <h1><?php echo htmlspecialchars($title); ?></h1>
+                </header>
+                
+                <div class="content">
+                    <?php $content(); ?>
+                </div>
+            </div>
+        </body>
+        </html>
+        <?php
+    }
+    
+    private static function getCSS(): void {
+        ?>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f7fa;
+            color: #2d3748;
+            line-height: 1.6;
+        }
+        
+        /* Sidebar */
+        .sidebar {
+            position: fixed;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 260px;
+            background: #1a202c;
+            color: white;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .logo {
+            padding: 30px 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .logo h1 {
+            font-size: 24px;
+            font-weight: 700;
+        }
+        
+        .nav {
+            flex: 1;
+            padding: 20px 0;
+        }
+        
+        .nav-item {
+            display: block;
+            padding: 12px 20px;
+            color: #a0aec0;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+        
+        .nav-item:hover {
+            background: rgba(255, 255, 255, 0.05);
+            color: white;
+        }
+        
+        .nav-item.active {
+            background: #3182ce;
+            color: white;
+        }
+        
+        .sidebar-footer {
+            padding: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            color: #a0aec0;
+        }
+        
+        /* Main Content */
+        .main-content {
+            margin-left: 260px;
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: white;
+            padding: 30px 40px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        /* Cards */
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+        
+        .card h2 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: white;
+            border-radius: 8px;
+            padding: 25px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+        
+        .stat-icon {
+            font-size: 36px;
+        }
+        
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #2d3748;
+        }
+        
+        .stat-label {
+            font-size: 14px;
+            color: #718096;
+        }
+        
+        /* Forms */
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 15px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        .form-group small {
+            display: block;
+            margin-top: 5px;
+            color: #718096;
+            font-size: 13px;
+        }
+        
+        .form-section {
+            margin-bottom: 30px;
+        }
+        
+        .form-section h3 {
+            margin-bottom: 15px;
+            color: #2d3748;
+        }
+        
+        /* Buttons */
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            background: #e2e8f0;
+            color: #2d3748;
+            text-decoration: none;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+        
+        .btn:hover {
+            background: #cbd5e0;
+        }
+        
+        .btn-primary {
+            background: #3182ce;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #2c5282;
+        }
+        
+        .btn-danger {
+            background: #e53e3e;
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #c53030;
+        }
+        
+        .btn-large {
+            width: 100%;
+            padding: 15px;
+            font-size: 16px;
+        }
+        
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 13px;
+        }
+        
+        /* Tables */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        .data-table th,
+        .data-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        .data-table th {
+            font-weight: 600;
+            background: #f7fafc;
+            color: #4a5568;
+        }
+        
+        .data-table tr:hover {
+            background: #f7fafc;
+        }
+        
+        .info-table {
+            width: 100%;
+        }
+        
+        .info-table th,
+        .info-table td {
+            padding: 12px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        .info-table th {
+            text-align: left;
+            font-weight: 600;
+            width: 200px;
+        }
+        
+        /* Status Badges */
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-pending {
+            background: #fef5e7;
+            color: #d68910;
+        }
+        
+        .status-running {
+            background: #ebf8ff;
+            color: #2c5282;
+        }
+        
+        .status-completed {
+            background: #f0fff4;
+            color: #22543d;
+        }
+        
+        .status-failed {
+            background: #fff5f5;
+            color: #c53030;
+        }
+        
+        .status-idle {
+            background: #f7fafc;
+            color: #4a5568;
+        }
+        
+        .status-stopped {
+            background: #fff5f5;
+            color: #c53030;
+        }
+        
+        /* Progress Bar */
+        .progress-bar {
+            display: inline-block;
+            width: 100px;
+            height: 8px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            overflow: hidden;
+            vertical-align: middle;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: #3182ce;
+            transition: width 0.3s;
+        }
+        
+        .progress-text {
+            display: inline-block;
+            margin-left: 10px;
+            font-size: 13px;
+            color: #718096;
+        }
+        
+        /* Alerts */
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-error {
+            background: #fff5f5;
+            color: #c53030;
+            border: 1px solid #feb2b2;
+        }
+        
+        .alert-success {
+            background: #f0fff4;
+            color: #22543d;
+            border: 1px solid #9ae6b4;
+        }
+        
+        .alert-warning {
+            background: #fffbeb;
+            color: #b7791f;
+            border: 1px solid #fbd38d;
+        }
+        
+        .alert-critical {
+            background: #fff5f5;
+            color: #c53030;
+            border: 2px solid #e53e3e;
+            font-weight: bold;
+        }
+        
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+        
+        /* Setup & Login Pages */
+        .setup-page,
+        .login-page {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .setup-container,
+        .login-container {
+            width: 100%;
+            max-width: 500px;
+            padding: 20px;
+        }
+        
+        .setup-card,
+        .login-card {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        .setup-card h1,
+        .login-card h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #718096;
+            margin-bottom: 30px;
+        }
+        
+        /* Results */
+        .results-list {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .result-item {
+            padding: 20px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            transition: all 0.3s;
+        }
+        
+        .result-item:hover {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        
+        .result-item h3 {
+            font-size: 18px;
+            margin-bottom: 10px;
+        }
+        
+        .result-item h3 a {
+            color: #3182ce;
+            text-decoration: none;
+        }
+        
+        .result-item h3 a:hover {
+            text-decoration: underline;
+        }
+        
+        .result-snippet {
+            color: #4a5568;
+            margin-bottom: 8px;
+        }
+        
+        .result-url {
+            font-size: 13px;
+            color: #22863a;
+        }
+        
+        /* Job Info */
+        .job-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            margin: 20px 0;
+        }
+        
+        /* Action Bar */
+        .action-bar {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        /* Code Block */
+        .code-block {
+            background: #2d3748;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+        }
+        
+        /* Worker Status Indicator */
+        .worker-status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #48bb78;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        /* Metrics Grid */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        
+        .metric-item {
+            padding: 15px;
+            background: #f7fafc;
+            border-radius: 6px;
+        }
+        
+        .metric-label {
+            font-size: 13px;
+            color: #718096;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #2d3748;
+        }
+        
+        .worker-detail {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f7fafc;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #4a5568;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 0;
+                overflow: hidden;
+            }
+            
+            .main-content {
+                margin-left: 0;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        <?php
+    }
+}
 
-    </body>
-    </html>
+// ============================================================================
+// APPLICATION ENTRY POINT
+// ============================================================================
+
+Router::handleRequest();
