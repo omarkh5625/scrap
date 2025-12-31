@@ -261,9 +261,10 @@ if (PHP_SAPI === 'cli' && isset($argv) && count($argv) > 1) {
 // Handle test_connection API endpoint early to avoid session/auth overhead
 // This must run before session_start() to prevent any output buffering issues
 if (isset($_GET['action']) && $_GET['action'] === 'test_connection') {
-    // Completely suppress all output/errors before JSON
+    // Suppress display of errors but keep logging enabled
     @ini_set('display_errors', 0);
-    @error_reporting(0);
+    @ini_set('log_errors', 1);  // Keep logging enabled for debugging
+    // Don't suppress error_reporting completely - still log errors
     
     // Clear ALL output buffers that might exist
     while (ob_get_level()) @ob_end_clean();
