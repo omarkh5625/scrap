@@ -1,0 +1,22 @@
+# Database configuration (contains sensitive credentials)
+config.php
+
+# Installation lock file
+.installed
+
+# Temporary data directory
+/tmp/
+
+# Log files
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

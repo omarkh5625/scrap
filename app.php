@@ -2721,6 +2721,37 @@ class Application {
         .pulse {
             animation: pulse 2s infinite;
         }
+        
+        .db-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px;
+            background: #f6f8fa;
+            border-radius: 6px;
+            margin-top: 15px;
+            font-size: 12px;
+        }
+        
+        .db-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        
+        .db-indicator.connected {
+            background: #28a745;
+            box-shadow: 0 0 8px rgba(40, 167, 69, 0.6);
+        }
+        
+        .db-indicator.disconnected {
+            background: #dc3545;
+        }
+        
+        .db-status-text {
+            flex: 1;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -2728,6 +2759,20 @@ class Application {
         <div class="sidebar">
             <h1>📧 Email Extractor</h1>
             <div class="version">Version <?php echo Config::VERSION; ?></div>
+            
+            <?php 
+            $db = Database::getInstance();
+            $dbConfigured = $db->isConfigured();
+            ?>
+            
+            <?php if (!$dbConfigured): ?>
+                <div style="background: #fff3cd; border: 1px solid #ffc107; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px;">
+                    <strong>⚠️ Database Not Configured</strong><br>
+                    <p style="margin-top: 8px; color: #856404;">
+                        Please run <a href="install.php" style="color: #0066ff; text-decoration: underline;">install.php</a> to set up MySQL database for persistent email storage.
+                    </p>
+                </div>
+            <?php endif; ?>
             
             <div class="sidebar-section">
                 <h3>System Stats</h3>
@@ -2747,6 +2792,16 @@ class Application {
                     <div class="stats-item">
                         <span class="stats-label">Memory</span>
                         <span class="stats-value" id="stat-memory">0 MB</span>
+                    </div>
+                </div>
+                <div class="db-status">
+                    <div class="db-indicator <?php echo $dbConfigured ? 'connected' : 'disconnected'; ?>"></div>
+                    <div class="db-status-text">
+                        <?php if ($dbConfigured): ?>
+                            <strong>Database:</strong> MySQL Connected
+                        <?php else: ?>
+                            <strong>Database:</strong> File Storage (Temporary)
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>
@@ -3137,6 +3192,23 @@ class Application {
             }
         };
         
+        // API Key persistence
+        const apiKeyInput = document.getElementById('apiKey');
+        
+        // Load saved API key from localStorage
+        const savedApiKey = localStorage.getItem('serper_api_key');
+        if (savedApiKey) {
+            apiKeyInput.value = savedApiKey;
+        }
+        
+        // Save API key to localStorage when it changes
+        apiKeyInput.addEventListener('change', () => {
+            const apiKey = apiKeyInput.value.trim();
+            if (apiKey) {
+                localStorage.setItem('serper_api_key', apiKey);
+            }
+        });
+        
         // Initialize
         // Test Connection Button
         document.getElementById('testConnectionBtn').addEventListener('click', async () => {
@@ -3145,6 +3217,9 @@ class Application {
                 UI.showAlert('Please enter an API key first', 'error');
                 return;
             }
+            
+            // Save API key when testing
+            localStorage.setItem('serper_api_key', apiKey);
             
             const btn = document.getElementById('testConnectionBtn');
             const status = document.getElementById('connectionStatus');
@@ -3181,9 +3256,16 @@ class Application {
         document.getElementById('createJobForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
+            const apiKey = document.getElementById('apiKey').value;
+            
+            // Save API key to localStorage
+            if (apiKey) {
+                localStorage.setItem('serper_api_key', apiKey);
+            }
+            
             const formData = {
                 name: document.getElementById('jobName').value,
-                api_key: document.getElementById('apiKey').value,
+                api_key: apiKey,
                 query: document.getElementById('query').value,
                 keywords: document.getElementById('keywords').value,
                 country: document.getElementById('country').value,
