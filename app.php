@@ -987,8 +987,12 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $maxAttempts = $workers * 5; // Allow multiple rounds per worker
         $pageOffset = 0;
         
+        error_log("PARALLEL_EXTRACTION: Loop variables - extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}");
+        error_log("PARALLEL_EXTRACTION: While condition check: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")");
+        
         // Parallel extraction loop - all workers work simultaneously
         while ($extractedCount < $targetCount && $attempts < $maxAttempts) {
+            error_log("PARALLEL_EXTRACTION: ===== ROUND {$attempts} START =====");
             $workerResults = [];
             
             // Spawn all workers in parallel using curl_multi
