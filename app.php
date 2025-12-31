@@ -2055,15 +2055,20 @@ class Application {
                 $page = min($page, $totalPages);
                 $offset = ($page - 1) * $perPage;
                 
-                // Get paginated emails
-                $stmt = $db->query(
+                // Get paginated emails with properly bound parameters
+                $pdo = $db->getConnection();
+                $stmt = $pdo->prepare(
                     "SELECT email, quality, confidence, source_url, UNIX_TIMESTAMP(created_at) as timestamp, worker_id 
                      FROM emails 
                      WHERE job_id = :job_id 
                      ORDER BY created_at DESC 
-                     LIMIT :limit OFFSET :offset",
-                    [':job_id' => $jobId, ':limit' => $perPage, ':offset' => $offset]
+                     LIMIT :limit OFFSET :offset"
                 );
+                $stmt->bindValue(':job_id', $jobId, PDO::PARAM_STR);
+                $stmt->bindValue(':limit', (int)$perPage, PDO::PARAM_INT);
+                $stmt->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
+                $stmt->execute();
+                
                 $emailsPage = array_map(function($row) {
                     return [
                         'email' => $row['email'],
