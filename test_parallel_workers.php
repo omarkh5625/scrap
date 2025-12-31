@@ -25,7 +25,12 @@ echo "  - Log file: {$logFile}\n\n";
 // Create test worker script that logs start and end times
 $workerScript = __DIR__ . '/test_worker_script.php';
 file_put_contents($workerScript, '<?php
+// Input validation: ensure worker ID is alphanumeric
 $workerId = $argv[1] ?? "unknown";
+if (!preg_match("/^[a-zA-Z0-9_-]+$/", $workerId)) {
+    exit(1); // Exit silently if invalid worker ID
+}
+
 $logFile = __DIR__ . "/test_parallel_workers.log";
 
 // Log start time

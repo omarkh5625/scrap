@@ -2144,7 +2144,9 @@ class Router {
         error_log("  Worker ID: {$workerId}");
         error_log("  Polling for queue items...");
         
-        // Get polling interval from settings or use default 2 seconds (faster)
+        // Get polling interval from settings or use default 2 seconds
+        // Reduced from 5 to 2 seconds for faster queue processing and better responsiveness
+        // Can be adjusted via settings if database load becomes an issue
         $pollingInterval = (int)(Settings::get('worker_polling_interval', '2'));
         
         $itemsProcessed = 0;
@@ -4312,7 +4314,7 @@ class Router {
         // Spawn ALL workers simultaneously
         for ($i = 0; $i < $workerCount; $i++) {
             try {
-                $workerName = 'parallel-worker-j' . ($jobId ?? 'any') . '-' . time() . '-' . $i;
+                $workerName = 'parallel-worker-j' . ($jobId ?? 'any') . '-' . uniqid() . '-' . $i;
                 
                 // Build command arguments for worker in CLI mode
                 $args = [$phpBinary, $scriptPath, $workerName];
@@ -4361,8 +4363,9 @@ class Router {
         error_log("✓✓✓ Workers are now running in PARALLEL as independent processes");
         
         // Give workers a moment to initialize then close process handles
+        // This small delay ensures workers have time to detach from parent process
         // (workers continue running independently even after handles are closed)
-        usleep(100000); // 0.1 seconds
+        usleep(100000); // 0.1 seconds - allows process initialization
         
         foreach ($processes as $proc) {
             // Don't wait for process to finish - just close the handle
