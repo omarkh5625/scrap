@@ -1520,23 +1520,25 @@ class Worker {
     public static function getNextJob(?int $jobId = null): ?array {
         $db = Database::connect();
         
-        // Use transaction to prevent race conditions
+        // OPTIMIZATION: Use short-lived transaction to minimize lock time for parallel workers
+        // Transaction ensures atomic claim of queue item by worker
         $db->beginTransaction();
         
         try {
             // First check job_queue for pending chunks
             // If jobId is specified, only get queue items for that specific job
+            // SKIP LOCKED ensures parallel workers don't wait for each other
             if ($jobId !== null) {
-                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' AND job_id = ? ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute([$jobId]);
             } else {
-                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM job_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute();
             }
             $queueItem = $stmt->fetch();
             
             if ($queueItem) {
-                // Mark this queue item as processing
+                // Mark this queue item as processing IMMEDIATELY to release lock
                 $stmt = $db->prepare("UPDATE job_queue SET status = 'processing', started_at = NOW() WHERE id = ?");
                 $stmt->execute([$queueItem['id']]);
                 
@@ -1552,6 +1554,7 @@ class Worker {
                     $job['queue_max_results'] = $queueItem['max_results'];
                 }
                 
+                // COMMIT FAST - other workers can immediately grab next item
                 $db->commit();
                 return $job ?: null;
             }
@@ -1559,10 +1562,10 @@ class Worker {
             // Fallback to old method: check for pending jobs without queue
             // If jobId is specified, only check that specific job
             if ($jobId !== null) {
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' AND id = ? LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute([$jobId]);
             } else {
-                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+                $stmt = $db->prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
                 $stmt->execute();
             }
             $job = $stmt->fetch();
@@ -1760,6 +1763,11 @@ class Worker {
     }
     
     public static function processJob(int $jobId, ?int $existingWorkerId = null, ?string $existingWorkerName = null): void {
+        $workerStartTime = microtime(true);
+        $processId = getmypid();
+        $timestamp = date('H:i:s') . '.' . sprintf('%03d', (int)(fmod(microtime(true), 1) * 1000));
+        error_log("✓ Worker processJob STARTED in parallel: jobId={$jobId}, PID={$processId} at {$timestamp}");
+        
         $job = Job::getById($jobId);
         if (!$job) {
             return;
@@ -1835,7 +1843,10 @@ class Worker {
         // Update overall job progress
         self::updateJobProgress($jobId);
         
-        echo "Job chunk completed! Processed {$processed} emails\n";
+        $elapsedTime = round(microtime(true) - $workerStartTime, 2);
+        // Use realistic minimum for rate calculation (1 second minimum for email processing)
+        echo "Job chunk completed! Processed {$processed} emails in {$elapsedTime}s\n";
+        error_log("✓ Worker processJob COMPLETED in parallel: jobId={$jobId}, PID={$processId}, emails={$processed}, time={$elapsedTime}s, rate=" . round($processed / max($elapsedTime, 1.0), 1) . " emails/s");
         
         // Mark worker as idle
         self::updateHeartbeat($workerId, 'idle', null, 0, 0);
@@ -1919,7 +1930,9 @@ class Worker {
     }
     
     public static function processJobImmediately(int $jobId, int $startOffset = 0, int $maxResults = 100): void {
-        error_log("processJobImmediately called: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults}");
+        $workerStartTime = microtime(true);
+        $timestamp = date('H:i:s') . '.' . sprintf('%03d', (int)(fmod(microtime(true), 1) * 1000));
+        error_log("✓ processJobImmediately STARTED in parallel: jobId={$jobId}, startOffset={$startOffset}, maxResults={$maxResults} at {$timestamp}");
         
         try {
             $job = Job::getById($jobId);
@@ -2133,6 +2146,7 @@ class Router {
         }
         
         // Regular worker mode (polls for jobs)
+        $workerStartTime = microtime(true);
         echo "=== PHP Email Extraction System Worker ===\n";
         
         $workerName = $argv[1] ?? 'worker-' . uniqid();
@@ -2140,6 +2154,8 @@ class Router {
         $jobId = isset($argv[2]) && is_numeric($argv[2]) ? (int)$argv[2] : null;
         
         echo "Worker: {$workerName}\n";
+        echo "Started at: " . date('Y-m-d H:i:s') . "\n";
+        echo "Process ID: " . getmypid() . "\n";
         if ($jobId !== null) {
             echo "Dedicated to Job ID: {$jobId}\n";
         }
@@ -2148,29 +2164,93 @@ class Router {
         echo "Worker ID: {$workerId}\n";
         echo "Waiting for jobs...\n\n";
         
-        // Get polling interval from settings or use default 5 seconds
-        $pollingInterval = (int)(Settings::get('worker_polling_interval', '5'));
+        // OPTIMIZATION: Use much shorter polling interval for near-instant job pickup
+        // Changed from 5 seconds to 0.1 seconds for maximum parallel performance
+        // Can be configured via settings for fine-tuning based on system load
+        $pollingIntervalSetting = Settings::get('worker_polling_interval', '0.1');
         
+        // Define minimum allowed polling interval as constant
+        $minPollingInterval = 0.05; // 50ms minimum to prevent excessive CPU usage
+        
+        // Validate and parse polling interval with safety bounds
+        if (!is_numeric($pollingIntervalSetting)) {
+            error_log("Warning: Invalid worker_polling_interval '{$pollingIntervalSetting}', using default 0.1s");
+            $pollingInterval = 0.1;
+        } else {
+            $pollingInterval = (float)$pollingIntervalSetting;
+            // Enforce reasonable bounds to prevent misconfiguration
+            if ($pollingInterval < $minPollingInterval) {
+                error_log("Warning: Polling interval {$pollingInterval}s too low, using minimum {$minPollingInterval}s");
+                $pollingInterval = $minPollingInterval;
+            }
+            if ($pollingInterval > 5.0) {
+                error_log("Warning: Polling interval {$pollingInterval}s too high, using maximum 5.0s");
+                $pollingInterval = 5.0; // Maximum 5s (old behavior)
+            }
+        }
+        
+        // Track consecutive empty polls to implement adaptive backoff
+        $emptyPollCount = 0;
+        $maxEmptyPolls = 50; // After 50 empty polls (5 seconds), increase interval
+        $maxIdleTime = 300; // Exit after 5 minutes of no work (300 seconds)
+        $jobsProcessed = 0;
+        
+        // NO INITIAL SLEEP - start checking for work immediately for parallel execution
         while (true) {
             Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+            
+            // Check if worker has been idle too long (safety exit)
+            $elapsedTime = microtime(true) - $workerStartTime;
+            // Calculate based on actual polling interval (converts to integer checks)
+            // Cap at reasonable maximum to prevent excessive idle time
+            // Protection against division by zero (should not happen due to validation)
+            $maxIdleChecks = $pollingInterval > 0 
+                ? min((int)($maxIdleTime / $pollingInterval), 10000) 
+                : 10000; // Fallback if polling interval is invalid
+            if ($emptyPollCount > $maxIdleChecks && $jobsProcessed === 0) {
+                echo "Worker idle timeout ({$maxIdleTime}s) - no jobs found. Exiting.\n";
+                error_log("Worker {$workerName} exiting due to idle timeout after " . round($elapsedTime, 1) . "s");
+                break;
+            }
             
             // Pass job_id to only get queue items for that specific job
             $job = Worker::getNextJob($jobId);
             
             if ($job) {
+                // Reset empty poll counter when work is found
+                $emptyPollCount = 0;
+                
                 Worker::updateHeartbeat($workerId, 'running', $job['id'], 0, 0);
+                error_log("✓ Worker {$workerName} (PID " . getmypid() . ") starting job #{$job['id']} in PARALLEL mode at " . date('H:i:s'));
                 Worker::processJob($job['id']);
                 Worker::updateHeartbeat($workerId, 'idle', null, 0, 0);
+                $jobsProcessed++;
+                error_log("✓ Worker {$workerName} completed job #{$job['id']} (total: {$jobsProcessed} jobs)");
             } else if ($jobId !== null) {
                 // If dedicated to a specific job and no work found, check if job is complete
                 $jobDetails = Job::getById($jobId);
                 if (!$jobDetails || in_array($jobDetails['status'], ['completed', 'failed'])) {
-                    echo "Job {$jobId} is complete or not found. Exiting.\n";
+                    $totalTime = round(microtime(true) - $workerStartTime, 2);
+                    echo "Job {$jobId} is complete or not found. Exiting after {$totalTime}s ({$jobsProcessed} jobs processed).\n";
+                    error_log("Worker {$workerName} exiting - job complete. Processed {$jobsProcessed} jobs in {$totalTime}s");
                     break;
                 }
+                $emptyPollCount++;
+            } else {
+                $emptyPollCount++;
             }
             
-            sleep($pollingInterval);
+            // Adaptive polling: use short interval when active, longer when idle
+            if ($emptyPollCount > $maxEmptyPolls) {
+                // After extended idle time, use 1 second interval to save CPU
+                usleep(1000000); // 1 second
+            } else {
+                // Active processing: use configured polling interval for near-instant parallel pickup
+                // Convert to microseconds with minimum of 1000 (1ms) to ensure actual sleep
+                // Use round() to preserve precision for fractional intervals
+                $sleepMicros = max(1000, (int)round($pollingInterval * 1000000));
+                usleep($sleepMicros);
+            }
         }
     }
     
@@ -4049,10 +4129,14 @@ class Router {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
-        error_log("spawnWorkersViaProcOpen: Spawning {$workerCount} workers using proc_open()" . ($jobId ? " for job {$jobId}" : ""));
+        $startTime = microtime(true);
+        error_log("spawnWorkersViaProcOpen: Starting PARALLEL spawn of {$workerCount} workers" . ($jobId ? " for job {$jobId}" : ""));
         
         $spawnedCount = 0;
         
+        // OPTIMIZATION: Spawn all workers as fast as possible for true parallel execution
+        // No delays between spawns - let OS handle scheduling
+        // Note: We don't store process handles - proc_open spawns detached processes
         for ($i = 0; $i < $workerCount; $i++) {
             try {
                 // Build command to run worker in queue mode
@@ -4090,10 +4174,16 @@ class Router {
                         fclose($pipes[0]);
                     }
                     
-                    // Don't call proc_close - let it run in background
-                    // The process will continue running even after parent terminates
+                    // Don't call proc_close - this allows the process to run in background
+                    // The process is now detached and will continue independently
+                    // No need to store handle - it will be garbage collected without blocking
+                    
                     $spawnedCount++;
-                    error_log("spawnWorkersViaProcOpen: Spawned worker {$spawnedCount}/{$workerCount}: {$workerName}");
+                    
+                    // Log every 100 workers to avoid log spam
+                    if ($spawnedCount % 100 === 0 || $spawnedCount === $workerCount) {
+                        error_log("spawnWorkersViaProcOpen: Spawned {$spawnedCount}/{$workerCount} workers in parallel");
+                    }
                 } else {
                     error_log("spawnWorkersViaProcOpen: Failed to spawn worker {$i}: {$workerName}");
                 }
@@ -4102,7 +4192,14 @@ class Router {
             }
         }
         
-        error_log("spawnWorkersViaProcOpen: Completed spawning {$spawnedCount}/{$workerCount} workers");
+        $elapsedTime = round(microtime(true) - $startTime, 3);
+        // Use realistic minimum for rate calculation (100ms minimum - spawning 10+ workers takes time)
+        $workersPerSecond = $spawnedCount > 0 ? round($spawnedCount / max($elapsedTime, 0.1), 1) : 0;
+        
+        error_log("spawnWorkersViaProcOpen: ✓ Successfully spawned {$spawnedCount}/{$workerCount} workers in {$elapsedTime}s ({$workersPerSecond} workers/sec) - ALL RUNNING IN PARALLEL");
+        
+        // All workers are now running independently in the background
+        // They will start processing queue items immediately with configurable polling
         return $spawnedCount;
     }
     
@@ -5055,6 +5152,8 @@ class Router {
                     <li>✅ No manual configuration needed - just click "🚀 Start Extraction"</li>
                     <li>✅ Workers scale dynamically for maximum parallel performance</li>
                     <li>✅ <strong>Target:</strong> Process 1,000,000 emails in ≤10 minutes</li>
+                    <li>✅ <strong>NEW: Instant Job Pickup</strong> - Workers poll every 100ms (vs 5s)</li>
+                    <li>✅ <strong>NEW: True Parallel Execution</strong> - All workers start simultaneously</li>
                 </ul>
                 <p style="margin-top: 15px; color: #718096;">
                     <strong>Performance Features:</strong>
@@ -5066,6 +5165,8 @@ class Router {
                     <li>✅ <strong>HTTP keep-alive</strong> and connection reuse</li>
                     <li>✅ <strong>Real-time ETA</strong> calculation based on processing rate</li>
                     <li>✅ Automatic performance tracking and error logging</li>
+                    <li>✅ <strong>NEW: 0.1s polling interval</strong> for near-instant queue processing</li>
+                    <li>✅ <strong>NEW: Adaptive backoff</strong> - reduces CPU when idle</li>
                 </ul>
             </div>
             
