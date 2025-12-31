@@ -719,11 +719,12 @@ class JobManager {
             if ($result) {
                 $this->dedupEngine->markEmailSeen($jobId, $email);
                 
-                $this->db->exec("
+                $stmt = $this->db->prepare("
                     UPDATE jobs 
                     SET total_emails = total_emails + 1 
-                    WHERE id = $jobId
+                    WHERE id = ?
                 ");
+                $stmt->execute([$jobId]);
             }
             
             return $result;
@@ -748,11 +749,12 @@ class JobManager {
             if ($result) {
                 $this->dedupEngine->markUrlProcessed($jobId, $url);
                 
-                $this->db->exec("
+                $stmt = $this->db->prepare("
                     UPDATE jobs 
                     SET total_urls_processed = total_urls_processed + 1 
-                    WHERE id = $jobId
+                    WHERE id = ?
                 ");
+                $stmt->execute([$jobId]);
             }
             
             return $result;
