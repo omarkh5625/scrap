@@ -1071,8 +1071,8 @@ class JobManager {
         foreach ($files as $file) {
             $data = json_decode(file_get_contents($file), true);
             if ($data && isset($data['id'])) {
-                // Don't auto-start jobs on load
-                $data['status'] = ($data['status'] === 'running') ? 'stopped' : $data['status'];
+                // Keep jobs in their saved state, but clear worker governor
+                // Worker governor will be recreated on next start/check
                 $data['worker_governor'] = null;
                 $this->jobs[$data['id']] = $data;
             }
@@ -1348,6 +1348,9 @@ class Application {
             $this->runCron();
             return;
         }
+        
+        // Run background tasks before rendering UI
+        $this->runBackgroundTasks();
         
         // Render UI
         $this->renderUI();
