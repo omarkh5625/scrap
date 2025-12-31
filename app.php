@@ -961,7 +961,7 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $searchQuery = $profile['search_query'] ?? '';
         $country = $profile['country'] ?? '';
         $businessOnly = !empty($profile['filter_business_only']);
-        $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)($profile['target_count'] ?? 100);
+        $targetCount = (int)($profile['target_count'] ?? 100);  // Always use profile's target
         $workers = max(1, (int)($profile['workers'] ?? 4));
         
         error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}'");
@@ -2677,12 +2677,19 @@ function get_job_stats(PDO $pdo, int $id) {
 
     try {
         // Get job details from jobs table
-        $stmt = $pdo->prepare("SELECT target_count, progress_extracted, progress_total FROM jobs WHERE id = ? LIMIT 1");
+        // Get job and profile info to get target from profile
+        $stmt = $pdo->prepare("
+            SELECT j.progress_extracted, j.progress_total, j.profile_id, p.target_count
+            FROM jobs j
+            LEFT JOIN job_profiles p ON j.profile_id = p.id
+            WHERE j.id = ? 
+            LIMIT 1
+        ");
         $stmt->execute([$id]);
         $job = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if ($job) {
-            $stats['target'] = (int)($job['target_count'] ?? 0);
+            $stats['target'] = (int)($job['target_count'] ?? 0);  // From profile
             $stats['progress_extracted'] = (int)($job['progress_extracted'] ?? 0);
             $stats['progress_total'] = (int)($job['progress_total'] ?? 0);
         }
@@ -4999,32 +5006,21 @@ if ($action === 'save_job' || $action === 'save_campaign') {
     $id        = (int)($_POST['id'] ?? 0);
     $name      = trim($_POST['name'] ?? '');
     $profile_id = (int)($_POST['profile_id'] ?? 0);
-    $target_count = (int)($_POST['target_count'] ?? 0);
     $start_immediately = isset($_POST['start_immediately']) && $_POST['start_immediately'];
     
-    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, target_count={$target_count}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
+    error_log("SAVE_JOB ACTION: id={$id}, name='{$name}', profile_id={$profile_id}, start_immediately=" . ($start_immediately ? 'YES' : 'NO'));
 
     try {
-        if ($target_count > 0) {
-            $stmt = $pdo->prepare("
-                UPDATE jobs
-                SET name = ?, profile_id = ?, target_count = ?
-                WHERE id = ?
-            ");
-            $stmt->execute([$name, $profile_id, $target_count, $id]);
-            error_log("SAVE_JOB ACTION: Job {$id} updated with target_count");
-        } else {
-            $stmt = $pdo->prepare("
-                UPDATE jobs
-                SET name = ?, profile_id = ?
-                WHERE id = ?
-            ");
-            $stmt->execute([$name, $profile_id, $id]);
-            error_log("SAVE_JOB ACTION: Job {$id} updated without target_count");
-        }
+        $stmt = $pdo->prepare("
+            UPDATE jobs
+            SET name = ?, profile_id = ?
+            WHERE id = ?
+        ");
+        $stmt->execute([$name, $profile_id, $id]);
+        error_log("SAVE_JOB ACTION: Job {$id} updated");
         
         // Verify save was successful
-        $verify = $pdo->prepare("SELECT id, name, profile_id, target_count, status FROM jobs WHERE id = ?");
+        $verify = $pdo->prepare("SELECT id, name, profile_id, status FROM jobs WHERE id = ?");
         $verify->execute([$id]);
         $saved_job = $verify->fetch(PDO::FETCH_ASSOC);
         error_log("SAVE_JOB ACTION: Verified job after save: " . json_encode($saved_job));
@@ -5118,8 +5114,8 @@ if ($action === 'start_job') {
                 error_log("START_JOB ACTION: Profile fetched: " . ($profile ? "YES (id=" . $profile['id'] . ")" : "NO"));
                 
                 if ($profile) {
-                    // Use target from job or profile
-                    $targetCount = !empty($job['target_count']) ? (int)$job['target_count'] : (int)$profile['target_count'];
+                    // Use target from profile only
+                    $targetCount = (int)$profile['target_count'];
                     
                     // Update job status to extracting immediately (like old "sending" status)
                     $stmt = $pdo->prepare("UPDATE jobs SET status = 'extracting', progress_status = 'extracting', progress_total = ?, started_at = NOW() WHERE id = ?");
@@ -7568,14 +7564,6 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
                 <div style="font-weight: 600; margin-bottom: 8px;">Profile Details:</div>
                 <div id="profileQuery" style="color: var(--sg-muted);"></div>
                 <div id="profileTarget" style="color: var(--sg-muted); margin-top: 4px;"></div>
-              </div>
-
-              <div class="form-group">
-                <label>Target Emails to Extract</label>
-                <input type="number" name="target_count" min="1" max="10000" 
-                  value="<?php echo (int)($job['target_count'] ?? 0); ?>" 
-                  placeholder="Leave empty to use profile default">
-                <small class="hint">How many emails to extract for this job. This does NOT affect worker count - workers are configured in the profile.</small>
               </div>
 
               <div class="checkbox-row">
