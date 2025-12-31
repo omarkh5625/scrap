@@ -149,14 +149,26 @@ if (strpos($phpBinary, 'php-fpm') !== false || strpos($phpBinary, 'fpm') !== fal
     
     foreach ($possiblePaths as $path) {
         if (file_exists($path) && is_executable($path)) {
-            // Test if it's actually a CLI binary
-            $output = [];
-            $return = 0;
-            @exec($path . ' -v 2>&1', $output, $return);
-            if ($return === 0 && !empty($output)) {
-                $phpBinary = $path;
-                echo "  ✓ Found CLI PHP binary: {$phpBinary}\n";
-                break;
+            // Test if it's actually a CLI binary using proc_open (works even if exec is disabled)
+            $nullDevice = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN' ? 'NUL' : '/dev/null';
+            $descriptors = [
+                0 => ['pipe', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['file', $nullDevice, 'w']
+            ];
+            
+            $process = @proc_open([$path, '-v'], $descriptors, $pipes);
+            if (is_resource($process)) {
+                fclose($pipes[0]);
+                $output = stream_get_contents($pipes[1]);
+                fclose($pipes[1]);
+                $return = proc_close($process);
+                
+                if ($return === 0 && !empty($output) && stripos($output, 'PHP') !== false) {
+                    $phpBinary = $path;
+                    echo "  ✓ Found CLI PHP binary: {$phpBinary}\n";
+                    break;
+                }
             }
         }
     }
