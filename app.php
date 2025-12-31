@@ -152,9 +152,13 @@ class Database {
                 $attempt++;
                 $lastError = $e;
                 
-                // Check if it's a "Too many connections" error (error code 1040)
-                $isTooManyConnections = strpos($e->getMessage(), '1040') !== false || 
-                                       strpos($e->getMessage(), 'Too many connections') !== false;
+                // Check if it's a "Too many connections" error (SQLSTATE HY000, error code 1040)
+                // Use more robust error checking via SQLSTATE and error code
+                $errorInfo = $e->errorInfo ?? [];
+                $sqlState = $errorInfo[0] ?? '';
+                $errorCode = $errorInfo[1] ?? 0;
+                $isTooManyConnections = ($errorCode === 1040) || 
+                                       ($sqlState === 'HY000' && strpos($e->getMessage(), 'Too many connections') !== false);
                 
                 if ($attempt < self::MAX_RETRY_ATTEMPTS) {
                     // Calculate exponential backoff delay
@@ -164,7 +168,13 @@ class Database {
                     );
                     
                     // Add jitter to prevent thundering herd
-                    $jitter = rand(0, (int)($delay * 0.3));
+                    // Use random_int for better randomness distribution
+                    try {
+                        $jitter = random_int(0, (int)($delay * 0.3));
+                    } catch (Exception $randException) {
+                        // Fallback to rand if random_int fails
+                        $jitter = rand(0, (int)($delay * 0.3));
+                    }
                     $delay += $jitter;
                     
                     error_log("⚠️ Database connection failed (attempt {$attempt}/{" . self::MAX_RETRY_ATTEMPTS . "}): " . 
@@ -178,9 +188,14 @@ class Database {
             }
         }
         
-        // All retries exhausted
-        die('Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts: ' . 
-            ($lastError ? $lastError->getMessage() : 'Unknown error'));
+        // All retries exhausted - throw exception instead of die()
+        $errorMessage = 'Database connection failed after ' . self::MAX_RETRY_ATTEMPTS . ' attempts';
+        if ($lastError) {
+            $errorMessage .= ': ' . $lastError->getMessage();
+            throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+        } else {
+            throw new PDOException($errorMessage . ': Unknown error');
+        }
     }
     
     /**
@@ -196,28 +211,40 @@ class Database {
     
     /**
      * Execute a query with automatic retry on connection failure
+     * 
+     * @param callable $operation Function that takes PDO connection and returns result
+     * @param int $maxAttempts Maximum number of retry attempts
+     * @return mixed Result from the operation
+     * @throws PDOException If all retries are exhausted
      */
     public static function executeWithRetry(callable $operation, int $maxAttempts = 3) {
         $attempt = 0;
+        $lastError = null;
         
         while ($attempt < $maxAttempts) {
             try {
                 return $operation(self::connect());
             } catch (PDOException $e) {
                 $attempt++;
+                $lastError = $e;
                 
-                // Check if it's a connection-related error
-                $isConnectionError = strpos($e->getMessage(), 'MySQL server has gone away') !== false ||
-                                    strpos($e->getMessage(), 'Lost connection') !== false ||
-                                    strpos($e->getMessage(), '1040') !== false;
+                // Check if it's a connection-related error using more robust checking
+                $errorInfo = $e->errorInfo ?? [];
+                $errorCode = $errorInfo[1] ?? 0;
+                $isConnectionError = ($errorCode === 2006) || // MySQL server has gone away
+                                    ($errorCode === 2013) || // Lost connection during query
+                                    ($errorCode === 1040) || // Too many connections
+                                    strpos($e->getMessage(), 'MySQL server has gone away') !== false ||
+                                    strpos($e->getMessage(), 'Lost connection') !== false;
                 
                 if ($isConnectionError && $attempt < $maxAttempts) {
-                    error_log("⚠️ Query failed due to connection issue (attempt {$attempt}/{$maxAttempts}), retrying...");
+                    error_log("⚠️ Query failed due to connection issue (attempt {$attempt}/{$maxAttempts}): " . 
+                             $e->getMessage());
                     
                     // Force reconnection
                     self::$pdo = null;
                     
-                    // Wait before retry
+                    // Wait before retry with increasing delay
                     usleep(100000 * $attempt); // 100ms, 200ms, 300ms
                 } else {
                     throw $e;
@@ -225,7 +252,14 @@ class Database {
             }
         }
         
-        throw new PDOException("Operation failed after {$maxAttempts} attempts");
+        // Provide detailed error message with context
+        $errorMessage = "Operation failed after {$maxAttempts} attempts";
+        if ($lastError) {
+            $errorMessage .= ": " . $lastError->getMessage();
+            throw new PDOException($errorMessage, (int)$lastError->getCode(), $lastError);
+        } else {
+            throw new PDOException($errorMessage . ": Unknown error");
+        }
     }
     
     private static function runMigrations(): void {
