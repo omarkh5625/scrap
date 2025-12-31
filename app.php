@@ -128,6 +128,13 @@ define('DEFAULT_CYCLE_DELAY_MS', 0);
 define('MIN_CYCLE_DELAY_MS', 0);
 define('MAX_CYCLE_DELAY_MS', 10000); // Max 10 seconds
 
+// Free email providers list for business_only filtering mode
+// These domains are excluded when "Business Only" filter is enabled
+define('FREE_EMAIL_PROVIDERS', [
+    'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 
+    'icloud.com', 'att.net', 'live.com', 'msn.com', 'comcast.net', 'verizon.net'
+]);
+
 ///////////////////////
 //  DATABASE CONNECTION
 ///////////////////////
@@ -514,6 +521,16 @@ if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_lo
             $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS workers INT NOT NULL DEFAULT " . DEFAULT_WORKERS);
             $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER);
         } catch (Exception $e) {}
+        
+        // Add email domain filtering fields to job_profiles
+        try {
+            // email_domains: comma-separated list of target domains (e.g., "gmail.com,yahoo.com,att.net")
+            $pdo->exec("ALTER TABLE job_profiles ADD COLUMN IF NOT EXISTS email_domains TEXT DEFAULT NULL");
+            // domain_filter_mode: 'include' = only these domains, 'exclude' = all except these, 'business_only' = exclude free providers
+            $pdo->exec("ALTER TABLE job_profiles ADD COLUMN IF NOT EXISTS domain_filter_mode VARCHAR(20) DEFAULT 'business_only'");
+        } catch (Exception $e) {
+            error_log("Failed to add email domain fields: " . $e->getMessage());
+        }
         
         // RETROACTIVE FIX: Convert stuck jobs to 'completed'
         // Fix jobs that are 100% complete but stuck at 'extracting' status
@@ -961,10 +978,34 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $searchQuery = $profile['search_query'] ?? '';
         $country = $profile['country'] ?? '';
         $businessOnly = !empty($profile['filter_business_only']);
-        $targetCount = (int)($profile['target_count'] ?? 100);  // Always use profile's target
-        $workers = max(1, (int)($profile['workers'] ?? 4));
+        $rawTargetCount = (int)($profile['target_count'] ?? 100);
+        $targetCount = max(1, $rawTargetCount);  // Ensure at least 1 email target
+        $rawWorkers = (int)($profile['workers'] ?? 4);
         
-        error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}'");
+        // Limit workers to prevent resource exhaustion (curl handles, memory, etc.)
+        // Maximum 50 parallel workers per batch to stay within system limits
+        $maxWorkersPerBatch = 50;
+        $workers = max(1, min($rawWorkers, $maxWorkersPerBatch));
+        
+        // Log warning if target count was invalid
+        if ($rawTargetCount <= 0) {
+            error_log("PARALLEL_EXTRACTION: WARNING - Profile target_count was {$rawTargetCount}, adjusted to {$targetCount}");
+        }
+        
+        // Log warning if workers were limited
+        if ($rawWorkers > $maxWorkersPerBatch) {
+            error_log("PARALLEL_EXTRACTION: WARNING - Profile workers was {$rawWorkers}, limited to {$workers} per batch to prevent resource exhaustion");
+        }
+        
+        // Get email domain filtering parameters
+        $filterMode = $profile['domain_filter_mode'] ?? 'business_only';
+        $emailDomains = [];
+        if (!empty($profile['email_domains'])) {
+            // Parse comma-separated domains
+            $emailDomains = array_filter(array_map('trim', explode(',', $profile['email_domains'])));
+        }
+        
+        error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}', filterMode={$filterMode}, domains=" . implode(',', $emailDomains));
         
         // Set active_workers count EARLY so UI shows workers are starting
         $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, active_workers = ? WHERE id = ?");
@@ -986,6 +1027,10 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $attempts = 0;
         $maxAttempts = $workers * 5; // Allow multiple rounds per worker
         $pageOffset = 0;
+        $allApiErrors = []; // Track all API errors across all rounds
+        $apiCallsMade = 0; // Actual count of API calls made
+        $zeroRounds = 0; // Count consecutive rounds with no emails
+        $maxZeroRounds = 3; // Allow up to 3 empty rounds before stopping
         
         // Store diagnostic info in database (fallback when error_log not available)
         $diagMsg = "DIAGNOSTIC: Loop vars: extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}\n";
@@ -998,6 +1043,8 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
         // Parallel extraction loop - all workers work simultaneously
         while ($extractedCount < $targetCount && $attempts < $maxAttempts) {
+            $attempts++; // Increment round counter at the start
+            
             // Update diagnostic in database
             $diagMsg .= "\nDIAGNOSTIC: Round {$attempts} started";
             $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
@@ -1013,6 +1060,11 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                     'page' => $pageOffset + $workerNum
                 ];
             }
+            
+            // Count actual API calls being made this round
+            $apiCallsThisRound = count($workerResults);
+            $apiCallsMade += $apiCallsThisRound;
+            error_log("PARALLEL_EXTRACTION: Round {$attempts} - spawning {$apiCallsThisRound} workers (total API calls so far: {$apiCallsMade})");
             
             // Execute all API calls in parallel
             $multiHandle = curl_multi_init();
@@ -1054,6 +1106,8 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             
             // Process results from all workers
             $roundEmails = 0;
+            $apiErrors = []; // Track API errors for debugging
+            
             foreach ($curlHandles as $idx => $ch) {
                 $response = curl_multi_getcontent($ch);
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -1063,23 +1117,39 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                 
                 if ($curlError) {
                     error_log("PARALLEL_EXTRACTION: Worker {$idx} - CURL ERROR: {$curlError}");
+                    $apiErrors[] = "Worker {$idx}: CURL Error - {$curlError}";
                 }
                 
                 if ($httpCode === 200 && $response) {
                     $data = json_decode($response, true);
                     if ($data === null) {
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - JSON decode failed! Response: " . substr($response, 0, 500));
+                        $apiErrors[] = "Worker {$idx}: JSON decode failed - Response: " . substr($response, 0, 200);
                     } elseif (!isset($data['organic'])) {
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - No 'organic' field in response. Keys: " . implode(', ', array_keys($data)));
                         if (isset($data['error'])) {
                             error_log("PARALLEL_EXTRACTION: Worker {$idx} - API ERROR: " . json_encode($data['error']));
+                            $apiErrors[] = "Worker {$idx}: API Error - " . json_encode($data['error']);
+                        } else {
+                            $apiErrors[] = "Worker {$idx}: No organic results field in response";
                         }
                     } else {
                         $organicCount = count($data['organic']);
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - Found {$organicCount} organic results");
                         
-                        $emails = extract_emails_from_results($data['organic'], $businessOnly);
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results");
+                        // Extract emails with detailed logging
+                        $emailsBeforeFilter = extract_emails_from_results($data['organic'], false, 'all', []);
+                        $emailsAfterFilter = extract_emails_from_results($data['organic'], $businessOnly, $filterMode, $emailDomains);
+                        
+                        $rawCount = count($emailsBeforeFilter);
+                        $filteredCount = count($emailsAfterFilter);
+                        $removedByFilter = $rawCount - $filteredCount;
+                        
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Email extraction: raw={$rawCount}, filtered={$filteredCount}, removed_by_filter={$removedByFilter} (mode={$filterMode})");
+                        
+                        $emails = $emailsAfterFilter;
+                        $duplicatesSkipped = 0;
+                        $savedCount = 0;
                         
                         // Insert emails into database
                         foreach ($emails as $emailData) {
@@ -1096,6 +1166,7 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                                 if ($stmt->rowCount() > 0) {
                                     $extractedCount++;
                                     $roundEmails++;
+                                    $savedCount++;
                                     
                                     // Update progress every 5 emails for responsiveness
                                     if ($extractedCount % 5 === 0) {
@@ -1105,13 +1176,36 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                                 }
                             } catch (Exception $e) {
                                 // Skip duplicates
-                                error_log("PARALLEL_EXTRACTION: Worker {$idx} - Duplicate email: " . $emailData['email']);
+                                $duplicatesSkipped++;
                                 continue;
                             }
                         }
+                        
+                        // Log summary for this worker
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Summary: saved={$savedCount}, duplicates_skipped={$duplicatesSkipped}");
                     }
                 } else {
-                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - HTTP {$httpCode} or empty response");
+                    // Non-200 HTTP response
+                    $httpMessage = "";
+                    switch ($httpCode) {
+                        case 401:
+                            $httpMessage = "Unauthorized - Invalid or expired API key";
+                            break;
+                        case 429:
+                            $httpMessage = "Rate limit exceeded - Too many API requests";
+                            break;
+                        case 500:
+                            $httpMessage = "Internal server error on serper.dev";
+                            break;
+                        case 0:
+                            $httpMessage = "Connection failed - Network/firewall issue";
+                            break;
+                        default:
+                            $httpMessage = "HTTP error {$httpCode}";
+                    }
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - {$httpMessage}");
+                    error_log("PARALLEL_EXTRACTION: Worker {$idx} - Response preview: " . substr($response, 0, 500));
+                    $apiErrors[] = "Worker {$idx}: {$httpMessage} (HTTP {$httpCode}) - Response: " . substr($response, 0, 200);
                 }
                 
                 curl_multi_remove_handle($multiHandle, $ch);
@@ -1120,15 +1214,27 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
             
             curl_multi_close($multiHandle);
             
-            error_log("PARALLEL_EXTRACTION: Round {$attempts} - extracted {$roundEmails} emails (total: {$extractedCount}/{$targetCount})");
-            
-            // If no emails extracted in this round, stop
-            if ($roundEmails === 0) {
-                error_log("PARALLEL_EXTRACTION: No new emails found, stopping");
-                break;
+            // Collect API errors from this round
+            if (!empty($apiErrors)) {
+                $allApiErrors = array_merge($allApiErrors, $apiErrors);
             }
             
-            $attempts++;
+            error_log("PARALLEL_EXTRACTION: Round {$attempts} - extracted {$roundEmails} emails (total: {$extractedCount}/{$targetCount})");
+            
+            // Allow multiple empty rounds before stopping (SERP pages may not always have emails)
+            if ($roundEmails === 0) {
+                $zeroRounds++;
+                error_log("PARALLEL_EXTRACTION: Round {$attempts} had zero emails - consecutive zero rounds: {$zeroRounds}/{$maxZeroRounds}");
+                
+                if ($zeroRounds >= $maxZeroRounds) {
+                    error_log("PARALLEL_EXTRACTION: Stopping after {$maxZeroRounds} consecutive rounds with no emails");
+                    break;
+                }
+            } else {
+                // Reset zero rounds counter when we find emails
+                $zeroRounds = 0;
+            }
+            
             $pageOffset += $workers;
         }
         
@@ -1138,25 +1244,115 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         
         // Check if we extracted any emails
         if ($extractedCount === 0) {
-            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$attempts} attempts with {$workers} workers");
+            error_log("PARALLEL_EXTRACTION: FAILURE - 0 emails extracted after {$apiCallsMade} API calls in {$attempts} rounds");
             
-            $errorMsg = "No emails found in search results after {$attempts} API calls.\n\n";
+            $errorMsg = "No emails found in search results after {$apiCallsMade} API calls ({$attempts} rounds).\n\n";
+            $errorMsg .= "=== JOB CONFIGURATION ===\n";
             $errorMsg .= "Search Query: \"{$searchQuery}\"\n";
             $errorMsg .= "Country: " . ($country ?: "Not specified") . "\n";
-            $errorMsg .= "Business Only Filter: " . ($businessOnly ? "Enabled" : "Disabled") . "\n";
-            $errorMsg .= "Workers Used: {$workers}\n";
-            $errorMsg .= "API Calls Made: {$attempts}\n\n";
-            $errorMsg .= "Possible reasons:\n";
-            $errorMsg .= "1. The search query returns no results with email addresses\n";
-            $errorMsg .= "2. All emails filtered out (Business Only excludes gmail.com, yahoo.com, etc.)\n";
-            $errorMsg .= "3. API key may be invalid or rate limited\n";
-            $errorMsg .= "4. Network connectivity issues\n\n";
-            $errorMsg .= "Suggestions:\n";
-            $errorMsg .= "- Try a more specific search query (e.g., 'company contact email')\n";
-            $errorMsg .= "- Try a different location or industry\n";
-            $errorMsg .= "- Disable 'Business Only' filter to include all emails\n";
-            $errorMsg .= "- Check server error.log for API response details\n";
-            $errorMsg .= "- Verify API key at serper.dev/dashboard\n";
+            $errorMsg .= "Target Email Count: {$targetCount}\n";
+            $errorMsg .= "Filter Mode: {$filterMode}\n";
+            if (!empty($emailDomains)) {
+                $errorMsg .= "Target Domains: " . implode(', ', $emailDomains) . "\n";
+            }
+            $errorMsg .= "Workers Per Round: {$workers}\n";
+            $errorMsg .= "Rounds Attempted: {$attempts}\n";
+            $errorMsg .= "Total API Calls: {$apiCallsMade}\n";
+            if ($zeroRounds > 0) {
+                $errorMsg .= "Consecutive Empty Rounds: {$zeroRounds}\n";
+            }
+            $errorMsg .= "\n";
+            
+            // Special case: if no API calls made, provide specific guidance
+            if ($apiCallsMade === 0) {
+                $errorMsg .= "⚠️ CRITICAL: No API calls were made! This means the extraction loop never started.\n\n";
+                $errorMsg .= "=== MOST LIKELY CAUSE ===\n";
+                if ($rawTargetCount <= 0) {
+                    $errorMsg .= "✗ Profile 'Target Email Count' was {$rawTargetCount} (invalid - must be at least 1)\n";
+                    $errorMsg .= "  → The system adjusted it to {$targetCount}, but the profile should be updated\n";
+                    $errorMsg .= "  → Edit the profile and set 'Target Email Count' to a valid number (e.g., 100)\n\n";
+                } else {
+                    $errorMsg .= "The extraction loop failed to start. This is unusual.\n";
+                    $errorMsg .= "Check the server error.log for messages starting with 'PARALLEL_EXTRACTION:'\n\n";
+                }
+            } else {
+                // API calls were made but no emails found
+                $errorMsg .= "=== EXTRACTION SUMMARY ===\n";
+                $errorMsg .= "✓ API calls were successfully made to serper.dev\n";
+                $errorMsg .= "✓ Search results were retrieved from {$attempts} rounds\n";
+                $errorMsg .= "✗ No emails were found that matched your criteria\n\n";
+            }
+            
+            $errorMsg .= "=== POSSIBLE REASONS ===\n";
+            if ($apiCallsMade > 0) {
+                $errorMsg .= "1. SERP pages don't contain visible email addresses for this query\n";
+                $errorMsg .= "2. Emails exist but were removed by your filter settings:\n";
+            } else {
+                $errorMsg .= "1. The search query returns no results with email addresses\n";
+            }
+            if ($filterMode === 'business_only') {
+                $errorMsg .= "   - Business Only filter excludes: gmail.com, yahoo.com, hotmail.com, outlook.com, etc.\n";
+            } elseif ($filterMode === 'include' && !empty($emailDomains)) {
+                $errorMsg .= "   - Include filter only allows: " . implode(', ', $emailDomains) . "\n";
+            } elseif ($filterMode === 'exclude' && !empty($emailDomains)) {
+                $errorMsg .= "   - Exclude filter removes: " . implode(', ', $emailDomains) . "\n";
+            }
+            if ($apiCallsMade > 0) {
+                $errorMsg .= "3. Search results exist but don't contain email addresses in visible text\n";
+                $errorMsg .= "4. Try different search terms or add keywords like 'contact', 'email'\n\n";
+            } else {
+                $errorMsg .= "3. API key may be invalid or rate limited (check HTTP codes in API Log below)\n";
+                $errorMsg .= "4. Network connectivity issues to serper.dev\n";
+                $errorMsg .= "5. Search query is too specific or targets wrong audience\n\n";
+            }
+            
+            $errorMsg .= "=== TROUBLESHOOTING STEPS ===\n";
+            $errorMsg .= "1. Test API Connection: Use the 'Test Connection' button in the profile\n";
+            if ($apiCallsMade > 0) {
+                $errorMsg .= "2. Adjust Filter Mode:\n";
+            } else {
+                $errorMsg .= "2. Verify API Key: Check at https://serper.dev/dashboard\n";
+                $errorMsg .= "3. Adjust Filter Mode:\n";
+            }
+            if ($filterMode === 'business_only') {
+                $errorMsg .= "   - Try 'All Emails' mode to see if any emails are found\n";
+                $errorMsg .= "   - Or use 'Include Only' with specific domains like gmail.com, yahoo.com\n";
+            } elseif ($filterMode === 'include') {
+                $errorMsg .= "   - Add more domains to the Include list\n";
+                $errorMsg .= "   - Or switch to 'All Emails' mode temporarily\n";
+            }
+            $errorMsg .= "4. Improve Search Query:\n";
+            $errorMsg .= "   - Add keywords like 'contact', 'email', 'support'\n";
+            $errorMsg .= "   - Try more general terms (e.g., 'real estate California' instead of 'luxury real estate Newport Beach')\n";
+            $errorMsg .= "5. Check Server Error Log: Look for API response details\n\n";
+            
+            $errorMsg .= "=== HTTP STATUS CODE REFERENCE ===\n";
+            $errorMsg .= "200 OK = Success\n";
+            $errorMsg .= "401 Unauthorized = Invalid/expired API key\n";
+            $errorMsg .= "429 Too Many Requests = Rate limit exceeded\n";
+            $errorMsg .= "500 Internal Server Error = serper.dev server issue\n";
+            $errorMsg .= "Connection timeout = Network/firewall blocking serper.dev\n\n";
+            
+            // Include API error log if we have errors
+            if (!empty($allApiErrors)) {
+                $errorMsg .= "=== API ERRORS ENCOUNTERED ===\n";
+                $errorMsg .= "The following errors were encountered during extraction:\n\n";
+                // Limit to last 10 errors to avoid overwhelming the error message
+                $recentErrors = array_slice($allApiErrors, -10);
+                foreach ($recentErrors as $error) {
+                    $errorMsg .= "  • " . $error . "\n";
+                }
+                if (count($allApiErrors) > 10) {
+                    $errorMsg .= "\n(Showing last 10 of " . count($allApiErrors) . " errors. Check error.log for complete list)\n";
+                }
+                $errorMsg .= "\n";
+            }
+            
+            $errorMsg .= "=== NEXT STEPS ===\n";
+            $errorMsg .= "1. Check the 'Test Connection' button in Job Profiles to verify API connectivity\n";
+            $errorMsg .= "2. Review the API errors above to identify the issue\n";
+            $errorMsg .= "3. Check server error.log for detailed API responses from all workers\n";
+            $errorMsg .= "   Look for lines starting with 'PARALLEL_EXTRACTION: Worker' to see HTTP codes and response data.\n";
             
             $stmt = $pdo->prepare("UPDATE jobs SET status = 'draft', progress_status = 'error', error_message = ?, active_workers = 0 WHERE id = ?");
             $stmt->execute([$errorMsg, $jobId]);
@@ -1195,11 +1391,29 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
 
 /**
  * Extract emails from search result array
+ * 
+ * @param array $results Search results from API
+ * @param bool $businessOnly Legacy parameter - kept for backward compatibility
+ * @param string $filterMode Filter mode: 'business_only', 'include', 'exclude', 'all'
+ * @param array $targetDomains Array of domains to include/exclude (e.g., ['gmail.com', 'yahoo.com'])
+ * @return array Array of email data with 'email' and 'source' keys
  */
-function extract_emails_from_results(array $results, bool $businessOnly = true): array {
+function extract_emails_from_results(array $results, bool $businessOnly = true, string $filterMode = 'business_only', array $targetDomains = []): array {
     $emails = [];
     $emailSet = []; // Use associative array for O(1) duplicate checking
     $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
+    
+    // Normalize target domains to lowercase for case-insensitive comparison
+    // Email domains are case-insensitive, so we normalize everything to lowercase
+    $normalizedDomains = [];
+    foreach ($targetDomains as $domain) {
+        $normalizedDomains[] = strtolower(trim($domain));
+    }
+    
+    // Legacy support: if businessOnly is explicitly set, use it
+    if ($businessOnly && $filterMode === 'business_only' && empty($normalizedDomains)) {
+        $filterMode = 'business_only';
+    }
     
     foreach ($results as $result) {
         $text = '';
@@ -1209,19 +1423,56 @@ function extract_emails_from_results(array $results, bool $businessOnly = true):
         
         if (preg_match_all($emailPattern, $text, $matches)) {
             foreach ($matches[0] as $email) {
-                $email = strtolower($email);
+                $email = strtolower($email); // Normalize email to lowercase
                 
                 $atPos = strpos($email, '@');
                 if ($atPos === false || $atPos === 0 || $atPos === strlen($email) - 1) {
                     continue;
                 }
                 
-                if ($businessOnly) {
-                    $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
-                    $domain = substr($email, $atPos + 1);
-                    if (in_array($domain, $freeProviders)) {
-                        continue;
-                    }
+                // Extract domain (already lowercase since email is lowercase)
+                $domain = substr($email, $atPos + 1);
+                
+                // Apply filtering based on mode
+                $shouldInclude = true;
+                
+                switch ($filterMode) {
+                    case 'business_only':
+                        // Exclude free email providers (using constant)
+                        if (in_array($domain, FREE_EMAIL_PROVIDERS)) {
+                            $shouldInclude = false;
+                        }
+                        break;
+                        
+                    case 'include':
+                        // Include ONLY specified domains
+                        if (!empty($normalizedDomains)) {
+                            $shouldInclude = in_array($domain, $normalizedDomains);
+                        }
+                        break;
+                        
+                    case 'exclude':
+                        // Exclude specified domains
+                        if (!empty($normalizedDomains)) {
+                            $shouldInclude = !in_array($domain, $normalizedDomains);
+                        }
+                        break;
+                        
+                    case 'all':
+                        // Include all emails (no filtering)
+                        $shouldInclude = true;
+                        break;
+                        
+                    default:
+                        // Default to business_only for safety
+                        if (in_array($domain, FREE_EMAIL_PROVIDERS)) {
+                            $shouldInclude = false;
+                        }
+                        break;
+                }
+                
+                if (!$shouldInclude) {
+                    continue;
                 }
                 
                 // Check if email already in set (O(1) lookup)
@@ -5777,6 +6028,19 @@ if ($action === 'save_profile') {
     $filter_business_only = isset($_POST['filter_business_only']) ? 1 : 0;
     $active       = isset($_POST['active']) ? 1 : 0;
     
+    // Email domain filtering parameters
+    $domain_filter_mode = $_POST['domain_filter_mode'] ?? 'business_only';
+    $email_domains = '';
+    
+    // Handle domain selection
+    if (isset($_POST['email_domains']) && is_array($_POST['email_domains'])) {
+        // From checkboxes
+        $email_domains = implode(',', array_map('trim', $_POST['email_domains']));
+    } elseif (isset($_POST['email_domains_custom']) && !empty(trim($_POST['email_domains_custom']))) {
+        // From custom input
+        $email_domains = trim($_POST['email_domains_custom']);
+    }
+    
     // Workers field - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
     // This determines how many parallel API calls will be made simultaneously
     $profile_workers = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
@@ -5792,13 +6056,13 @@ if ($action === 'save_profile') {
                 UPDATE job_profiles SET
                   profile_name=?, api_key=?, search_query=?, target_count=?, 
                   filter_business_only=?, country=?, active=?,
-                  workers=?
+                  workers=?, email_domains=?, domain_filter_mode=?
                 WHERE id=?
             ");
             $stmt->execute([
                 $profile_name, $api_key, $search_query, $target_count,
                 $filter_business_only, $country, $active,
-                $profile_workers,
+                $profile_workers, $email_domains, $domain_filter_mode,
                 $profile_id
             ]);
         } else {
@@ -5806,13 +6070,13 @@ if ($action === 'save_profile') {
                 INSERT INTO job_profiles
                   (profile_name, api_key, search_query, target_count,
                    filter_business_only, country, active,
-                   workers)
-                VALUES (?,?,?,?,?,?,?,?)
+                   workers, email_domains, domain_filter_mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             ");
             $stmt->execute([
                 $profile_name, $api_key, $search_query, $target_count,
                 $filter_business_only, $country, $active,
-                $profile_workers
+                $profile_workers, $email_domains, $domain_filter_mode
             ]);
         }
     } catch (Exception $e) {
@@ -7171,6 +7435,79 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
             <input type="checkbox" name="filter_business_only" id="pf_business" <?php if (!$editProfile || $editProfile['filter_business_only']) echo 'checked'; ?>>
             <label for="pf_business">Business Emails Only (filter out free providers)</label>
           </div>
+          
+          <!-- Email Domain Filtering Section -->
+          <div class="form-group" style="border-top:1px solid #E4E7EB; padding-top:16px; margin-top:16px;">
+            <label style="font-weight:600; margin-bottom:12px; display:block;">📧 Email Domain Filtering (Advanced)</label>
+            <small class="hint" style="display:block; margin-bottom:12px;">
+              Choose how to filter emails by domain. Leave empty to use "Business Only" mode above.
+            </small>
+            
+            <div class="form-group">
+              <label>Filter Mode</label>
+              <select name="domain_filter_mode" id="domain_filter_mode" style="width:100%; padding:8px;">
+                <?php
+                  $currentMode = $editProfile['domain_filter_mode'] ?? 'business_only';
+                ?>
+                <option value="business_only" <?php if ($currentMode === 'business_only') echo 'selected'; ?>>Business Only (exclude free providers)</option>
+                <option value="include" <?php if ($currentMode === 'include') echo 'selected'; ?>>Include Only Selected Domains</option>
+                <option value="exclude" <?php if ($currentMode === 'exclude') echo 'selected'; ?>>Exclude Selected Domains</option>
+                <option value="all" <?php if ($currentMode === 'all') echo 'selected'; ?>>All Emails (no filtering)</option>
+              </select>
+              <small class="hint">
+                <strong>Business Only:</strong> Excludes gmail.com, yahoo.com, etc.<br>
+                <strong>Include Only:</strong> Extract ONLY emails from selected domains<br>
+                <strong>Exclude:</strong> Extract all EXCEPT selected domains<br>
+                <strong>All:</strong> No filtering - extract all found emails
+              </small>
+            </div>
+            
+            <div id="domain_selection_section" style="display:none;">
+              <label style="margin-bottom:8px; display:block;">Select Email Domains</label>
+              <?php
+                $selectedDomains = [];
+                if ($editProfile && !empty($editProfile['email_domains'])) {
+                  $selectedDomains = array_map('trim', explode(',', $editProfile['email_domains']));
+                }
+                
+                $commonDomains = [
+                  'gmail.com' => 'Gmail',
+                  'yahoo.com' => 'Yahoo',
+                  'outlook.com' => 'Outlook',
+                  'hotmail.com' => 'Hotmail',
+                  'aol.com' => 'AOL',
+                  'icloud.com' => 'iCloud',
+                  'att.net' => 'AT&T',
+                  'comcast.net' => 'Comcast',
+                  'verizon.net' => 'Verizon',
+                  'live.com' => 'Live.com',
+                  'msn.com' => 'MSN'
+                ];
+              ?>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px;">
+                <?php foreach ($commonDomains as $domain => $label): ?>
+                  <div class="checkbox-row" style="margin:0;">
+                    <input type="checkbox" name="email_domains[]" id="domain_<?php echo str_replace('.', '_', $domain); ?>" value="<?php echo h($domain); ?>" <?php if (in_array($domain, $selectedDomains)) echo 'checked'; ?>>
+                    <label for="domain_<?php echo str_replace('.', '_', $domain); ?>" style="margin:0; font-weight:normal;"><?php echo h($label); ?></label>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+              
+              <div class="form-group">
+                <label>Custom Domains (comma-separated)</label>
+                <input type="text" name="email_domains_custom" id="email_domains_custom" 
+                       placeholder="example.com, company.org" 
+                       value="<?php 
+                         // Show custom domains that aren't in the common list
+                         if ($editProfile && !empty($editProfile['email_domains'])) {
+                           $customOnly = array_diff($selectedDomains, array_keys($commonDomains));
+                           echo h(implode(', ', $customOnly));
+                         }
+                       ?>">
+                <small class="hint">Add additional domains not in the list above</small>
+              </div>
+            </div>
+          </div>
           <div class="form-group">
             <label>Workers (Parallel API Calls)</label>
             <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)$editProfile['workers'] : DEFAULT_WORKERS; ?>">
@@ -8345,6 +8682,27 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
         <?php if ($editProfile): ?>
           openSidebar();
         <?php endif; ?>
+        
+        // Domain filter mode handler
+        var domainFilterMode = document.getElementById('domain_filter_mode');
+        var domainSelectionSection = document.getElementById('domain_selection_section');
+        
+        function updateDomainSelection() {
+          if (domainFilterMode && domainSelectionSection) {
+            var mode = domainFilterMode.value;
+            // Show domain selection only for 'include' and 'exclude' modes
+            if (mode === 'include' || mode === 'exclude') {
+              domainSelectionSection.style.display = 'block';
+            } else {
+              domainSelectionSection.style.display = 'none';
+            }
+          }
+        }
+        
+        if (domainFilterMode) {
+          domainFilterMode.addEventListener('change', updateDomainSelection);
+          updateDomainSelection(); // Initialize on page load
+        }
 
         // Toast helper exposed to global scope
         window.showToast = function(msg, type){
