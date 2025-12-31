@@ -987,11 +987,22 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $maxAttempts = $workers * 5; // Allow multiple rounds per worker
         $pageOffset = 0;
         
+        // Store diagnostic info in database (fallback when error_log not available)
+        $diagMsg = "DIAGNOSTIC: Loop vars: extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}\n";
+        $diagMsg .= "DIAGNOSTIC: Condition: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")";
+        $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+        $stmt->execute([$diagMsg, $jobId]);
+        
         error_log("PARALLEL_EXTRACTION: Loop variables - extractedCount={$extractedCount}, targetCount={$targetCount}, attempts={$attempts}, maxAttempts={$maxAttempts}");
         error_log("PARALLEL_EXTRACTION: While condition check: (" . ($extractedCount < $targetCount ? 'TRUE' : 'FALSE') . " && " . ($attempts < $maxAttempts ? 'TRUE' : 'FALSE') . ")");
         
         // Parallel extraction loop - all workers work simultaneously
         while ($extractedCount < $targetCount && $attempts < $maxAttempts) {
+            // Update diagnostic in database
+            $diagMsg .= "\nDIAGNOSTIC: Round {$attempts} started";
+            $stmt = $pdo->prepare("UPDATE jobs SET error_message = ? WHERE id = ?");
+            $stmt->execute([$diagMsg, $jobId]);
+            
             error_log("PARALLEL_EXTRACTION: ===== ROUND {$attempts} START =====");
             $workerResults = [];
             
