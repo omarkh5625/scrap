@@ -515,6 +515,16 @@ if ($pdo !== null && (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_lo
             $pdo->exec("ALTER TABLE rotation_settings ADD COLUMN IF NOT EXISTS emails_per_worker INT NOT NULL DEFAULT " . DEFAULT_EMAILS_PER_WORKER);
         } catch (Exception $e) {}
         
+        // Add email domain filtering fields to job_profiles
+        try {
+            // email_domains: comma-separated list of target domains (e.g., "gmail.com,yahoo.com,att.net")
+            $pdo->exec("ALTER TABLE job_profiles ADD COLUMN IF NOT EXISTS email_domains TEXT DEFAULT NULL");
+            // domain_filter_mode: 'include' = only these domains, 'exclude' = all except these, 'business_only' = exclude free providers
+            $pdo->exec("ALTER TABLE job_profiles ADD COLUMN IF NOT EXISTS domain_filter_mode VARCHAR(20) DEFAULT 'business_only'");
+        } catch (Exception $e) {
+            error_log("Failed to add email domain fields: " . $e->getMessage());
+        }
+        
         // RETROACTIVE FIX: Convert stuck jobs to 'completed'
         // Fix jobs that are 100% complete but stuck at 'extracting' status
         try {
@@ -964,7 +974,15 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
         $targetCount = (int)($profile['target_count'] ?? 100);  // Always use profile's target
         $workers = max(1, (int)($profile['workers'] ?? 4));
         
-        error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}'");
+        // Get email domain filtering parameters
+        $filterMode = $profile['domain_filter_mode'] ?? 'business_only';
+        $emailDomains = [];
+        if (!empty($profile['email_domains'])) {
+            // Parse comma-separated domains
+            $emailDomains = array_filter(array_map('trim', explode(',', $profile['email_domains'])));
+        }
+        
+        error_log("PARALLEL_EXTRACTION: Parameters - workers={$workers}, targetCount={$targetCount}, query='{$searchQuery}', filterMode={$filterMode}, domains=" . implode(',', $emailDomains));
         
         // Set active_workers count EARLY so UI shows workers are starting
         $stmt = $pdo->prepare("UPDATE jobs SET progress_total = ?, active_workers = ? WHERE id = ?");
@@ -1078,8 +1096,8 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
                         $organicCount = count($data['organic']);
                         error_log("PARALLEL_EXTRACTION: Worker {$idx} - Found {$organicCount} organic results");
                         
-                        $emails = extract_emails_from_results($data['organic'], $businessOnly);
-                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results");
+                        $emails = extract_emails_from_results($data['organic'], $businessOnly, $filterMode, $emailDomains);
+                        error_log("PARALLEL_EXTRACTION: Worker {$idx} - Extracted " . count($emails) . " emails from results (mode={$filterMode})");
                         
                         // Insert emails into database
                         foreach ($emails as $emailData) {
@@ -1195,11 +1213,28 @@ function perform_parallel_extraction(PDO $pdo, int $jobId, array $job, array $pr
 
 /**
  * Extract emails from search result array
+ * 
+ * @param array $results Search results from API
+ * @param bool $businessOnly Legacy parameter - kept for backward compatibility
+ * @param string $filterMode Filter mode: 'business_only', 'include', 'exclude', 'all'
+ * @param array $targetDomains Array of domains to include/exclude (e.g., ['gmail.com', 'yahoo.com'])
+ * @return array Array of email data with 'email' and 'source' keys
  */
-function extract_emails_from_results(array $results, bool $businessOnly = true): array {
+function extract_emails_from_results(array $results, bool $businessOnly = true, string $filterMode = 'business_only', array $targetDomains = []): array {
     $emails = [];
     $emailSet = []; // Use associative array for O(1) duplicate checking
     $emailPattern = '/[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}/';
+    
+    // Default free providers for business_only mode
+    $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com', 'att.net', 'live.com', 'msn.com', 'comcast.net', 'verizon.net'];
+    
+    // Normalize target domains to lowercase for comparison
+    $targetDomains = array_map('strtolower', array_map('trim', $targetDomains));
+    
+    // Legacy support: if businessOnly is explicitly set, use it
+    if ($businessOnly && $filterMode === 'business_only' && empty($targetDomains)) {
+        $filterMode = 'business_only';
+    }
     
     foreach ($results as $result) {
         $text = '';
@@ -1216,12 +1251,48 @@ function extract_emails_from_results(array $results, bool $businessOnly = true):
                     continue;
                 }
                 
-                if ($businessOnly) {
-                    $freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
-                    $domain = substr($email, $atPos + 1);
-                    if (in_array($domain, $freeProviders)) {
-                        continue;
-                    }
+                $domain = substr($email, $atPos + 1);
+                
+                // Apply filtering based on mode
+                $shouldInclude = true;
+                
+                switch ($filterMode) {
+                    case 'business_only':
+                        // Exclude free email providers
+                        if (in_array($domain, $freeProviders)) {
+                            $shouldInclude = false;
+                        }
+                        break;
+                        
+                    case 'include':
+                        // Include ONLY specified domains
+                        if (!empty($targetDomains)) {
+                            $shouldInclude = in_array($domain, $targetDomains);
+                        }
+                        break;
+                        
+                    case 'exclude':
+                        // Exclude specified domains
+                        if (!empty($targetDomains)) {
+                            $shouldInclude = !in_array($domain, $targetDomains);
+                        }
+                        break;
+                        
+                    case 'all':
+                        // Include all emails (no filtering)
+                        $shouldInclude = true;
+                        break;
+                        
+                    default:
+                        // Default to business_only for safety
+                        if (in_array($domain, $freeProviders)) {
+                            $shouldInclude = false;
+                        }
+                        break;
+                }
+                
+                if (!$shouldInclude) {
+                    continue;
                 }
                 
                 // Check if email already in set (O(1) lookup)
@@ -5777,6 +5848,19 @@ if ($action === 'save_profile') {
     $filter_business_only = isset($_POST['filter_business_only']) ? 1 : 0;
     $active       = isset($_POST['active']) ? 1 : 0;
     
+    // Email domain filtering parameters
+    $domain_filter_mode = $_POST['domain_filter_mode'] ?? 'business_only';
+    $email_domains = '';
+    
+    // Handle domain selection
+    if (isset($_POST['email_domains']) && is_array($_POST['email_domains'])) {
+        // From checkboxes
+        $email_domains = implode(',', array_map('trim', $_POST['email_domains']));
+    } elseif (isset($_POST['email_domains_custom']) && !empty(trim($_POST['email_domains_custom']))) {
+        // From custom input
+        $email_domains = trim($_POST['email_domains_custom']);
+    }
+    
     // Workers field - NO MAXIMUM LIMIT - accepts ANY value (1, 100, 500, 1000+)
     // This determines how many parallel API calls will be made simultaneously
     $profile_workers = max(MIN_WORKERS, (int)($_POST['workers'] ?? DEFAULT_WORKERS));
@@ -5792,13 +5876,13 @@ if ($action === 'save_profile') {
                 UPDATE job_profiles SET
                   profile_name=?, api_key=?, search_query=?, target_count=?, 
                   filter_business_only=?, country=?, active=?,
-                  workers=?
+                  workers=?, email_domains=?, domain_filter_mode=?
                 WHERE id=?
             ");
             $stmt->execute([
                 $profile_name, $api_key, $search_query, $target_count,
                 $filter_business_only, $country, $active,
-                $profile_workers,
+                $profile_workers, $email_domains, $domain_filter_mode,
                 $profile_id
             ]);
         } else {
@@ -5806,13 +5890,13 @@ if ($action === 'save_profile') {
                 INSERT INTO job_profiles
                   (profile_name, api_key, search_query, target_count,
                    filter_business_only, country, active,
-                   workers)
-                VALUES (?,?,?,?,?,?,?,?)
+                   workers, email_domains, domain_filter_mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             ");
             $stmt->execute([
                 $profile_name, $api_key, $search_query, $target_count,
                 $filter_business_only, $country, $active,
-                $profile_workers
+                $profile_workers, $email_domains, $domain_filter_mode
             ]);
         }
     } catch (Exception $e) {
@@ -7171,6 +7255,79 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
             <input type="checkbox" name="filter_business_only" id="pf_business" <?php if (!$editProfile || $editProfile['filter_business_only']) echo 'checked'; ?>>
             <label for="pf_business">Business Emails Only (filter out free providers)</label>
           </div>
+          
+          <!-- Email Domain Filtering Section -->
+          <div class="form-group" style="border-top:1px solid #E4E7EB; padding-top:16px; margin-top:16px;">
+            <label style="font-weight:600; margin-bottom:12px; display:block;">📧 Email Domain Filtering (Advanced)</label>
+            <small class="hint" style="display:block; margin-bottom:12px;">
+              Choose how to filter emails by domain. Leave empty to use "Business Only" mode above.
+            </small>
+            
+            <div class="form-group">
+              <label>Filter Mode</label>
+              <select name="domain_filter_mode" id="domain_filter_mode" style="width:100%; padding:8px;">
+                <?php
+                  $currentMode = $editProfile['domain_filter_mode'] ?? 'business_only';
+                ?>
+                <option value="business_only" <?php if ($currentMode === 'business_only') echo 'selected'; ?>>Business Only (exclude free providers)</option>
+                <option value="include" <?php if ($currentMode === 'include') echo 'selected'; ?>>Include Only Selected Domains</option>
+                <option value="exclude" <?php if ($currentMode === 'exclude') echo 'selected'; ?>>Exclude Selected Domains</option>
+                <option value="all" <?php if ($currentMode === 'all') echo 'selected'; ?>>All Emails (no filtering)</option>
+              </select>
+              <small class="hint">
+                <strong>Business Only:</strong> Excludes gmail.com, yahoo.com, etc.<br>
+                <strong>Include Only:</strong> Extract ONLY emails from selected domains<br>
+                <strong>Exclude:</strong> Extract all EXCEPT selected domains<br>
+                <strong>All:</strong> No filtering - extract all found emails
+              </small>
+            </div>
+            
+            <div id="domain_selection_section" style="display:none;">
+              <label style="margin-bottom:8px; display:block;">Select Email Domains</label>
+              <?php
+                $selectedDomains = [];
+                if ($editProfile && !empty($editProfile['email_domains'])) {
+                  $selectedDomains = array_map('trim', explode(',', $editProfile['email_domains']));
+                }
+                
+                $commonDomains = [
+                  'gmail.com' => 'Gmail',
+                  'yahoo.com' => 'Yahoo',
+                  'outlook.com' => 'Outlook',
+                  'hotmail.com' => 'Hotmail',
+                  'aol.com' => 'AOL',
+                  'icloud.com' => 'iCloud',
+                  'att.net' => 'AT&T',
+                  'comcast.net' => 'Comcast',
+                  'verizon.net' => 'Verizon',
+                  'live.com' => 'Live.com',
+                  'msn.com' => 'MSN'
+                ];
+              ?>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px;">
+                <?php foreach ($commonDomains as $domain => $label): ?>
+                  <div class="checkbox-row" style="margin:0;">
+                    <input type="checkbox" name="email_domains[]" id="domain_<?php echo str_replace('.', '_', $domain); ?>" value="<?php echo h($domain); ?>" <?php if (in_array($domain, $selectedDomains)) echo 'checked'; ?>>
+                    <label for="domain_<?php echo str_replace('.', '_', $domain); ?>" style="margin:0; font-weight:normal;"><?php echo h($label); ?></label>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+              
+              <div class="form-group">
+                <label>Custom Domains (comma-separated)</label>
+                <input type="text" name="email_domains_custom" id="email_domains_custom" 
+                       placeholder="example.com, company.org" 
+                       value="<?php 
+                         // Show custom domains that aren't in the common list
+                         if ($editProfile && !empty($editProfile['email_domains'])) {
+                           $customOnly = array_diff($selectedDomains, array_keys($commonDomains));
+                           echo h(implode(', ', $customOnly));
+                         }
+                       ?>">
+                <small class="hint">Add additional domains not in the list above</small>
+              </div>
+            </div>
+          </div>
           <div class="form-group">
             <label>Workers (Parallel API Calls)</label>
             <input type="number" name="workers" min="<?php echo MIN_WORKERS; ?>" value="<?php echo $editProfile ? (int)$editProfile['workers'] : DEFAULT_WORKERS; ?>">
@@ -8345,6 +8502,27 @@ $isSingleSendsPage = in_array($page, ['list','editor','review','stats'], true);
         <?php if ($editProfile): ?>
           openSidebar();
         <?php endif; ?>
+        
+        // Domain filter mode handler
+        var domainFilterMode = document.getElementById('domain_filter_mode');
+        var domainSelectionSection = document.getElementById('domain_selection_section');
+        
+        function updateDomainSelection() {
+          if (domainFilterMode && domainSelectionSection) {
+            var mode = domainFilterMode.value;
+            // Show domain selection only for 'include' and 'exclude' modes
+            if (mode === 'include' || mode === 'exclude') {
+              domainSelectionSection.style.display = 'block';
+            } else {
+              domainSelectionSection.style.display = 'none';
+            }
+          }
+        }
+        
+        if (domainFilterMode) {
+          domainFilterMode.addEventListener('change', updateDomainSelection);
+          updateDomainSelection(); // Initialize on page load
+        }
 
         // Toast helper exposed to global scope
         window.showToast = function(msg, type){
