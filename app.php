@@ -5431,7 +5431,7 @@ if ($action === 'save_rotation') {
 // Test API Connection Action
 if ($action === 'test_connection') {
     // Prevent any output before JSON
-    ob_clean();
+    if (ob_get_level()) ob_clean();
     header('Content-Type: application/json; charset=utf-8');
     
     try {
