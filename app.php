@@ -17,6 +17,16 @@
  * - BloomFilter Deduplication
  * - CLI Worker Support
  * - Regex Email Extraction
+ * - True Parallel Worker Execution
+ * 
+ * TROUBLESHOOTING WORKERS:
+ * If workers are not starting or crashing:
+ * 1. Run: php worker_diagnostic.php (to check system compatibility)
+ * 2. Enable debug mode by adding this line after line 26:
+ *    define('WORKER_DEBUG_MODE', true);
+ * 3. Check worker_logs/ directory for error logs from each worker
+ * 4. Check your PHP error log for worker initialization errors
+ * 5. Ensure database connection is working properly
  */
 
 // ============================================================================
@@ -2139,15 +2149,57 @@ class Router {
         $jobId = isset($argv[2]) && is_numeric($argv[2]) ? (int)$argv[2] : null;
         
         error_log("=== Worker Started: {$workerName} ===" . ($jobId ? " (Job #{$jobId})" : ""));
+        error_log("  PHP Version: " . PHP_VERSION);
+        error_log("  Script: " . __FILE__);
         
-        $workerId = Worker::register($workerName);
-        error_log("  Worker ID: {$workerId}");
+        // Try to initialize worker with better error handling
+        $workerId = null;
+        $maxInitRetries = 3;
+        $initRetryDelay = 2; // seconds
+        
+        for ($initAttempt = 1; $initAttempt <= $maxInitRetries; $initAttempt++) {
+            try {
+                error_log("  Initialization attempt {$initAttempt}/{$maxInitRetries}...");
+                
+                // Test database connectivity first
+                $db = Database::connect();
+                error_log("  ✓ Database connected");
+                
+                // Register worker
+                $workerId = Worker::register($workerName);
+                error_log("  ✓ Worker registered with ID: {$workerId}");
+                
+                // Get settings
+                $pollingInterval = (int)(Settings::get('worker_polling_interval', '2'));
+                error_log("  ✓ Settings loaded (polling interval: {$pollingInterval}s)");
+                
+                error_log("  ✓ Worker initialization successful");
+                break; // Success - exit retry loop
+                
+            } catch (Exception $e) {
+                error_log("  ✗ Initialization attempt {$initAttempt} failed: " . $e->getMessage());
+                error_log("  Stack trace: " . $e->getTraceAsString());
+                
+                if ($initAttempt < $maxInitRetries) {
+                    error_log("  Retrying in {$initRetryDelay} seconds...");
+                    sleep($initRetryDelay);
+                } else {
+                    error_log("  ✗✗✗ FATAL: Worker initialization failed after {$maxInitRetries} attempts");
+                    error_log("  Worker {$workerName} cannot start. Exiting.");
+                    exit(1);
+                }
+            }
+        }
+        
+        // If we got here, initialization was successful
         error_log("  Polling for queue items...");
         
         // Get polling interval from settings or use default 2 seconds
         // Reduced from 5 to 2 seconds for faster queue processing and better responsiveness
         // Implements exponential backoff when no work available to reduce database load
-        $pollingInterval = (int)(Settings::get('worker_polling_interval', '2'));
+        if (!isset($pollingInterval)) {
+            $pollingInterval = 2; // Fallback if settings failed
+        }
         
         $itemsProcessed = 0;
         $consecutiveErrors = 0;
@@ -4329,7 +4381,18 @@ class Router {
         $phpBinary = PHP_BINARY;
         $scriptPath = __FILE__;
         
+        // Check if debug mode is enabled for worker spawning
+        $debugMode = defined('WORKER_DEBUG_MODE') && WORKER_DEBUG_MODE;
+        $logDir = __DIR__ . '/worker_logs';
+        
+        if ($debugMode && !is_dir($logDir)) {
+            @mkdir($logDir, 0755, true);
+        }
+        
         error_log("🚀 spawnWorkersViaProcOpenParallel: Spawning {$workerCount} parallel workers using proc_open()");
+        error_log("  PHP Binary: {$phpBinary}");
+        error_log("  Script Path: {$scriptPath}");
+        error_log("  Debug Mode: " . ($debugMode ? 'ENABLED' : 'DISABLED'));
         
         $spawnedCount = 0;
         $processes = [];
@@ -4345,19 +4408,30 @@ class Router {
                     $args[] = (string)$jobId;
                 }
                 
-                // Descriptors for proc_open (redirect all output to null)
-                if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                // Descriptors for proc_open
+                // In debug mode, capture stderr to log files for troubleshooting
+                if ($debugMode) {
+                    $errorLog = $logDir . "/{$workerName}.err.log";
                     $descriptors = [
                         0 => ['pipe', 'r'],
-                        1 => ['file', 'NUL', 'w'],
-                        2 => ['file', 'NUL', 'w']
+                        1 => ['file', $logDir . "/{$workerName}.out.log", 'w'],
+                        2 => ['file', $errorLog, 'w']
                     ];
                 } else {
-                    $descriptors = [
-                        0 => ['pipe', 'r'],
-                        1 => ['file', '/dev/null', 'w'],
-                        2 => ['file', '/dev/null', 'w']
-                    ];
+                    // Normal mode - redirect output to null
+                    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+                        $descriptors = [
+                            0 => ['pipe', 'r'],
+                            1 => ['file', 'NUL', 'w'],
+                            2 => ['file', 'NUL', 'w']
+                        ];
+                    } else {
+                        $descriptors = [
+                            0 => ['pipe', 'r'],
+                            1 => ['file', '/dev/null', 'w'],
+                            2 => ['file', '/dev/null', 'w']
+                        ];
+                    }
                 }
                 
                 // Spawn process - this returns IMMEDIATELY, allowing parallel execution
@@ -4373,21 +4447,50 @@ class Router {
                     $processes[] = ['handle' => $process, 'name' => $workerName];
                     $spawnedCount++;
                     
-                    error_log("  ✓ Worker {$i}/{$workerCount}: {$workerName} spawned (PID tracked)");
+                    error_log("  ✓ Worker {$i}/{$workerCount}: {$workerName} spawned" . ($debugMode ? " (logging to {$logDir})" : ""));
                 } else {
                     error_log("  ✗ Worker {$i}/{$workerCount}: Failed to spawn {$workerName}");
+                    error_log("    Command: " . implode(' ', $args));
                 }
             } catch (Exception $e) {
                 error_log("  ✗ Worker {$i}: Exception during spawn: " . $e->getMessage());
+                error_log("    Stack trace: " . $e->getTraceAsString());
             }
         }
         
         error_log("✓✓✓ spawnWorkersViaProcOpenParallel: ALL {$spawnedCount}/{$workerCount} workers spawned SIMULTANEOUSLY!");
+        
+        if ($spawnedCount < $workerCount) {
+            error_log("⚠️  WARNING: Only {$spawnedCount}/{$workerCount} workers spawned successfully!");
+            error_log("⚠️  Run worker_diagnostic.php to troubleshoot issues");
+        }
+        
         error_log("✓✓✓ Workers are now running in PARALLEL as independent processes");
         
         // Give workers a moment to initialize then close process handles
         // Workers continue running independently even after handles are closed
         usleep($processInitDelayMicroseconds);
+        
+        // Wait a bit longer and check if workers registered successfully
+        sleep(1);
+        
+        // Verify workers registered in database
+        try {
+            $db = Database::connect();
+            $stmt = $db->query("SELECT COUNT(*) as active FROM workers WHERE last_heartbeat > DATE_SUB(NOW(), INTERVAL 10 SECOND)");
+            $result = $stmt->fetch();
+            $activeWorkers = (int)$result['active'];
+            
+            if ($activeWorkers < $spawnedCount) {
+                error_log("⚠️  WARNING: Only {$activeWorkers}/{$spawnedCount} workers registered in database!");
+                error_log("⚠️  Some workers may have crashed during initialization");
+                error_log("⚠️  Enable WORKER_DEBUG_MODE to see worker error logs");
+            } else {
+                error_log("✓ Verified: {$activeWorkers} workers registered and active in database");
+            }
+        } catch (Exception $e) {
+            error_log("⚠️  Could not verify worker registration: " . $e->getMessage());
+        }
         
         foreach ($processes as $proc) {
             // Don't wait for process to finish - just close the handle
