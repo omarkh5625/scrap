@@ -1806,12 +1806,12 @@ class JobManager {
                     id, name, query, options, status, 
                     emails_found, emails_accepted, emails_rejected, 
                     urls_processed, errors, worker_count, workers_running,
-                    started_at
+                    started_at, completed_at
                 ) VALUES (
                     :id, :name, :query, :options, :status,
                     :emails_found, :emails_accepted, :emails_rejected,
                     :urls_processed, :errors, :worker_count, :workers_running,
-                    :started_at
+                    :started_at, :completed_at
                 ) ON DUPLICATE KEY UPDATE
                     name = VALUES(name),
                     query = VALUES(query),
@@ -1824,7 +1824,8 @@ class JobManager {
                     errors = VALUES(errors),
                     worker_count = VALUES(worker_count),
                     workers_running = VALUES(workers_running),
-                    started_at = VALUES(started_at)";
+                    started_at = VALUES(started_at),
+                    completed_at = VALUES(completed_at)";
                 
                 $this->db->execute($sql, [
                     ':id' => $jobId,
@@ -1839,7 +1840,8 @@ class JobManager {
                     ':errors' => $jobData['errors'],
                     ':worker_count' => $jobData['worker_count'],
                     ':workers_running' => $jobData['workers_running'],
-                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null
+                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null,
+                    ':completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? date('Y-m-d H:i:s', $jobData['completed_at']) : null
                 ]);
                 
                 Utils::logMessage('DEBUG', "Job {$jobId} saved to database");
@@ -1867,19 +1869,24 @@ class JobManager {
                 foreach ($dbJobs as $jobData) {
                     $jobId = $jobData['id'];
                     
-                    // Load recent errors for this job
-                    $errorStmt = $this->db->query(
-                        "SELECT error_message, UNIX_TIMESTAMP(created_at) as time 
-                         FROM job_errors 
-                         WHERE job_id = :job_id 
-                         ORDER BY created_at DESC 
-                         LIMIT 10",
-                        [':job_id' => $jobId]
-                    );
-                    $errors = $errorStmt->fetchAll();
-                    $errorMessages = array_map(function($err) {
-                        return ['time' => $err['time'], 'message' => $err['error_message']];
-                    }, $errors);
+                    try {
+                        // Load recent errors for this job
+                        $errorStmt = $this->db->query(
+                            "SELECT error_message, UNIX_TIMESTAMP(created_at) as time 
+                             FROM job_errors 
+                             WHERE job_id = :job_id 
+                             ORDER BY created_at DESC 
+                             LIMIT 10",
+                            [':job_id' => $jobId]
+                        );
+                        $errors = $errorStmt->fetchAll();
+                        $errorMessages = array_map(function($err) {
+                            return ['time' => $err['time'], 'message' => $err['error_message']];
+                        }, $errors);
+                    } catch (Exception $e) {
+                        Utils::logMessage('WARNING', "Failed to load errors for job {$jobId}: {$e->getMessage()}");
+                        $errorMessages = [];
+                    }
                     
                     $this->jobs[$jobId] = [
                         'id' => $jobId,
@@ -1890,6 +1897,7 @@ class JobManager {
                         'status' => $jobData['status'],
                         'created_at' => strtotime($jobData['created_at']),
                         'started_at' => $jobData['started_at'] ? strtotime($jobData['started_at']) : null,
+                        'completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? strtotime($jobData['completed_at']) : null,
                         'emails_found' => (int)$jobData['emails_found'],
                         'emails_accepted' => (int)$jobData['emails_accepted'],
                         'emails_rejected' => (int)$jobData['emails_rejected'],
@@ -1921,6 +1929,7 @@ class JobManager {
                 return;
             } catch (Exception $e) {
                 Utils::logMessage('ERROR', "Failed to load jobs from database: {$e->getMessage()}");
+                Utils::logMessage('ERROR', "Stack trace: " . $e->getTraceAsString());
                 // Fall through to file-based load
             }
         }
@@ -1931,12 +1940,22 @@ class JobManager {
         foreach ($files as $file) {
             $data = json_decode(file_get_contents($file), true);
             if ($data && isset($data['id'])) {
+                // Ensure all required fields exist with defaults
+                if (!isset($data['completed_at'])) {
+                    $data['completed_at'] = null;
+                }
+                if (!isset($data['target_emails'])) {
+                    $data['target_emails'] = $data['options']['target_emails'] ?? 10000;
+                }
+                
                 // Keep jobs in their saved state, but clear worker governor
                 // Worker governor will be recreated on next start/check
                 $data['worker_governor'] = null;
                 $this->jobs[$data['id']] = $data;
             }
         }
+        
+        Utils::logMessage('INFO', "Loaded " . count($this->jobs) . " jobs from files");
     }
 }
 
