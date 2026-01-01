@@ -2852,10 +2852,23 @@ class Application {
         
         .progress-bar {
             height: 100%;
-            transition: width 0.3s ease;
+            transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
             border-radius: 12px;
             position: relative;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .progress-bar.updating {
+            animation: pulse-progress 1s ease-in-out;
+        }
+        
+        @keyframes pulse-progress {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.85;
+            }
         }
         
         .progress-bar::after {
@@ -2870,6 +2883,27 @@ class Application {
                 rgba(255,255,255,0.1) 50%, 
                 rgba(255,255,255,0.2) 100%);
             animation: shimmer 2s infinite;
+        }
+        
+        .live-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #28a745;
+            border-radius: 50%;
+            margin-left: 8px;
+            animation: live-pulse 2s infinite;
+        }
+        
+        @keyframes live-pulse {
+            0%, 100% {
+                opacity: 1;
+                box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7);
+            }
+            50% {
+                opacity: 0.7;
+                box-shadow: 0 0 0 4px rgba(40, 167, 69, 0);
+            }
         }
         
         @keyframes shimmer {
@@ -3315,6 +3349,66 @@ class Application {
                 document.getElementById('stat-memory').textContent = stats.memory_usage;
             },
             
+            // Update progress bars with smooth animation
+            updateJobProgress(jobId, job) {
+                const jobCard = document.querySelector(`.job-card[data-job-id="${jobId}"]`);
+                if (!jobCard || job.status !== 'running') return;
+                
+                const acceptedEmails = job.emails_accepted || 0;
+                const targetEmails = job.target_emails || job.options?.target_emails || 10000;
+                const emailProgress = Math.min(100, (acceptedEmails / targetEmails) * 100).toFixed(1);
+                
+                const workerStats = job.worker_stats || {total: 0, running: 0};
+                const maxWorkers = job.options?.max_workers || 10;
+                const workerProgress = Math.min(100, (workerStats.running / maxWorkers) * 100).toFixed(1);
+                
+                // Update email progress
+                const emailProgressBar = jobCard.querySelector('.progress-bar[data-type="email"]');
+                const emailProgressText = jobCard.querySelector('.progress-percentage[data-type="email"]');
+                const emailProgressDetails = jobCard.querySelector('.progress-details[data-type="email"]');
+                
+                if (emailProgressBar && emailProgressText && emailProgressDetails) {
+                    const oldProgress = parseFloat(emailProgressBar.style.width || '0');
+                    if (oldProgress !== parseFloat(emailProgress)) {
+                        emailProgressBar.classList.add('updating');
+                        setTimeout(() => emailProgressBar.classList.remove('updating'), 800);
+                    }
+                    emailProgressBar.style.width = `${emailProgress}%`;
+                    emailProgressText.textContent = `${emailProgress}%`;
+                    emailProgressDetails.textContent = `${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails`;
+                }
+                
+                // Update worker progress
+                const workerProgressBar = jobCard.querySelector('.progress-bar[data-type="worker"]');
+                const workerProgressText = jobCard.querySelector('.progress-percentage[data-type="worker"]');
+                const workerProgressDetails = jobCard.querySelector('.progress-details[data-type="worker"]');
+                
+                if (workerProgressBar && workerProgressText && workerProgressDetails) {
+                    workerProgressBar.style.width = `${workerProgress}%`;
+                    workerProgressText.textContent = `${workerProgress}%`;
+                    workerProgressDetails.textContent = `${workerStats.running} / ${maxWorkers} workers active`;
+                }
+                
+                // Update metrics
+                const acceptedMetric = jobCard.querySelector('.metric-value[data-metric="accepted"]');
+                const rejectedMetric = jobCard.querySelector('.metric-value[data-metric="rejected"]');
+                const rateMetric = jobCard.querySelector('.metric-value[data-metric="rate"]');
+                
+                if (acceptedMetric) {
+                    acceptedMetric.textContent = acceptedEmails.toLocaleString();
+                }
+                if (rejectedMetric) {
+                    const rejectedEmails = job.emails_rejected || 0;
+                    rejectedMetric.textContent = rejectedEmails.toLocaleString();
+                }
+                if (rateMetric) {
+                    const rejectedEmails = job.emails_rejected || 0;
+                    const totalFound = acceptedEmails + rejectedEmails;
+                    const acceptRate = totalFound > 0 ? ((acceptedEmails / totalFound) * 100).toFixed(1) : 0;
+                    rateMetric.textContent = `${acceptRate}%`;
+                }
+            },
+            
             renderJobs(jobs) {
                 const container = document.getElementById('jobContainer');
                 
@@ -3378,22 +3472,27 @@ class Application {
                             <div class="progress-section">
                                 <div class="progress-item">
                                     <div class="progress-header">
-                                        <span class="progress-label">📊 Email Collection Progress</span>
-                                        <span class="progress-percentage">${emailProgress}%</span>
+                                        <span class="progress-label">📊 Email Collection Progress<span class="live-indicator"></span></span>
+                                        <span class="progress-percentage" data-type="email">${emailProgress}%</span>
                                     </div>
                                     <div class="progress-bar-container">
-                                        <div class="progress-bar" style="width: ${emailProgress}%; background: linear-gradient(90deg, #28a745, #20c997);"></div>
+                                        <div class="progress-bar" data-type="email" style="width: ${emailProgress}%; background: linear-gradient(90deg, #28a745, #20c997);"></div>
                                     </div>
-                                    <div class="progress-details">${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails</div>
+                                    <div class="progress-details" data-type="email">${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails</div>
                                 </div>
                                 
                                 <div class="progress-item" style="margin-top: 12px;">
                                     <div class="progress-header">
                                         <span class="progress-label">👷 Active Workers</span>
-                                        <span class="progress-percentage">${workerProgress}%</span>
+                                        <span class="progress-percentage" data-type="worker">${workerProgress}%</span>
                                     </div>
                                     <div class="progress-bar-container">
-                                        <div class="progress-bar" style="width: ${workerProgress}%; background: linear-gradient(90deg, #007bff, #0056b3);"></div>
+                                        <div class="progress-bar" data-type="worker" style="width: ${workerProgress}%; background: linear-gradient(90deg, #007bff, #0056b3);"></div>
+                                    </div>
+                                    <div class="progress-details" data-type="worker">${workerStats.running} / ${maxWorkers} workers active</div>
+                                </div>
+                            </div>
+                        ` : ''}
                                     </div>
                                     <div class="progress-details">${workerStats.running} / ${maxWorkers} workers active</div>
                                 </div>
@@ -3421,15 +3520,15 @@ class Application {
                         
                         <div class="job-metrics">
                             <div class="metric">
-                                <div class="metric-value" style="color: #28a745;">${acceptedEmails.toLocaleString()}</div>
+                                <div class="metric-value" data-metric="accepted" style="color: #28a745;">${acceptedEmails.toLocaleString()}</div>
                                 <div class="metric-label">✓ Accepted</div>
                             </div>
                             <div class="metric">
-                                <div class="metric-value" style="color: #dc3545;">${rejectedEmails.toLocaleString()}</div>
+                                <div class="metric-value" data-metric="rejected" style="color: #dc3545;">${rejectedEmails.toLocaleString()}</div>
                                 <div class="metric-label">✗ Rejected</div>
                             </div>
                             <div class="metric">
-                                <div class="metric-value">${acceptRate}%</div>
+                                <div class="metric-value" data-metric="rate">${acceptRate}%</div>
                                 <div class="metric-label">Accept Rate</div>
                             </div>
                         </div>
@@ -3560,7 +3659,35 @@ class Application {
                     ]);
                     
                     if (jobsResult.success) {
-                        UI.renderJobs(jobsResult.jobs);
+                        // Check if we have existing job cards
+                        const hasExistingCards = document.querySelector('.job-card');
+                        
+                        if (!hasExistingCards) {
+                            // First load or no cards - render full HTML
+                            UI.renderJobs(jobsResult.jobs);
+                        } else {
+                            // Update existing cards - use incremental updates for running jobs
+                            jobsResult.jobs.forEach(job => {
+                                const existingCard = document.querySelector(`.job-card[data-job-id="${job.id}"]`);
+                                if (existingCard && job.status === 'running') {
+                                    // Update only progress for running jobs (live update)
+                                    UI.updateJobProgress(job.id, job);
+                                } else if (!existingCard) {
+                                    // New job appeared - re-render all
+                                    UI.renderJobs(jobsResult.jobs);
+                                }
+                            });
+                            
+                            // Check if any jobs were removed
+                            const currentJobIds = jobsResult.jobs.map(j => j.id);
+                            document.querySelectorAll('.job-card').forEach(card => {
+                                const jobId = card.getAttribute('data-job-id');
+                                if (!currentJobIds.includes(jobId)) {
+                                    // Job was deleted - re-render all
+                                    UI.renderJobs(jobsResult.jobs);
+                                }
+                            });
+                        }
                     }
                     
                     if (statsResult.success) {
@@ -3568,6 +3695,23 @@ class Application {
                     }
                 } catch (error) {
                     console.error('Failed to refresh jobs:', error);
+                }
+            },
+            
+            // Fast refresh for running jobs only (called more frequently)
+            async refreshRunningJobs() {
+                try {
+                    const jobsResult = await API.get('get_jobs');
+                    
+                    if (jobsResult.success) {
+                        jobsResult.jobs.forEach(job => {
+                            if (job.status === 'running') {
+                                UI.updateJobProgress(job.id, job);
+                            }
+                        });
+                    }
+                } catch (error) {
+                    console.error('Failed to refresh running jobs:', error);
                 }
             }
         };
@@ -3663,8 +3807,11 @@ class Application {
             await JobController.createJob(formData);
         });
         
-        // Auto-refresh every 5 seconds
-        setInterval(() => JobController.refreshJobs(), 5000);
+        // Fast live updates for running jobs (every 2 seconds) - like SendGrid
+        setInterval(() => JobController.refreshRunningJobs(), 2000);
+        
+        // Full refresh every 10 seconds for complete sync
+        setInterval(() => JobController.refreshJobs(), 10000);
         
         // Initial load
         JobController.refreshJobs();
