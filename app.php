@@ -940,7 +940,7 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
 \$extractedCount = 0;
 \$urlCache = [];
 \$currentPage = 1;
-\$maxPages = 30; // Expand to 30 pages as required
+\$maxPages = 200; // Expanded to 200 pages for maximum coverage
 \$seenEmails = []; // In-memory deduplication cache for this worker
 \$noResultsCount = 0; // Track consecutive failed queries
 \$currentQueryIndex = 0; // Track which query/keyword we're using
@@ -974,7 +974,7 @@ if (empty(\$queryList) && !empty(\$query)) {
             'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
-while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
+while ((time() - \$startTime) < \$maxRunTime) {
     // Check if we've reached the target email count across all workers
     if (\$pdo) {
         \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
@@ -1492,7 +1492,7 @@ class JobManager {
                 'country' => $job['options']['country'] ?? '',
                 'language' => $job['options']['language'] ?? 'en',
                 'max_emails' => $job['options']['max_emails'] ?? 10000,
-                'max_run_time' => 300,
+                'max_run_time' => 7200, // 2 hours - allow workers to run longer to reach target
                 'email_types' => $job['options']['email_types'] ?? '',
                 'custom_domains' => $job['options']['custom_domains'] ?? [],
                 'keywords' => $job['options']['keywords'] ?? []
@@ -1689,7 +1689,7 @@ class JobManager {
                             'country' => $job['options']['country'] ?? '',
                             'language' => $job['options']['language'] ?? 'en',
                             'max_emails' => $job['options']['max_emails'] ?? 10000,
-                            'max_run_time' => 300,
+                            'max_run_time' => 7200, // 2 hours - allow workers to run longer to reach target
                             'email_types' => $job['options']['email_types'] ?? '',
                             'custom_domains' => $job['options']['custom_domains'] ?? [],
                             'keywords' => $job['options']['keywords'] ?? []
