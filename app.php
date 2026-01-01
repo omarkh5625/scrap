@@ -37,8 +37,10 @@ if (file_exists($configFile)) {
 // Configuration
 class Config {
     const VERSION = '1.0.0';
-    const MAX_WORKERS_PER_JOB = 1000; // Increased for 32GB RAM server
+    const MAX_WORKERS_PER_JOB = 200; // Capped at 200 for optimal performance
     const MIN_WORKERS_PER_JOB = 1;
+    const WORKER_SPAWN_BATCH_SIZE = 20; // Spawn workers in batches of 20
+    const WORKER_SPAWN_BATCH_DELAY = 1; // Wait 1 second between batches
     const WORKER_TIMEOUT = 300; // 5 minutes
     const ZOMBIE_CHECK_INTERVAL = 60; // 1 minute
     const MEMORY_LIMIT_MB = 450; // Alert at 450MB
@@ -50,6 +52,8 @@ class Config {
     const LOG_DIR = '/tmp/email_extraction/logs';
     const DB_RETRY_ATTEMPTS = 3;
     const DB_RETRY_DELAY = 2; // seconds
+    const DEFAULT_MAX_PAGES = 200; // Default max pages per query (configurable per job)
+    const DEFAULT_WORKER_RUNTIME = 7200; // Default 2 hours (configurable per job)
 }
 
 // Database Connection Manager
@@ -661,6 +665,22 @@ class WorkerGovernor {
     }
     
     public function spawnWorker($workerId, $config) {
+        // Hard cap at 200 workers - enforce here, not just in UI
+        $currentWorkerCount = count($this->workers);
+        if ($currentWorkerCount >= 200) {
+            Utils::logMessage('WARNING', "Cannot spawn worker {$workerId}: hard limit of 200 workers reached (current: {$currentWorkerCount})");
+            throw new Exception("Worker limit of 200 reached");
+        }
+        
+        // Check system load before spawning
+        if (function_exists('sys_getloadavg')) {
+            $load = sys_getloadavg();
+            if ($load[0] > 20) {
+                Utils::logMessage('WARNING', "Cannot spawn worker {$workerId}: system load too high ({$load[0]})");
+                throw new Exception("System load too high: {$load[0]}");
+            }
+        }
+        
         $workerScript = $this->generateWorkerScript($workerId, $config);
         
         $descriptorspec = [
@@ -732,16 +752,15 @@ class WorkerGovernor {
 \$emailTypes = \$config['email_types'] ?? '';
 \$customDomains = \$config['custom_domains'] ?? [];
 \$keywords = \$config['keywords'] ?? [];
+\$maxPages = \$config['max_pages'] ?? 200; // Configurable max pages per query
+\$maxRunTime = \$config['max_run_time'] ?? 7200; // Configurable worker runtime
 
-// Database configuration
-\$dbHost = '{$dbHost}';
-\$dbPort = '{$dbPort}';
-\$dbName = '{$dbName}';
-\$dbUser = '{$dbUser}';
-\$dbPass = '{$dbPass}';
-
-// Email storage file (fallback)
-\$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
+// Raw data directory for this worker
+\$rawDataDir = \$dataDir . '/raw/job_' . \$jobId;
+if (!file_exists(\$rawDataDir)) {
+    @mkdir(\$rawDataDir, 0755, true);
+}
+\$workerOutputFile = \$rawDataDir . '/worker_' . \$workerId;
 
 // Helper function to check if email matches selected types
 function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
@@ -799,103 +818,56 @@ function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
     return false;
 }
 
-// Helper function to connect to database with retry
-function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$maxRetries = 3) {
-    \$attempts = 0;
-    while (\$attempts < \$maxRetries) {
-        try {
-            \$dsn = "mysql:host={\$dbHost};port={\$dbPort};dbname={\$dbName};charset=utf8mb4";
-            \$pdo = new PDO(\$dsn, \$dbUser, \$dbPass, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-            ]);
-            return \$pdo;
-        } catch (PDOException \$e) {
-            \$attempts++;
-            if (\$attempts < \$maxRetries) {
-                sleep(2);
+// Helper function to write emails to raw JSON file (no deduplication, no database)
+function writeEmailsToRawFile(\$baseFilePath, \$emailBatch, \$workerId) {
+    \$timestamp = time();
+    \$microtime = str_replace('.', '_', (string)microtime(true));
+    
+    \$data = [
+        'emails' => \$emailBatch,
+        'count' => count(\$emailBatch),
+        'timestamp' => \$timestamp,
+        'worker_id' => \$workerId
+    ];
+    
+    // Create unique filename with worker ID and timestamp to avoid conflicts
+    \$uniqueFile = \$baseFilePath . '_' . \$microtime . '.tmp';
+    \$finalFile = \$baseFilePath . '_' . \$timestamp . '.json';
+    
+    // Write to temp file first
+    if (file_put_contents(\$uniqueFile, json_encode(\$data, JSON_PRETTY_PRINT), LOCK_EX) === false) {
+        error_log("Failed to write to temp file: \$uniqueFile");
+        return false;
+    }
+    
+    // Atomic rename
+    if (!rename(\$uniqueFile, \$finalFile)) {
+        error_log("Failed to rename \$uniqueFile to \$finalFile");
+        @unlink(\$uniqueFile); // Clean up temp file
+        return false;
+    }
+    
+    return true;
+}
+
+// Helper function to count emails from raw files (approximate)
+function getApproximateEmailCount(\$rawDataDir) {
+    \$count = 0;
+    if (is_dir(\$rawDataDir)) {
+        \$files = glob(\$rawDataDir . '/worker_*.json*');
+        foreach (\$files as \$file) {
+            if (is_readable(\$file)) {
+                \$content = @file_get_contents(\$file);
+                if (\$content) {
+                    \$data = @json_decode(\$content, true);
+                    if (\$data && isset(\$data['count'])) {
+                        \$count += \$data['count'];
+                    }
+                }
             }
         }
     }
-    return null;
-}
-
-// Helper function to check if email already exists in database
-function isEmailDuplicate(\$pdo, \$jobId, \$email) {
-    try {
-        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id AND email = :email");
-        \$stmt->execute([':job_id' => \$jobId, ':email' => \$email]);
-        \$result = \$stmt->fetch();
-        return (int)\$result['count'] > 0;
-    } catch (PDOException \$e) {
-        return false;
-    }
-}
-
-// Helper function to get current email count from database
-function getCurrentEmailCount(\$pdo, \$jobId) {
-    try {
-        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id");
-        \$stmt->execute([':job_id' => \$jobId]);
-        \$result = \$stmt->fetch();
-        return (int)\$result['count'];
-    } catch (PDOException \$e) {
-        return 0;
-    }
-}
-
-// Helper function to save email to database
-function saveEmailToDB(\$pdo, \$jobId, \$emailData) {
-    try {
-        \$sql = "INSERT INTO emails (job_id, email, quality, confidence, source_url, worker_id) 
-                VALUES (:job_id, :email, :quality, :confidence, :source_url, :worker_id)
-                ON DUPLICATE KEY UPDATE 
-                    quality = VALUES(quality),
-                    confidence = VALUES(confidence),
-                    source_url = VALUES(source_url),
-                    worker_id = VALUES(worker_id)";
-        
-        \$stmt = \$pdo->prepare(\$sql);
-        \$stmt->execute([
-            ':job_id' => \$jobId,
-            ':email' => \$emailData['email'],
-            ':quality' => \$emailData['quality'],
-            ':confidence' => \$emailData['confidence'],
-            ':source_url' => \$emailData['source_url'],
-            ':worker_id' => \$emailData['worker_id']
-        ]);
-        return true;
-    } catch (PDOException \$e) {
-        error_log("Worker {\$emailData['worker_id']} DB error: " . \$e->getMessage());
-        return false;
-    }
-}
-
-// Helper function to save email to file (fallback)
-function saveEmailToFile(\$emailFile, \$emailData) {
-    if (!file_exists(dirname(\$emailFile))) {
-        @mkdir(dirname(\$emailFile), 0755, true);
-    }
-    
-    \$data = ['emails' => [], 'total' => 0, 'last_updated' => time()];
-    if (file_exists(\$emailFile)) {
-        \$existing = json_decode(file_get_contents(\$emailFile), true);
-        if (\$existing) {
-            \$data = \$existing;
-        }
-    }
-    
-    \$data['emails'][] = \$emailData;
-    \$data['total'] = count(\$data['emails']);
-    \$data['last_updated'] = time();
-    
-    file_put_contents(\$emailFile, json_encode(\$data), LOCK_EX);
-}
-
-// Initialize database connection
-\$pdo = null;
-if (!empty(\$dbHost) && !empty(\$dbName)) {
-    \$pdo = getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass);
+    return \$count;
 }
 
 // Serper API search function with pagination support
@@ -934,11 +906,9 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
 
 // Extraction work with real URLs
 \$startTime = time();
-\$maxRunTime = \$config['max_run_time'] ?? 300;
 \$extractedCount = 0;
 \$urlCache = [];
 \$currentPage = 1;
-\$maxPages = 30; // Expand to 30 pages as required
 \$seenEmails = []; // In-memory deduplication cache for this worker
 \$noResultsCount = 0; // Track consecutive failed queries
 \$currentQueryIndex = 0; // Track which query/keyword we're using
@@ -972,14 +942,12 @@ if (empty(\$queryList) && !empty(\$query)) {
             'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
-while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
-    // Check if we've reached the target email count across all workers
-    if (\$pdo) {
-        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-        if (\$currentTotal >= \$maxEmails) {
-            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
-            break; // Stop this worker, target reached
-        }
+while ((time() - \$startTime) < \$maxRunTime) {
+    // Check if we've reached the target email count (approximate from files)
+    \$currentTotal = getApproximateEmailCount(\$rawDataDir);
+    if (\$currentTotal >= \$maxEmails) {
+        echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
+        break; // Stop this worker, target reached
     }
     
     // Output heartbeat
@@ -1021,16 +989,9 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     sleep(rand(10, 30));
     
     // Generate realistic emails with real source URLs
+    \$emailBatch = [];
     \$found = rand(3, 8);
     for (\$i = 0; \$i < \$found; \$i++) {
-        // Check target again before each email
-        if (\$pdo) {
-            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-            if (\$currentTotal >= \$maxEmails) {
-                break 2; // Break out of both loops
-            }
-        }
-        
         \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
         \$lastName = ['smith', 'johnson', 'williams', 'jones', 'brown', 'davis', 'miller', 'wilson'][rand(0, 7)];
         \$domain = \$domains[rand(0, count(\$domains) - 1)];
@@ -1038,7 +999,7 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Check for duplicates in memory cache first
+        // Simple in-memory deduplication for this worker only
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
             continue; // Skip duplicate email (already seen in this worker)
@@ -1089,30 +1050,28 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
             }
         }
         
-        \$emailData = [
+        // Add to batch (no database operations)
+        \$emailBatch[] = [
             'email' => \$email,
             'quality' => \$quality,
             'source_url' => \$sourceUrl,
             'timestamp' => time(),
             'confidence' => rand(60, 95) / 100,
-            'worker_id' => \$workerId
+            'worker_id' => \$workerId,
+            'job_id' => \$jobId
         ];
-        
-        // Save to database first, fallback to file
-        if (\$pdo) {
-            if (!saveEmailToDB(\$pdo, \$jobId, \$emailData)) {
-                saveEmailToFile(\$emailFile, \$emailData);
-            }
-        } else {
-            saveEmailToFile(\$emailFile, \$emailData);
-        }
         \$extractedCount++;
+    }
+    
+    // Write entire batch to raw JSON file (no deduplication, no database)
+    if (!empty(\$emailBatch)) {
+        writeEmailsToRawFile(\$workerOutputFile, \$emailBatch, \$workerId);
     }
     
     echo json_encode([
         'type' => 'emails_found',
         'worker_id' => \$workerId,
-        'count' => \$found,
+        'count' => count(\$emailBatch),
         'time' => time()
     ]) . "\\n";
     flush();
@@ -1203,6 +1162,73 @@ PHP;
         Utils::logMessage('INFO', "Worker terminated: {$workerId} (reason: {$reason})");
         
         return true;
+    }
+    
+    public function spawnWorkersBatch($count, $config) {
+        $spawned = 0;
+        $current = count($this->workers);
+        
+        // Hard cap at 200 workers
+        if ($current >= 200) {
+            Utils::logMessage('WARNING', "Batch spawn requested but hard limit of 200 workers already reached (current: {$current})");
+            return 0;
+        }
+        
+        // Cap at max workers (200)
+        $actualCount = min($count, 200 - $current);
+        
+        if ($actualCount <= 0) {
+            Utils::logMessage('WARNING', "Batch spawn requested for {$count} workers, but maximum capacity reached or invalid count (current: {$current}, max: 200)");
+            return 0;
+        }
+        
+        // Calculate batches
+        $batchSize = Config::WORKER_SPAWN_BATCH_SIZE;
+        $totalBatches = ceil($actualCount / $batchSize);
+        
+        Utils::logMessage('INFO', "Starting batch spawn: {$actualCount} workers in {$totalBatches} batches");
+        
+        for ($batchNum = 0; $batchNum < $totalBatches; $batchNum++) {
+            // Check system load before each batch
+            if (function_exists('sys_getloadavg')) {
+                $load = sys_getloadavg();
+                if ($load[0] > 20) {
+                    Utils::logMessage('WARNING', "Stopping batch spawn: system load too high ({$load[0]})");
+                    break;
+                }
+            }
+            
+            $workersInThisBatch = min($batchSize, $actualCount - $spawned);
+            
+            for ($i = 0; $i < $workersInThisBatch; $i++) {
+                $workerId = Utils::generateId('worker_');
+                try {
+                    $this->spawnWorker($workerId, $config);
+                    $spawned++;
+                } catch (Exception $e) {
+                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
+                    Utils::logMessage('ERROR', $errorMsg);
+                    
+                    // If we hit the worker limit or load limit, stop trying
+                    if (strpos($e->getMessage(), 'limit') !== false || strpos($e->getMessage(), 'load') !== false) {
+                        break 2; // Break out of both loops
+                    }
+                }
+            }
+            
+            // Sleep between batches to avoid CPU spikes, but not after the last batch
+            if ($batchNum < $totalBatches - 1) {
+                $completedBatch = $batchNum + 1;
+                $nextBatch = $completedBatch + 1;
+                $delay = Config::WORKER_SPAWN_BATCH_DELAY;
+                Utils::logMessage('DEBUG', sprintf("Completed batch %d/%d, sleeping for %d second(s) before starting batch %d", $completedBatch, $totalBatches, $delay, $nextBatch));
+                sleep(Config::WORKER_SPAWN_BATCH_DELAY);
+            }
+        }
+        
+        Utils::logMessage('INFO', "Batch spawn complete: {$spawned} workers spawned");
+        
+        return $spawned;
     }
     
     public function scaleUp($count = 1) {
@@ -1442,8 +1468,9 @@ class JobManager {
                 'query' => $job['query'],
                 'country' => $job['options']['country'] ?? '',
                 'language' => $job['options']['language'] ?? 'en',
-                'max_emails' => $job['options']['max_emails'] ?? 10000,
-                'max_run_time' => 300,
+                'max_emails' => $job['options']['target_emails'] ?? 10000, // Use target_emails as the stop condition
+                'max_run_time' => $job['options']['max_run_time'] ?? Config::DEFAULT_WORKER_RUNTIME,
+                'max_pages' => $job['options']['max_pages'] ?? Config::DEFAULT_MAX_PAGES,
                 'email_types' => $job['options']['email_types'] ?? '',
                 'custom_domains' => $job['options']['custom_domains'] ?? [],
                 'keywords' => $job['options']['keywords'] ?? []
@@ -1459,25 +1486,15 @@ class JobManager {
             $job['status'] = 'running';
             $job['started_at'] = time();
             
-            // Spawn all requested workers with full configuration
-            $workersSpawned = 0;
-            for ($i = 0; $i < $desiredWorkers; $i++) {
-                $workerId = Utils::generateId('worker_');
-                try {
-                    $governor->spawnWorker($workerId, $workerConfig);
-                    $workersSpawned++;
-                    Utils::logMessage('INFO', "Worker spawned: {$workerId}");
-                } catch (Exception $e) {
-                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
-                    Utils::logMessage('ERROR', $errorMsg);
-                    $this->addJobError($jobId, $errorMsg);
-                }
-            }
+            // Spawn all requested workers in batches for optimal performance
+            $workersSpawned = $governor->spawnWorkersBatch($desiredWorkers, $workerConfig);
             
             if ($workersSpawned === 0) {
                 $job['status'] = 'error';
+                $errorMsg = "Failed to spawn any workers. Check: 1) System resources (memory, CPU), 2) PHP configuration (verify proc_open is not in disable_functions in php.ini), 3) Try reducing worker count.";
+                $this->addJobError($jobId, $errorMsg);
                 $this->saveJob($jobId);
-                throw new Exception("Failed to spawn any workers. Check system requirements.");
+                throw new Exception($errorMsg);
             }
             
             // Update persistent worker counts
@@ -1649,8 +1666,9 @@ class JobManager {
                             'query' => $job['query'],
                             'country' => $job['options']['country'] ?? '',
                             'language' => $job['options']['language'] ?? 'en',
-                            'max_emails' => $job['options']['max_emails'] ?? 10000,
-                            'max_run_time' => 300,
+                            'max_emails' => $job['options']['target_emails'] ?? 10000, // Use target_emails as the stop condition
+                            'max_run_time' => $job['options']['max_run_time'] ?? Config::DEFAULT_WORKER_RUNTIME,
+                            'max_pages' => $job['options']['max_pages'] ?? Config::DEFAULT_MAX_PAGES,
                             'email_types' => $job['options']['email_types'] ?? '',
                             'custom_domains' => $job['options']['custom_domains'] ?? [],
                             'keywords' => $job['options']['keywords'] ?? []
@@ -1661,23 +1679,15 @@ class JobManager {
                         
                         Utils::logMessage('INFO', "Restoring job {$jobId}: spawning {$neededWorkers} workers to reach {$desiredWorkers} total");
                         
-                        for ($i = 0; $i < $neededWorkers; $i++) {
-                            $workerId = Utils::generateId('worker_');
-                            try {
-                                $governor->spawnWorker($workerId, $workerConfig);
-                                Utils::logMessage('INFO', "Respawned worker {$workerId} for job {$jobId}");
-                                
-                                // Update persistent worker count
-                                if (!isset($this->jobs[$jobId]['worker_count'])) {
-                                    $this->jobs[$jobId]['worker_count'] = 0;
-                                }
-                                $this->jobs[$jobId]['worker_count']++;
-                                $this->saveJob($jobId);
-                            } catch (Exception $e) {
-                                Utils::logMessage('ERROR', "Failed to respawn worker: {$e->getMessage()}");
-                                $this->addJobError($jobId, "Failed to respawn worker: {$e->getMessage()}");
-                            }
+                        // Use batch spawning for restoration as well
+                        $workersSpawned = $governor->spawnWorkersBatch($neededWorkers, $workerConfig);
+                        
+                        // Update persistent worker count
+                        if (!isset($this->jobs[$jobId]['worker_count'])) {
+                            $this->jobs[$jobId]['worker_count'] = 0;
                         }
+                        $this->jobs[$jobId]['worker_count'] += $workersSpawned;
+                        $this->saveJob($jobId);
                     } catch (Exception $e) {
                         Utils::logMessage('ERROR', "Failed to restore worker governor for job {$jobId}: {$e->getMessage()}");
                         $this->addJobError($jobId, "Worker restoration failed: {$e->getMessage()}");
@@ -1992,8 +2002,8 @@ class APIHandler {
         
         $options = [
             'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
-            'max_emails' => (int)($_POST['max_emails'] ?? 10000),
-            'target_emails' => (int)($_POST['target_emails'] ?? 10000), // Target for progress tracking
+            'target_emails' => (int)($_POST['target_emails'] ?? 10000),
+            'max_emails' => (int)($_POST['target_emails'] ?? 10000), // Same as target_emails for worker stop condition
             'keywords' => $keywordList,
             'country' => $country,
             'language' => $language,
@@ -3244,8 +3254,8 @@ class Application {
                     
                     <div class="form-group">
                         <label for="maxWorkers">Max Workers</label>
-                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="1000">
-                        <small style="color: #666;">Parallel workers (1-1000, server has 32GB RAM)</small>
+                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="200">
+                        <small style="color: #666;">Parallel workers (1-200, optimized for performance)</small>
                     </div>
                     
                     <button type="submit" class="btn">Create Job</button>
