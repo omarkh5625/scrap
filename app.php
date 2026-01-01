@@ -1794,54 +1794,55 @@ class APIHandler {
             switch ($action) {
                 case 'create_job':
                     $result = $this->createJob();
-                    ob_end_clean(); // Clean the buffer
-                    return $result;
+                    break;
                     
                 case 'start_job':
                     $result = $this->startJob();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'stop_job':
                     $result = $this->stopJob();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'delete_job':
                     $result = $this->deleteJob();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'get_job':
                     $result = $this->getJob();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'get_jobs':
                     $result = $this->getJobs();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'get_stats':
                     $result = $this->getStats();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'scale_workers':
                     $result = $this->scaleWorkers();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 case 'test_connection':
                     $result = $this->testConnection();
-                    ob_end_clean();
-                    return $result;
+                    break;
                     
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
+            
+            // Clean buffer before returning result
+            if (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+            return $result;
+            
         } catch (Exception $e) {
-            ob_end_clean(); // Clean buffer on error too
+            // Clean buffer on error too
+            if (ob_get_level() > 0) {
+                ob_end_clean();
+            }
             return $this->jsonResponse([
                 'success' => false,
                 'error' => $e->getMessage()
