@@ -1215,6 +1215,7 @@ PHP;
         $actualCount = min($count, $this->maxWorkers - $current);
         
         if ($actualCount <= 0) {
+            Utils::logMessage('WARNING', "Batch spawn requested for {$count} workers, but maximum capacity reached or invalid count (current: {$current}, max: {$this->maxWorkers})");
             return 0;
         }
         
@@ -1241,7 +1242,9 @@ PHP;
             // Sleep between batches to avoid CPU spikes, but not after the last batch
             if ($batchNum < $totalBatches - 1) {
                 $completedBatch = $batchNum + 1;
-                Utils::logMessage('DEBUG', "Completed batch {$completedBatch}/{$totalBatches}, sleeping for " . Config::WORKER_SPAWN_BATCH_DELAY . " second(s) before starting batch " . ($completedBatch + 1));
+                $nextBatch = $completedBatch + 1;
+                $delay = Config::WORKER_SPAWN_BATCH_DELAY;
+                Utils::logMessage('DEBUG', sprintf("Completed batch %d/%d, sleeping for %d second(s) before starting batch %d", $completedBatch, $totalBatches, $delay, $nextBatch));
                 sleep(Config::WORKER_SPAWN_BATCH_DELAY);
             }
         }
@@ -1510,7 +1513,7 @@ class JobManager {
             
             if ($workersSpawned === 0) {
                 $job['status'] = 'error';
-                $errorMsg = "Failed to spawn any workers. Check system resources (memory, CPU), PHP configuration (proc_open enabled), or try reducing worker count.";
+                $errorMsg = "Failed to spawn any workers. Check: 1) System resources (memory, CPU), 2) PHP configuration (verify proc_open is not in disable_functions in php.ini), 3) Try reducing worker count.";
                 $this->addJobError($jobId, $errorMsg);
                 $this->saveJob($jobId);
                 throw new Exception($errorMsg);
