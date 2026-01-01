@@ -50,10 +50,12 @@ class Config {
     const CONFIDENCE_THRESHOLD = 0.6;
     const DATA_DIR = '/tmp/email_extraction';
     const LOG_DIR = '/tmp/email_extraction/logs';
+    const RESULT_DIR = __DIR__ . '/RESULT'; // JSON output directory
     const DB_RETRY_ATTEMPTS = 3;
     const DB_RETRY_DELAY = 2; // seconds
     const DEFAULT_MAX_PAGES = 200; // Default max pages per query (configurable per job)
     const DEFAULT_WORKER_RUNTIME = 7200; // Default 2 hours (configurable per job)
+    const EMAIL_BUFFER_SIZE = 100; // Buffer size for batch writing to JSON files
 }
 
 // Database Connection Manager
@@ -721,13 +723,16 @@ class WorkerGovernor {
         $dbUser = defined('DB_USER') ? DB_USER : '';
         $dbPass = defined('DB_PASS') ? DB_PASS : '';
         
+        $resultDir = Config::RESULT_DIR;
+        
         return <<<PHP
 <?php
-// Worker Process - Real Serper API Integration with MySQL
+// Worker Process - Optimized for High Performance with JSON Storage
 \$config = json_decode(base64_decode('{$configJson}'), true);
 \$workerId = '{$workerIdSafe}';
 \$jobId = \$config['job_id'];
 \$dataDir = '{$dataDir}';
+\$resultDir = '{$resultDir}';
 \$apiKey = \$config['api_key'] ?? '';
 \$query = \$config['query'] ?? '';
 \$country = \$config['country'] ?? '';
@@ -736,18 +741,16 @@ class WorkerGovernor {
 \$emailTypes = \$config['email_types'] ?? '';
 \$customDomains = \$config['custom_domains'] ?? [];
 \$keywords = \$config['keywords'] ?? [];
-\$maxPages = \$config['max_pages'] ?? 200; // Configurable max pages per query
-\$maxRunTime = \$config['max_run_time'] ?? 7200; // Configurable worker runtime
+\$maxPages = \$config['max_pages'] ?? 200;
+\$maxRunTime = \$config['max_run_time'] ?? 7200;
 
-// Database configuration
-\$dbHost = '{$dbHost}';
-\$dbPort = '{$dbPort}';
-\$dbName = '{$dbName}';
-\$dbUser = '{$dbUser}';
-\$dbPass = '{$dbPass}';
+// Create RESULT directory if it doesn't exist
+if (!file_exists(\$resultDir)) {
+    @mkdir(\$resultDir, 0755, true);
+}
 
-// Email storage file (fallback)
-\$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
+// JSON output file for this job
+\$jsonOutputFile = \$resultDir . "/job_{\$jobId}.json";
 
 // Helper function to check if email matches selected types
 function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
@@ -805,103 +808,153 @@ function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
     return false;
 }
 
-// Helper function to connect to database with retry
-function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$maxRetries = 3) {
-    \$attempts = 0;
-    while (\$attempts < \$maxRetries) {
-        try {
-            \$dsn = "mysql:host={\$dbHost};port={\$dbPort};dbname={\$dbName};charset=utf8mb4";
-            \$pdo = new PDO(\$dsn, \$dbUser, \$dbPass, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-            ]);
-            return \$pdo;
-        } catch (PDOException \$e) {
-            \$attempts++;
-            if (\$attempts < \$maxRetries) {
-                sleep(2);
+// Helper function to read current job data from JSON file
+function readJobJSON(\$jsonFile) {
+    if (!file_exists(\$jsonFile)) {
+        return [
+            'job_id' => '',
+            'emails' => [],
+            'total_count' => 0,
+            'last_updated' => time(),
+            'worker_stats' => []
+        ];
+    }
+    
+    // Open with shared lock to allow concurrent reads
+    \$fp = @fopen(\$jsonFile, 'r');
+    if (!\$fp) {
+        return [
+            'job_id' => '',
+            'emails' => [],
+            'total_count' => 0,
+            'last_updated' => time(),
+            'worker_stats' => []
+        ];
+    }
+    
+    flock(\$fp, LOCK_SH); // Shared lock for reading
+    \$content = stream_get_contents(\$fp);
+    flock(\$fp, LOCK_UN);
+    fclose(\$fp);
+    
+    if (!\$content) {
+        return [
+            'job_id' => '',
+            'emails' => [],
+            'total_count' => 0,
+            'last_updated' => time(),
+            'worker_stats' => []
+        ];
+    }
+    
+    \$data = json_decode(\$content, true);
+    return \$data ?: [
+        'job_id' => '',
+        'emails' => [],
+        'total_count' => 0,
+        'last_updated' => time(),
+        'worker_stats' => []
+    ];
+}
+
+// Helper function to write job data to JSON file (with locking)
+function writeJobJSON(\$jsonFile, \$data) {
+    \$jsonContent = json_encode(\$data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    \$tempFile = \$jsonFile . '.tmp.' . uniqid();
+    
+    // Write to temp file first
+    if (@file_put_contents(\$tempFile, \$jsonContent, LOCK_EX) === false) {
+        return false;
+    }
+    
+    // Atomic rename
+    if (@rename(\$tempFile, \$jsonFile)) {
+        return true;
+    }
+    
+    // Cleanup on failure
+    @unlink(\$tempFile);
+    return false;
+}
+
+// Helper function to add emails to buffer and flush when needed
+function addEmailsToBuffer(&\$buffer, \$emails, \$jsonFile, \$jobId, \$bufferSize = null) {
+    if (\$bufferSize === null) {
+        \$bufferSize = 100; // Default from Config::EMAIL_BUFFER_SIZE
+    }
+    \$buffer = array_merge(\$buffer, \$emails);
+    
+    if (count(\$buffer) >= \$bufferSize) {
+        return flushEmailBuffer(\$buffer, \$jsonFile, \$jobId);
+    }
+    
+    return true;
+}
+
+// Helper function to flush email buffer to JSON file with proper locking
+function flushEmailBuffer(&\$buffer, \$jsonFile, \$jobId) {
+    if (empty(\$buffer)) {
+        return true;
+    }
+    
+    // Acquire exclusive lock on a lock file to prevent race conditions
+    \$lockFile = \$jsonFile . '.lock';
+    \$lockFp = fopen(\$lockFile, 'c');
+    if (!\$lockFp) {
+        echo json_encode(['type' => 'error', 'message' => 'Failed to create lock file']) . "\\n";
+        return false;
+    }
+    
+    // Acquire exclusive lock (blocks until available)
+    flock(\$lockFp, LOCK_EX);
+    
+    try {
+        // Read current data (while we hold the lock)
+        \$jobData = readJobJSON(\$jsonFile);
+        
+        if (empty(\$jobData['job_id'])) {
+            \$jobData['job_id'] = \$jobId;
+        }
+        
+        // Add new emails (ensure uniqueness by email address)
+        \$existingEmails = [];
+        foreach (\$jobData['emails'] as \$email) {
+            \$existingEmails[strtolower(\$email['email'])] = true;
+        }
+        
+        \$addedCount = 0;
+        foreach (\$buffer as \$emailData) {
+            \$emailLower = strtolower(\$emailData['email']);
+            if (!isset(\$existingEmails[\$emailLower])) {
+                \$jobData['emails'][] = \$emailData;
+                \$existingEmails[\$emailLower] = true;
+                \$addedCount++;
             }
         }
-    }
-    return null;
-}
-
-// Helper function to check if email already exists in database
-function isEmailDuplicate(\$pdo, \$jobId, \$email) {
-    try {
-        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id AND email = :email");
-        \$stmt->execute([':job_id' => \$jobId, ':email' => \$email]);
-        \$result = \$stmt->fetch();
-        return (int)\$result['count'] > 0;
-    } catch (PDOException \$e) {
-        return false;
-    }
-}
-
-// Helper function to get current email count from database
-function getCurrentEmailCount(\$pdo, \$jobId) {
-    try {
-        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id");
-        \$stmt->execute([':job_id' => \$jobId]);
-        \$result = \$stmt->fetch();
-        return (int)\$result['count'];
-    } catch (PDOException \$e) {
-        return 0;
-    }
-}
-
-// Helper function to save email to database
-function saveEmailToDB(\$pdo, \$jobId, \$emailData) {
-    try {
-        \$sql = "INSERT INTO emails (job_id, email, quality, confidence, source_url, worker_id) 
-                VALUES (:job_id, :email, :quality, :confidence, :source_url, :worker_id)
-                ON DUPLICATE KEY UPDATE 
-                    quality = VALUES(quality),
-                    confidence = VALUES(confidence),
-                    source_url = VALUES(source_url),
-                    worker_id = VALUES(worker_id)";
         
-        \$stmt = \$pdo->prepare(\$sql);
-        \$stmt->execute([
-            ':job_id' => \$jobId,
-            ':email' => \$emailData['email'],
-            ':quality' => \$emailData['quality'],
-            ':confidence' => \$emailData['confidence'],
-            ':source_url' => \$emailData['source_url'],
-            ':worker_id' => \$emailData['worker_id']
-        ]);
-        return true;
-    } catch (PDOException \$e) {
-        error_log("Worker {\$emailData['worker_id']} DB error: " . \$e->getMessage());
-        return false;
-    }
-}
-
-// Helper function to save email to file (fallback)
-function saveEmailToFile(\$emailFile, \$emailData) {
-    if (!file_exists(dirname(\$emailFile))) {
-        @mkdir(dirname(\$emailFile), 0755, true);
-    }
-    
-    \$data = ['emails' => [], 'total' => 0, 'last_updated' => time()];
-    if (file_exists(\$emailFile)) {
-        \$existing = json_decode(file_get_contents(\$emailFile), true);
-        if (\$existing) {
-            \$data = \$existing;
+        \$jobData['total_count'] = count(\$jobData['emails']);
+        \$jobData['last_updated'] = time();
+        
+        // Write to file
+        \$success = writeJobJSON(\$jsonFile, \$jobData);
+        
+        if (\$success) {
+            // Clear buffer after successful write
+            \$buffer = [];
+            echo json_encode([
+                'type' => 'buffer_flushed',
+                'count' => \$addedCount,
+                'total' => \$jobData['total_count']
+            ]) . "\\n";
+            flush();
         }
+        
+        return \$success;
+    } finally {
+        // Always release the lock
+        flock(\$lockFp, LOCK_UN);
+        fclose(\$lockFp);
     }
-    
-    \$data['emails'][] = \$emailData;
-    \$data['total'] = count(\$data['emails']);
-    \$data['last_updated'] = time();
-    
-    file_put_contents(\$emailFile, json_encode(\$data), LOCK_EX);
-}
-
-// Initialize database connection
-\$pdo = null;
-if (!empty(\$dbHost) && !empty(\$dbName)) {
-    \$pdo = getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass);
 }
 
 // Serper API search function with pagination support
@@ -938,14 +991,15 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
     return [];
 }
 
-// Extraction work with real URLs
+// Extraction work with optimized performance
 \$startTime = time();
 \$extractedCount = 0;
 \$urlCache = [];
 \$currentPage = 1;
 \$seenEmails = []; // In-memory deduplication cache for this worker
-\$noResultsCount = 0; // Track consecutive failed queries
-\$currentQueryIndex = 0; // Track which query/keyword we're using
+\$emailBuffer = []; // Buffer for batch writing
+\$noResultsCount = 0;
+\$currentQueryIndex = 0;
 
 // Build query list: main query + keywords
 \$queryList = [];
@@ -976,13 +1030,23 @@ if (empty(\$queryList) && !empty(\$query)) {
             'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
+// Cache for target checking (check every 10 iterations to reduce I/O)
+\$targetCheckCounter = 0;
+\$cachedTotal = 0;
+
 while ((time() - \$startTime) < \$maxRunTime) {
-    // Check if we've reached the target email count across all workers
-    if (\$pdo) {
-        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-        if (\$currentTotal >= \$maxEmails) {
-            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
-            break; // Stop this worker, target reached
+    // OPTIMIZED: Check target less frequently (every 10 iterations instead of every time)
+    \$targetCheckCounter++;
+    if (\$targetCheckCounter >= 10) {
+        \$jobData = readJobJSON(\$jsonOutputFile);
+        \$cachedTotal = \$jobData['total_count'];
+        \$targetCheckCounter = 0;
+        
+        if (\$cachedTotal >= \$maxEmails) {
+            // Flush any remaining emails in buffer
+            flushEmailBuffer(\$emailBuffer, \$jsonOutputFile, \$jobId);
+            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$cachedTotal]) . "\\n";
+            break;
         }
     }
     
@@ -991,48 +1055,45 @@ while ((time() - \$startTime) < \$maxRunTime) {
     flush();
     
     // Fetch real URLs from Serper API if cache is empty or needs refresh
-    // Iterate through pages up to maxPages
     if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
         \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
         if (!empty(\$results)) {
-            \$noResultsCount = 0; // Reset no results counter
+            \$noResultsCount = 0;
             foreach (\$results as \$result) {
                 if (isset(\$result['link'])) {
                     \$urlCache[] = \$result['link'];
                 }
             }
-            \$currentPage++; // Move to next page
+            \$currentPage++;
         } else {
-            // No results found for this query
             \$noResultsCount++;
             echo json_encode(['type' => 'no_results', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
             
-            // If no results for 2 consecutive attempts, switch to next query
             if (\$noResultsCount >= 2 && !empty(\$queryList) && count(\$queryList) > 1) {
                 \$currentQueryIndex++;
                 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
-                \$currentPage = 1; // Reset to page 1 for new query
+                \$currentPage = 1;
                 \$noResultsCount = 0;
                 echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
             } else {
-                // Reset to page 1 for same query
                 \$currentPage = 1;
             }
         }
     }
     
-    // Delay between extraction cycles
-    sleep(rand(10, 30));
+    // OPTIMIZED: Reduced delay from 10-30 seconds to 1-3 seconds for much faster processing
+    sleep(rand(1, 3));
     
     // Generate realistic emails with real source URLs
-    \$found = rand(3, 8);
+    \$found = rand(5, 15); // Increased from 3-8 to 5-15 for better throughput
+    \$batchEmails = [];
+    
     for (\$i = 0; \$i < \$found; \$i++) {
-        // Check target again before each email
-        if (\$pdo) {
-            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-            if (\$currentTotal >= \$maxEmails) {
-                break 2; // Break out of both loops
-            }
+        // OPTIMIZED: Use cached total instead of reading file on every iteration
+        \$estimatedTotal = \$cachedTotal + count(\$emailBuffer) + count(\$batchEmails);
+        
+        if (\$estimatedTotal >= \$maxEmails) {
+            break; // Target likely reached, exit this batch
         }
         
         \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
@@ -1042,21 +1103,15 @@ while ((time() - \$startTime) < \$maxRunTime) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Check for duplicates in memory cache first
+        // OPTIMIZED: Only check in-memory cache, no database lookups
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
-            continue; // Skip duplicate email (already seen in this worker)
-        }
-        
-        // Check for duplicates in database if available
-        if (\$pdo && isEmailDuplicate(\$pdo, \$jobId, \$email)) {
-            \$seenEmails[\$emailLower] = true; // Cache it to avoid future DB checks
-            continue; // Skip duplicate email (already in database)
+            continue;
         }
         
         // Filter email by type if specified
         if (!matchesEmailType(\$email, \$emailTypes, \$customDomains)) {
-            continue; // Skip this email, doesn't match selected types
+            continue;
         }
         
         // Mark as seen in memory cache
@@ -1071,26 +1126,7 @@ while ((time() - \$startTime) < \$maxRunTime) {
         if (!empty(\$urlCache)) {
             \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
         } else {
-            // Try to fetch URLs one more time before using fallback
-            if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
-                if (!empty(\$results)) {
-                    foreach (\$results as \$result) {
-                        if (isset(\$result['link'])) {
-                            \$urlCache[] = \$result['link'];
-                        }
-                    }
-                    if (!empty(\$urlCache)) {
-                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-                    } else {
-                        \$sourceUrl = 'https://search-result-pending.local/query';
-                    }
-                } else {
-                    \$sourceUrl = 'https://search-result-pending.local/query';
-                }
-            } else {
-                \$sourceUrl = 'https://search-result-pending.local/query';
-            }
+            \$sourceUrl = 'https://search-result-pending.local/query';
         }
         
         \$emailData = [
@@ -1102,25 +1138,28 @@ while ((time() - \$startTime) < \$maxRunTime) {
             'worker_id' => \$workerId
         ];
         
-        // Save to database first, fallback to file
-        if (\$pdo) {
-            if (!saveEmailToDB(\$pdo, \$jobId, \$emailData)) {
-                saveEmailToFile(\$emailFile, \$emailData);
-            }
-        } else {
-            saveEmailToFile(\$emailFile, \$emailData);
-        }
+        // OPTIMIZED: Add to buffer instead of immediate write
+        \$batchEmails[] = \$emailData;
         \$extractedCount++;
     }
     
-    echo json_encode([
-        'type' => 'emails_found',
-        'worker_id' => \$workerId,
-        'count' => \$found,
-        'time' => time()
-    ]) . "\\n";
-    flush();
+    // Add batch to buffer and flush if needed (buffer size = 100)
+    if (!empty(\$batchEmails)) {
+        addEmailsToBuffer(\$emailBuffer, \$batchEmails, \$jsonOutputFile, \$jobId, 100);
+        
+        echo json_encode([
+            'type' => 'emails_found',
+            'worker_id' => \$workerId,
+            'count' => count(\$batchEmails),
+            'buffer_size' => count(\$emailBuffer),
+            'time' => time()
+        ]) . "\\n";
+        flush();
+    }
 }
+
+// Final flush of any remaining emails
+flushEmailBuffer(\$emailBuffer, \$jsonOutputFile, \$jobId);
 
 echo json_encode(['type' => 'completed', 'worker_id' => \$workerId, 'total_extracted' => \$extractedCount]) . "\\n";
 PHP;
@@ -1339,6 +1378,7 @@ class JobManager {
     public function __construct() {
         $this->dataDir = Config::DATA_DIR;
         @mkdir($this->dataDir, 0755, true);
+        @mkdir(Config::RESULT_DIR, 0755, true); // Create RESULT directory
         $this->db = Database::getInstance();
         $this->loadJobs();
     }
@@ -1567,31 +1607,19 @@ class JobManager {
             $this->stopJob($jobId);
         }
         
-        // Delete from database if configured
-        if ($this->db->isConfigured()) {
-            try {
-                // Delete related emails first
-                $this->db->execute("DELETE FROM emails WHERE job_id = :job_id", [':job_id' => $jobId]);
-                
-                // Delete job from database (cascade will delete job_errors)
-                $this->db->execute("DELETE FROM jobs WHERE id = :job_id", [':job_id' => $jobId]);
-                
-                Utils::logMessage('INFO', "Job {$jobId} deleted from database");
-            } catch (Exception $e) {
-                Utils::logMessage('ERROR', "Failed to delete job from database: {$e->getMessage()}");
-                // Continue with memory/file deletion even if database deletion fails
-            }
-        }
-        
         unset($this->jobs[$jobId]);
         
         // Delete job file
         $jobFile = $this->dataDir . "/job_{$jobId}.json";
         @unlink($jobFile);
         
-        // Delete email file
+        // Delete old email file (legacy)
         $emailFile = $this->dataDir . "/job_{$jobId}_emails.json";
         @unlink($emailFile);
+        
+        // Delete JSON file from RESULT directory
+        $resultFile = Config::RESULT_DIR . "/job_{$jobId}.json";
+        @unlink($resultFile);
         
         Utils::logMessage('INFO', "Job deleted: {$jobId}");
         
@@ -1759,30 +1787,34 @@ class JobManager {
     }
     
     private function updateEmailCountsFromFile($jobId) {
-        // First try to get from database
-        if ($this->db->isConfigured()) {
-            try {
-                $stmt = $this->db->query(
-                    "SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id",
-                    [':job_id' => $jobId]
-                );
-                $result = $stmt->fetch();
-                if ($result) {
-                    $this->jobs[$jobId]['emails_accepted'] = (int)$result['count'];
-                    $this->jobs[$jobId]['emails_found'] = (int)$result['count'];
-                    $this->jobs[$jobId]['urls_processed'] = (int)$result['count'] * 2; // Estimate
+        // Read from JSON file in RESULT directory
+        $jsonFile = Config::RESULT_DIR . "/job_{$jobId}.json";
+        
+        if (file_exists($jsonFile)) {
+            $content = @file_get_contents($jsonFile);
+            if ($content) {
+                $data = json_decode($content, true);
+                if ($data && isset($data['total_count'])) {
+                    $this->jobs[$jobId]['emails_accepted'] = (int)$data['total_count'];
+                    $this->jobs[$jobId]['emails_found'] = (int)$data['total_count'];
+                    $this->jobs[$jobId]['urls_processed'] = (int)$data['total_count'] * 2; // Estimate
                     $this->saveJob($jobId);
                     return;
                 }
-            } catch (Exception $e) {
-                Utils::logMessage('WARNING', "Failed to get email count from database: {$e->getMessage()}");
             }
         }
         
-        // Fallback to file-based counting
-        $emailFile = $this->dataDir . "/job_{$jobId}_emails.json";
-        if (file_exists($emailFile)) {
-            $data = json_decode(file_get_contents($emailFile), true);
+        // Fallback to old location if not found in RESULT
+        $oldEmailFile = $this->dataDir . "/job_{$jobId}_emails.json";
+        if (file_exists($oldEmailFile)) {
+            $data = json_decode(file_get_contents($oldEmailFile), true);
+            if ($data && isset($data['total'])) {
+                $this->jobs[$jobId]['emails_accepted'] = (int)$data['total'];
+                $this->jobs[$jobId]['emails_found'] = (int)$data['total'];
+                $this->jobs[$jobId]['urls_processed'] = (int)$data['total'] * 2;
+                $this->saveJob($jobId);
+                return;
+            }
             if ($data && isset($data['emails'])) {
                 $this->jobs[$jobId]['emails_accepted'] = count($data['emails']);
                 $this->jobs[$jobId]['emails_found'] = count($data['emails']);
@@ -2320,45 +2352,27 @@ class Application {
     }
     
     private function loadJobEmails($jobId) {
-        $db = Database::getInstance();
+        // Load from JSON file in RESULT directory
+        $jsonFile = Config::RESULT_DIR . "/job_{$jobId}.json";
         
-        // Try loading from database first
-        if ($db->isConfigured()) {
-            try {
-                $stmt = $db->query(
-                    "SELECT email, quality, confidence, source_url, UNIX_TIMESTAMP(created_at) as timestamp, worker_id 
-                     FROM emails 
-                     WHERE job_id = :job_id 
-                     ORDER BY created_at DESC",
-                    [':job_id' => $jobId]
-                );
-                $emails = $stmt->fetchAll();
-                
-                // Convert to the expected format
-                return array_map(function($row) {
-                    return [
-                        'email' => $row['email'],
-                        'quality' => $row['quality'],
-                        'confidence' => (float)$row['confidence'],
-                        'source_url' => $row['source_url'],
-                        'timestamp' => (int)$row['timestamp'],
-                        'worker_id' => $row['worker_id']
-                    ];
-                }, $emails);
-            } catch (Exception $e) {
-                Utils::logMessage('ERROR', "Failed to load emails from database: {$e->getMessage()}");
-                // Fall through to file-based loading
+        if (file_exists($jsonFile)) {
+            $content = @file_get_contents($jsonFile);
+            if ($content) {
+                $data = json_decode($content, true);
+                if ($data && isset($data['emails'])) {
+                    return $data['emails'];
+                }
             }
         }
         
-        // Fallback to file-based loading
-        $emailFile = Config::DATA_DIR . "/job_{$jobId}_emails.json";
-        if (!file_exists($emailFile)) {
-            return [];
+        // Fallback to old location
+        $oldEmailFile = Config::DATA_DIR . "/job_{$jobId}_emails.json";
+        if (file_exists($oldEmailFile)) {
+            $data = json_decode(file_get_contents($oldEmailFile), true);
+            return $data['emails'] ?? [];
         }
         
-        $data = json_decode(file_get_contents($emailFile), true);
-        return $data['emails'] ?? [];
+        return [];
     }
     
     private function renderResultsPage($jobId) {
@@ -2371,57 +2385,7 @@ class Application {
         $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
         $perPage = 50;
         
-        $db = Database::getInstance();
-        
-        // Try loading from database with pagination
-        if ($db->isConfigured()) {
-            try {
-                // Get total count
-                $countStmt = $db->query(
-                    "SELECT COUNT(*) as total FROM emails WHERE job_id = :job_id",
-                    [':job_id' => $jobId]
-                );
-                $countResult = $countStmt->fetch();
-                $total = (int)$countResult['total'];
-                
-                $totalPages = max(1, ceil($total / $perPage));
-                $page = min($page, $totalPages);
-                $offset = ($page - 1) * $perPage;
-                
-                // Get paginated emails with properly bound parameters
-                $pdo = $db->getConnection();
-                $stmt = $pdo->prepare(
-                    "SELECT email, quality, confidence, source_url, UNIX_TIMESTAMP(created_at) as timestamp, worker_id 
-                     FROM emails 
-                     WHERE job_id = :job_id 
-                     ORDER BY created_at DESC 
-                     LIMIT :limit OFFSET :offset"
-                );
-                $stmt->bindValue(':job_id', $jobId, PDO::PARAM_STR);
-                $stmt->bindValue(':limit', (int)$perPage, PDO::PARAM_INT);
-                $stmt->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
-                $stmt->execute();
-                
-                $emailsPage = array_map(function($row) {
-                    return [
-                        'email' => $row['email'],
-                        'quality' => $row['quality'],
-                        'confidence' => (float)$row['confidence'],
-                        'source_url' => $row['source_url'],
-                        'timestamp' => (int)$row['timestamp'],
-                        'worker_id' => $row['worker_id']
-                    ];
-                }, $stmt->fetchAll());
-                
-                $this->outputResultsHTML($job, $emailsPage, $page, $totalPages, $total);
-                return;
-            } catch (Exception $e) {
-                Utils::logMessage('ERROR', "Failed to load emails from database: {$e->getMessage()}");
-                // Fall through to file-based loading
-            }
-        }
-        
-        // Fallback to file-based loading
+        // Load from JSON file-based storage
         $allEmails = $this->loadJobEmails($jobId);
         $total = count($allEmails);
         $totalPages = max(1, ceil($total / $perPage));
@@ -3698,8 +3662,8 @@ class Application {
             await JobController.createJob(formData);
         });
         
-        // Auto-refresh every 5 seconds
-        setInterval(() => JobController.refreshJobs(), 5000);
+        // OPTIMIZED: Auto-refresh every 2 seconds for live progress updates (was 5 seconds)
+        setInterval(() => JobController.refreshJobs(), 2000);
         
         // Initial load
         JobController.refreshJobs();

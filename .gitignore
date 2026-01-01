@@ -1,0 +1,12 @@
+# Test files
+test_json.php
+
+# Runtime data
+/RESULT/*.json
+/tmp/
+
+# Database config (if exists)
+config.php
+
+# Logs
+*.log
