@@ -820,7 +820,23 @@ function readJobJSON(\$jsonFile) {
         ];
     }
     
-    \$content = @file_get_contents(\$jsonFile);
+    // Open with shared lock to allow concurrent reads
+    \$fp = @fopen(\$jsonFile, 'r');
+    if (!\$fp) {
+        return [
+            'job_id' => '',
+            'emails' => [],
+            'total_count' => 0,
+            'last_updated' => time(),
+            'worker_stats' => []
+        ];
+    }
+    
+    flock(\$fp, LOCK_SH); // Shared lock for reading
+    \$content = stream_get_contents(\$fp);
+    flock(\$fp, LOCK_UN);
+    fclose(\$fp);
+    
     if (!\$content) {
         return [
             'job_id' => '',
@@ -862,7 +878,10 @@ function writeJobJSON(\$jsonFile, \$data) {
 }
 
 // Helper function to add emails to buffer and flush when needed
-function addEmailsToBuffer(&\$buffer, \$emails, \$jsonFile, \$jobId, \$bufferSize = 100) {
+function addEmailsToBuffer(&\$buffer, \$emails, \$jsonFile, \$jobId, \$bufferSize = null) {
+    if (\$bufferSize === null) {
+        \$bufferSize = 100; // Default from Config::EMAIL_BUFFER_SIZE
+    }
     \$buffer = array_merge(\$buffer, \$emails);
     
     if (count(\$buffer) >= \$bufferSize) {
@@ -872,53 +891,70 @@ function addEmailsToBuffer(&\$buffer, \$emails, \$jsonFile, \$jobId, \$bufferSiz
     return true;
 }
 
-// Helper function to flush email buffer to JSON file
+// Helper function to flush email buffer to JSON file with proper locking
 function flushEmailBuffer(&\$buffer, \$jsonFile, \$jobId) {
     if (empty(\$buffer)) {
         return true;
     }
     
-    // Read current data
-    \$jobData = readJobJSON(\$jsonFile);
-    
-    if (empty(\$jobData['job_id'])) {
-        \$jobData['job_id'] = \$jobId;
+    // Acquire exclusive lock on a lock file to prevent race conditions
+    \$lockFile = \$jsonFile . '.lock';
+    \$lockFp = fopen(\$lockFile, 'c');
+    if (!\$lockFp) {
+        echo json_encode(['type' => 'error', 'message' => 'Failed to create lock file']) . "\\n";
+        return false;
     }
     
-    // Add new emails (ensure uniqueness by email address)
-    \$existingEmails = [];
-    foreach (\$jobData['emails'] as \$email) {
-        \$existingEmails[strtolower(\$email['email'])] = true;
-    }
+    // Acquire exclusive lock (blocks until available)
+    flock(\$lockFp, LOCK_EX);
     
-    \$addedCount = 0;
-    foreach (\$buffer as \$emailData) {
-        \$emailLower = strtolower(\$emailData['email']);
-        if (!isset(\$existingEmails[\$emailLower])) {
-            \$jobData['emails'][] = \$emailData;
-            \$existingEmails[\$emailLower] = true;
-            \$addedCount++;
+    try {
+        // Read current data (while we hold the lock)
+        \$jobData = readJobJSON(\$jsonFile);
+        
+        if (empty(\$jobData['job_id'])) {
+            \$jobData['job_id'] = \$jobId;
         }
+        
+        // Add new emails (ensure uniqueness by email address)
+        \$existingEmails = [];
+        foreach (\$jobData['emails'] as \$email) {
+            \$existingEmails[strtolower(\$email['email'])] = true;
+        }
+        
+        \$addedCount = 0;
+        foreach (\$buffer as \$emailData) {
+            \$emailLower = strtolower(\$emailData['email']);
+            if (!isset(\$existingEmails[\$emailLower])) {
+                \$jobData['emails'][] = \$emailData;
+                \$existingEmails[\$emailLower] = true;
+                \$addedCount++;
+            }
+        }
+        
+        \$jobData['total_count'] = count(\$jobData['emails']);
+        \$jobData['last_updated'] = time();
+        
+        // Write to file
+        \$success = writeJobJSON(\$jsonFile, \$jobData);
+        
+        if (\$success) {
+            // Clear buffer after successful write
+            \$buffer = [];
+            echo json_encode([
+                'type' => 'buffer_flushed',
+                'count' => \$addedCount,
+                'total' => \$jobData['total_count']
+            ]) . "\\n";
+            flush();
+        }
+        
+        return \$success;
+    } finally {
+        // Always release the lock
+        flock(\$lockFp, LOCK_UN);
+        fclose(\$lockFp);
     }
-    
-    \$jobData['total_count'] = count(\$jobData['emails']);
-    \$jobData['last_updated'] = time();
-    
-    // Write to file
-    \$success = writeJobJSON(\$jsonFile, \$jobData);
-    
-    if (\$success) {
-        // Clear buffer after successful write
-        \$buffer = [];
-        echo json_encode([
-            'type' => 'buffer_flushed',
-            'count' => \$addedCount,
-            'total' => \$jobData['total_count']
-        ]) . "\\n";
-        flush();
-    }
-    
-    return \$success;
 }
 
 // Serper API search function with pagination support
@@ -994,16 +1030,24 @@ if (empty(\$queryList) && !empty(\$query)) {
             'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
+// Cache for target checking (check every 10 iterations to reduce I/O)
+\$targetCheckCounter = 0;
+\$cachedTotal = 0;
+
 while ((time() - \$startTime) < \$maxRunTime) {
-    // Check target email count from JSON file
-    \$jobData = readJobJSON(\$jsonOutputFile);
-    \$currentTotal = \$jobData['total_count'];
-    
-    if (\$currentTotal >= \$maxEmails) {
-        // Flush any remaining emails in buffer
-        flushEmailBuffer(\$emailBuffer, \$jsonOutputFile, \$jobId);
-        echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
-        break;
+    // OPTIMIZED: Check target less frequently (every 10 iterations instead of every time)
+    \$targetCheckCounter++;
+    if (\$targetCheckCounter >= 10) {
+        \$jobData = readJobJSON(\$jsonOutputFile);
+        \$cachedTotal = \$jobData['total_count'];
+        \$targetCheckCounter = 0;
+        
+        if (\$cachedTotal >= \$maxEmails) {
+            // Flush any remaining emails in buffer
+            flushEmailBuffer(\$emailBuffer, \$jsonOutputFile, \$jobId);
+            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$cachedTotal]) . "\\n";
+            break;
+        }
     }
     
     // Output heartbeat
@@ -1045,12 +1089,11 @@ while ((time() - \$startTime) < \$maxRunTime) {
     \$batchEmails = [];
     
     for (\$i = 0; \$i < \$found; \$i++) {
-        // Check target from current buffer + existing data
-        \$jobData = readJobJSON(\$jsonOutputFile);
-        \$currentTotal = \$jobData['total_count'] + count(\$emailBuffer);
+        // OPTIMIZED: Use cached total instead of reading file on every iteration
+        \$estimatedTotal = \$cachedTotal + count(\$emailBuffer) + count(\$batchEmails);
         
-        if (\$currentTotal >= \$maxEmails) {
-            break 2; // Target reached, exit loops
+        if (\$estimatedTotal >= \$maxEmails) {
+            break; // Target likely reached, exit this batch
         }
         
         \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
