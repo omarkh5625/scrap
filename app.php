@@ -1858,9 +1858,13 @@ class APIHandler {
         
         $jobId = $this->jobManager->createJob($name, $apiKey, $query, $options);
         
+        // Get the created job to return in response
+        $createdJob = $this->jobManager->getJob($jobId);
+        
         return $this->jsonResponse([
             'success' => true,
-            'job_id' => $jobId
+            'job_id' => $jobId,
+            'job' => $createdJob
         ]);
     }
     
@@ -3272,11 +3276,16 @@ class Application {
                     if (result.success) {
                         UI.showAlert('Job created successfully!');
                         document.getElementById('createJobForm').reset();
-                        this.refreshJobs();
+                        
+                        // Small delay to ensure database write completes
+                        setTimeout(() => {
+                            this.refreshJobs();
+                        }, 500);
                     } else {
                         UI.showAlert(result.error || 'Failed to create job', 'error');
                     }
                 } catch (error) {
+                    console.error('Create job error:', error);
                     UI.showAlert('Error: ' + error.message, 'error');
                 }
             },
