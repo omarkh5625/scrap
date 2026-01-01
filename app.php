@@ -1240,7 +1240,8 @@ PHP;
             
             // Sleep between batches to avoid CPU spikes, but not after the last batch
             if ($batchNum < $totalBatches - 1) {
-                Utils::logMessage('DEBUG', "Batch {$batchNum + 1}/{$totalBatches} complete, sleeping for " . Config::WORKER_SPAWN_BATCH_DELAY . " second(s)");
+                $nextBatch = $batchNum + 1;
+                Utils::logMessage('DEBUG', "Batch {$nextBatch}/{$totalBatches} complete, sleeping for " . Config::WORKER_SPAWN_BATCH_DELAY . " second(s)");
                 sleep(Config::WORKER_SPAWN_BATCH_DELAY);
             }
         }
