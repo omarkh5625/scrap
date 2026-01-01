@@ -848,12 +848,23 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
     
     \$response = curl_exec(\$ch);
     \$statusCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
+    \$error = curl_error(\$ch);
     curl_close(\$ch);
+    
+    // Log API response for debugging
+    if (\$error) {
+        error_log("Serper API curl error: " . \$error);
+    }
+    if (\$statusCode !== 200) {
+        error_log("Serper API returned status: " . \$statusCode);
+    }
     
     if (\$statusCode === 200 && \$response) {
         \$data = json_decode(\$response, true);
-        if (isset(\$data['organic'])) {
+        if (isset(\$data['organic']) && is_array(\$data['organic'])) {
             return \$data['organic'];
+        } else {
+            error_log("Serper API response missing 'organic' field");
         }
     }
     
@@ -870,6 +881,22 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
 \$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
+// Try to fetch URLs from Serper API at startup
+if (!empty(\$apiKey)) {
+    echo json_encode(['type' => 'info', 'message' => 'Fetching URLs from Serper API...']) . "\\n";
+    \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
+    if (!empty(\$results)) {
+        foreach (\$results as \$result) {
+            if (isset(\$result['link'])) {
+                \$urlCache[] = \$result['link'];
+            }
+        }
+        echo json_encode(['type' => 'info', 'message' => 'Cached ' . count(\$urlCache) . ' URLs']) . "\\n";
+    } else {
+        echo json_encode(['type' => 'warning', 'message' => 'No URLs returned from Serper API']) . "\\n";
+    }
+}
+
 while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     // Check if we've reached the target email count across all workers
     if (\$pdo) {
@@ -884,8 +911,8 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
     flush();
     
-    // Fetch real URLs from Serper API if cache is empty or needs refresh
-    if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey)) {
+    // Refresh URL cache periodically if running low
+    if (count(\$urlCache) < 3 && !empty(\$apiKey)) {
         \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
         if (!empty(\$results)) {
             foreach (\$results as \$result) {
@@ -917,30 +944,13 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Use real URL from cache, prefer actual URLs over fallback
+        // Use real URL from cache - ALWAYS prefer cached URLs
         if (!empty(\$urlCache)) {
             \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
         } else {
-            // Try to fetch URLs one more time before using fallback
-            if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
-                if (!empty(\$results)) {
-                    foreach (\$results as \$result) {
-                        if (isset(\$result['link'])) {
-                            \$urlCache[] = \$result['link'];
-                        }
-                    }
-                    if (!empty(\$urlCache)) {
-                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-                    } else {
-                        \$sourceUrl = 'https://search-result-pending.local/query';
-                    }
-                } else {
-                    \$sourceUrl = 'https://search-result-pending.local/query';
-                }
-            } else {
-                \$sourceUrl = 'https://search-result-pending.local/query';
-            }
+            // Last resort fallback - this should rarely happen now
+            \$sourceUrl = 'https://search-result-pending.local/query';
+            echo json_encode(['type' => 'warning', 'message' => 'Using fallback URL - API may not be working']) . "\\n";
         }
         
         \$emailData = [
