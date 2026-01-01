@@ -1241,7 +1241,7 @@ PHP;
             // Sleep between batches to avoid CPU spikes, but not after the last batch
             if ($batchNum < $totalBatches - 1) {
                 $nextBatch = $batchNum + 1;
-                Utils::logMessage('DEBUG', "Batch {$nextBatch}/{$totalBatches} complete, sleeping for " . Config::WORKER_SPAWN_BATCH_DELAY . " second(s)");
+                Utils::logMessage('DEBUG', "Completed batch {$nextBatch}/{$totalBatches}, sleeping for " . Config::WORKER_SPAWN_BATCH_DELAY . " second(s) before next batch");
                 sleep(Config::WORKER_SPAWN_BATCH_DELAY);
             }
         }
@@ -1510,9 +1510,9 @@ class JobManager {
             
             if ($workersSpawned === 0) {
                 $job['status'] = 'error';
-                $this->addJobError($jobId, "Failed to spawn any workers. Check system requirements.");
+                $this->addJobError($jobId, "Failed to spawn any workers. Check system resources (memory, CPU), PHP configuration (proc_open enabled), or try reducing worker count.");
                 $this->saveJob($jobId);
-                throw new Exception("Failed to spawn any workers. Check system requirements.");
+                throw new Exception("Failed to spawn any workers. Check system requirements or reduce worker count.");
             }
             
             // Update persistent worker counts
