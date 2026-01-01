@@ -1168,6 +1168,7 @@ class JobManager {
             'status' => 'created',
             'created_at' => time(),
             'started_at' => null,
+            'completed_at' => null,
             'emails_found' => 0,
             'emails_accepted' => 0,
             'emails_rejected' => 0,
@@ -1552,6 +1553,31 @@ class JobManager {
                     
                     // Update email counts from file
                     $this->updateEmailCountsFromFile($jobId);
+                    
+                    // Check if target emails reached - auto-complete job
+                    $targetEmails = $this->jobs[$jobId]['target_emails'] ?? 10000;
+                    $emailsAccepted = $this->jobs[$jobId]['emails_accepted'] ?? 0;
+                    
+                    if ($emailsAccepted >= $targetEmails) {
+                        Utils::logMessage('INFO', "Job {$jobId} reached target ({$emailsAccepted}/{$targetEmails}) - completing job");
+                        
+                        // Stop all workers
+                        $this->jobs[$jobId]['worker_governor']->terminateAll();
+                        
+                        // Mark job as completed
+                        $this->jobs[$jobId]['status'] = 'completed';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->jobs[$jobId]['workers_running'] = 0;
+                        $this->jobs[$jobId]['completed_at'] = time();
+                        
+                        // Clear the worker governor
+                        $this->jobs[$jobId]['worker_governor'] = null;
+                        
+                        // Save the completed job
+                        $this->saveJob($jobId);
+                        
+                        Utils::logMessage('INFO', "Job {$jobId} completed successfully with {$emailsAccepted} emails");
+                    }
                 }
             }
         }
@@ -1612,12 +1638,12 @@ class JobManager {
                     id, name, query, options, status, 
                     emails_found, emails_accepted, emails_rejected, 
                     urls_processed, errors, worker_count, workers_running,
-                    started_at
+                    started_at, completed_at
                 ) VALUES (
                     :id, :name, :query, :options, :status,
                     :emails_found, :emails_accepted, :emails_rejected,
                     :urls_processed, :errors, :worker_count, :workers_running,
-                    :started_at
+                    :started_at, :completed_at
                 ) ON DUPLICATE KEY UPDATE
                     name = VALUES(name),
                     query = VALUES(query),
@@ -1630,7 +1656,8 @@ class JobManager {
                     errors = VALUES(errors),
                     worker_count = VALUES(worker_count),
                     workers_running = VALUES(workers_running),
-                    started_at = VALUES(started_at)";
+                    started_at = VALUES(started_at),
+                    completed_at = VALUES(completed_at)";
                 
                 $this->db->execute($sql, [
                     ':id' => $jobId,
@@ -1645,7 +1672,8 @@ class JobManager {
                     ':errors' => $jobData['errors'],
                     ':worker_count' => $jobData['worker_count'],
                     ':workers_running' => $jobData['workers_running'],
-                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null
+                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null,
+                    ':completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? date('Y-m-d H:i:s', $jobData['completed_at']) : null
                 ]);
                 
                 Utils::logMessage('DEBUG', "Job {$jobId} saved to database");
@@ -1696,6 +1724,7 @@ class JobManager {
                         'status' => $jobData['status'],
                         'created_at' => strtotime($jobData['created_at']),
                         'started_at' => $jobData['started_at'] ? strtotime($jobData['started_at']) : null,
+                        'completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? strtotime($jobData['completed_at']) : null,
                         'emails_found' => (int)$jobData['emails_found'],
                         'emails_accepted' => (int)$jobData['emails_accepted'],
                         'emails_rejected' => (int)$jobData['emails_rejected'],

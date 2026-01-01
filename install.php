@@ -98,6 +98,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     `workers_running` INT UNSIGNED DEFAULT 0,
                     `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     `started_at` TIMESTAMP NULL,
+                    `completed_at` TIMESTAMP NULL,
                     `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX `idx_status` (`status`),
                     INDEX `idx_created_at` (`created_at`)
