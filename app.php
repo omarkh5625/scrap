@@ -726,11 +726,12 @@ class WorkerGovernor {
 \$dataDir = '{$dataDir}';
 \$apiKey = \$config['api_key'] ?? '';
 \$query = \$config['query'] ?? '';
-\$country = \$config['country'] ?? 'us';
+\$country = \$config['country'] ?? '';
 \$language = \$config['language'] ?? 'en';
 \$maxEmails = \$config['max_emails'] ?? 10000;
 \$emailTypes = \$config['email_types'] ?? '';
 \$customDomains = \$config['custom_domains'] ?? [];
+\$keywords = \$config['keywords'] ?? [];
 
 // Database configuration
 \$dbHost = '{$dbHost}';
@@ -817,6 +818,18 @@ function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$max
         }
     }
     return null;
+}
+
+// Helper function to check if email already exists in database
+function isEmailDuplicate(\$pdo, \$jobId, \$email) {
+    try {
+        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id AND email = :email");
+        \$stmt->execute([':job_id' => \$jobId, ':email' => \$email]);
+        \$result = \$stmt->fetch();
+        return (int)\$result['count'] > 0;
+    } catch (PDOException \$e) {
+        return false;
+    }
 }
 
 // Helper function to get current email count from database
@@ -926,6 +939,33 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
 \$urlCache = [];
 \$currentPage = 1;
 \$maxPages = 30; // Expand to 30 pages as required
+\$seenEmails = []; // In-memory deduplication cache for this worker
+\$noResultsCount = 0; // Track consecutive failed queries
+\$currentQueryIndex = 0; // Track which query/keyword we're using
+
+// Build query list: main query + keywords
+\$queryList = [];
+if (!empty(\$query)) {
+    \$queryList[] = \$query;
+}
+if (!empty(\$keywords)) {
+    foreach (\$keywords as \$keyword) {
+        if (!empty(\$keyword)) {
+            // Combine main query with keyword if both exist
+            if (!empty(\$query)) {
+                \$queryList[] = \$query . ' ' . \$keyword;
+            } else {
+                \$queryList[] = \$keyword;
+            }
+        }
+    }
+}
+// If no queries at all, use main query as fallback
+if (empty(\$queryList) && !empty(\$query)) {
+    \$queryList[] = \$query;
+}
+
+\$activeQuery = !empty(\$queryList) ? \$queryList[\$currentQueryIndex % count(\$queryList)] : \$query;
 
 // Common domains for test emails - expanded to match all types
 \$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'att.net', 'sbcglobal.net', 
@@ -949,8 +989,9 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     // Fetch real URLs from Serper API if cache is empty or needs refresh
     // Iterate through pages up to maxPages
     if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
-        \$results = searchSerper(\$apiKey, \$query, \$country, \$language, \$currentPage);
+        \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
         if (!empty(\$results)) {
+            \$noResultsCount = 0; // Reset no results counter
             foreach (\$results as \$result) {
                 if (isset(\$result['link'])) {
                     \$urlCache[] = \$result['link'];
@@ -958,8 +999,21 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
             }
             \$currentPage++; // Move to next page
         } else {
-            // No more results, reset to page 1
-            \$currentPage = 1;
+            // No results found for this query
+            \$noResultsCount++;
+            echo json_encode(['type' => 'no_results', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
+            
+            // If no results for 2 consecutive attempts, switch to next query
+            if (\$noResultsCount >= 2 && !empty(\$queryList) && count(\$queryList) > 1) {
+                \$currentQueryIndex++;
+                \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
+                \$currentPage = 1; // Reset to page 1 for new query
+                \$noResultsCount = 0;
+                echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+            } else {
+                // Reset to page 1 for same query
+                \$currentPage = 1;
+            }
         }
     }
     
@@ -984,9 +1038,29 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
+        // Check for duplicates in memory cache first
+        \$emailLower = strtolower(\$email);
+        if (isset(\$seenEmails[\$emailLower])) {
+            continue; // Skip duplicate email (already seen in this worker)
+        }
+        
+        // Check for duplicates in database if available
+        if (\$pdo && isEmailDuplicate(\$pdo, \$jobId, \$email)) {
+            \$seenEmails[\$emailLower] = true; // Cache it to avoid future DB checks
+            continue; // Skip duplicate email (already in database)
+        }
+        
         // Filter email by type if specified
         if (!matchesEmailType(\$email, \$emailTypes, \$customDomains)) {
             continue; // Skip this email, doesn't match selected types
+        }
+        
+        // Mark as seen in memory cache
+        \$seenEmails[\$emailLower] = true;
+        
+        // Prevent memory overflow (keep only last 10k emails in cache)
+        if (count(\$seenEmails) > 10000) {
+            \$seenEmails = array_slice(\$seenEmails, 5000, null, true);
         }
         
         // Use real URL from cache, prefer actual URLs over fallback
@@ -995,7 +1069,7 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         } else {
             // Try to fetch URLs one more time before using fallback
             if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$query, \$country, \$language, \$currentPage);
+                \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
                 if (!empty(\$results)) {
                     foreach (\$results as \$result) {
                         if (isset(\$result['link'])) {
@@ -1366,12 +1440,13 @@ class JobManager {
                 'job_id' => $jobId,
                 'api_key' => $job['api_key'],
                 'query' => $job['query'],
-                'country' => $job['options']['country'] ?? 'us',
+                'country' => $job['options']['country'] ?? '',
                 'language' => $job['options']['language'] ?? 'en',
                 'max_emails' => $job['options']['max_emails'] ?? 10000,
                 'max_run_time' => 300,
                 'email_types' => $job['options']['email_types'] ?? '',
-                'custom_domains' => $job['options']['custom_domains'] ?? []
+                'custom_domains' => $job['options']['custom_domains'] ?? [],
+                'keywords' => $job['options']['keywords'] ?? []
             ];
             
             // Get the desired number of workers from job options
@@ -1572,12 +1647,13 @@ class JobManager {
                             'job_id' => $jobId,
                             'api_key' => $job['api_key'],
                             'query' => $job['query'],
-                            'country' => $job['options']['country'] ?? 'us',
+                            'country' => $job['options']['country'] ?? '',
                             'language' => $job['options']['language'] ?? 'en',
                             'max_emails' => $job['options']['max_emails'] ?? 10000,
                             'max_run_time' => 300,
                             'email_types' => $job['options']['email_types'] ?? '',
-                            'custom_domains' => $job['options']['custom_domains'] ?? []
+                            'custom_domains' => $job['options']['custom_domains'] ?? [],
+                            'keywords' => $job['options']['keywords'] ?? []
                         ];
                         
                         $currentWorkers = count($governor->getWorkers());
@@ -3070,6 +3146,7 @@ class Application {
                     <div class="form-group">
                         <label for="country">Country</label>
                         <select id="country" name="country">
+                            <option value="">Worldwide (All Countries)</option>
                             <option value="us">United States</option>
                             <option value="uk">United Kingdom</option>
                             <option value="ca">Canada</option>
@@ -3078,6 +3155,11 @@ class Application {
                             <option value="fr">France</option>
                             <option value="es">Spain</option>
                             <option value="it">Italy</option>
+                            <option value="br">Brazil</option>
+                            <option value="mx">Mexico</option>
+                            <option value="in">India</option>
+                            <option value="jp">Japan</option>
+                            <option value="cn">China</option>
                         </select>
                     </div>
                     
