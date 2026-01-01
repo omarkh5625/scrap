@@ -665,6 +665,22 @@ class WorkerGovernor {
     }
     
     public function spawnWorker($workerId, $config) {
+        // Hard cap at 200 workers - enforce here, not just in UI
+        $currentWorkerCount = count($this->workers);
+        if ($currentWorkerCount >= 200) {
+            Utils::logMessage('WARNING', "Cannot spawn worker {$workerId}: hard limit of 200 workers reached (current: {$currentWorkerCount})");
+            throw new Exception("Worker limit of 200 reached");
+        }
+        
+        // Check system load before spawning
+        if (function_exists('sys_getloadavg')) {
+            $load = sys_getloadavg();
+            if ($load[0] > 20) {
+                Utils::logMessage('WARNING', "Cannot spawn worker {$workerId}: system load too high ({$load[0]})");
+                throw new Exception("System load too high: {$load[0]}");
+            }
+        }
+        
         $workerScript = $this->generateWorkerScript($workerId, $config);
         
         $descriptorspec = [
@@ -739,15 +755,12 @@ class WorkerGovernor {
 \$maxPages = \$config['max_pages'] ?? 200; // Configurable max pages per query
 \$maxRunTime = \$config['max_run_time'] ?? 7200; // Configurable worker runtime
 
-// Database configuration
-\$dbHost = '{$dbHost}';
-\$dbPort = '{$dbPort}';
-\$dbName = '{$dbName}';
-\$dbUser = '{$dbUser}';
-\$dbPass = '{$dbPass}';
-
-// Email storage file (fallback)
-\$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
+// Raw data directory for this worker
+\$rawDataDir = '/data/raw/job_' . \$jobId;
+if (!file_exists(\$rawDataDir)) {
+    @mkdir(\$rawDataDir, 0755, true);
+}
+\$workerOutputFile = \$rawDataDir . '/worker_' . \$workerId . '.json';
 
 // Helper function to check if email matches selected types
 function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
@@ -805,103 +818,40 @@ function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
     return false;
 }
 
-// Helper function to connect to database with retry
-function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$maxRetries = 3) {
-    \$attempts = 0;
-    while (\$attempts < \$maxRetries) {
-        try {
-            \$dsn = "mysql:host={\$dbHost};port={\$dbPort};dbname={\$dbName};charset=utf8mb4";
-            \$pdo = new PDO(\$dsn, \$dbUser, \$dbPass, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-            ]);
-            return \$pdo;
-        } catch (PDOException \$e) {
-            \$attempts++;
-            if (\$attempts < \$maxRetries) {
-                sleep(2);
+// Helper function to write emails to raw JSON file (no deduplication, no database)
+function writeEmailsToRawFile(\$filePath, \$emailBatch) {
+    \$data = [
+        'emails' => \$emailBatch,
+        'count' => count(\$emailBatch),
+        'timestamp' => time()
+    ];
+    
+    // Append to file with unique timestamp to avoid conflicts
+    \$uniqueFile = \$filePath . '.' . microtime(true) . '.tmp';
+    file_put_contents(\$uniqueFile, json_encode(\$data) . "\\n", LOCK_EX);
+    
+    // Atomic rename
+    @rename(\$uniqueFile, \$filePath . '.' . time() . '.json');
+}
+
+// Helper function to count emails from raw files (approximate)
+function getApproximateEmailCount(\$rawDataDir) {
+    \$count = 0;
+    if (is_dir(\$rawDataDir)) {
+        \$files = glob(\$rawDataDir . '/worker_*.json*');
+        foreach (\$files as \$file) {
+            if (is_readable(\$file)) {
+                \$content = @file_get_contents(\$file);
+                if (\$content) {
+                    \$data = @json_decode(\$content, true);
+                    if (\$data && isset(\$data['count'])) {
+                        \$count += \$data['count'];
+                    }
+                }
             }
         }
     }
-    return null;
-}
-
-// Helper function to check if email already exists in database
-function isEmailDuplicate(\$pdo, \$jobId, \$email) {
-    try {
-        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id AND email = :email");
-        \$stmt->execute([':job_id' => \$jobId, ':email' => \$email]);
-        \$result = \$stmt->fetch();
-        return (int)\$result['count'] > 0;
-    } catch (PDOException \$e) {
-        return false;
-    }
-}
-
-// Helper function to get current email count from database
-function getCurrentEmailCount(\$pdo, \$jobId) {
-    try {
-        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id");
-        \$stmt->execute([':job_id' => \$jobId]);
-        \$result = \$stmt->fetch();
-        return (int)\$result['count'];
-    } catch (PDOException \$e) {
-        return 0;
-    }
-}
-
-// Helper function to save email to database
-function saveEmailToDB(\$pdo, \$jobId, \$emailData) {
-    try {
-        \$sql = "INSERT INTO emails (job_id, email, quality, confidence, source_url, worker_id) 
-                VALUES (:job_id, :email, :quality, :confidence, :source_url, :worker_id)
-                ON DUPLICATE KEY UPDATE 
-                    quality = VALUES(quality),
-                    confidence = VALUES(confidence),
-                    source_url = VALUES(source_url),
-                    worker_id = VALUES(worker_id)";
-        
-        \$stmt = \$pdo->prepare(\$sql);
-        \$stmt->execute([
-            ':job_id' => \$jobId,
-            ':email' => \$emailData['email'],
-            ':quality' => \$emailData['quality'],
-            ':confidence' => \$emailData['confidence'],
-            ':source_url' => \$emailData['source_url'],
-            ':worker_id' => \$emailData['worker_id']
-        ]);
-        return true;
-    } catch (PDOException \$e) {
-        error_log("Worker {\$emailData['worker_id']} DB error: " . \$e->getMessage());
-        return false;
-    }
-}
-
-// Helper function to save email to file (fallback)
-function saveEmailToFile(\$emailFile, \$emailData) {
-    if (!file_exists(dirname(\$emailFile))) {
-        @mkdir(dirname(\$emailFile), 0755, true);
-    }
-    
-    \$data = ['emails' => [], 'total' => 0, 'last_updated' => time()];
-    if (file_exists(\$emailFile)) {
-        \$existing = json_decode(file_get_contents(\$emailFile), true);
-        if (\$existing) {
-            \$data = \$existing;
-        }
-    }
-    
-    \$data['emails'][] = \$emailData;
-    \$data['total'] = count(\$data['emails']);
-    \$data['last_updated'] = time();
-    
-    file_put_contents(\$emailFile, json_encode(\$data), LOCK_EX);
-}
-
-// Initialize database connection
-\$pdo = null;
-if (!empty(\$dbHost) && !empty(\$dbName)) {
-    \$pdo = getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass);
+    return \$count;
 }
 
 // Serper API search function with pagination support
@@ -977,13 +927,11 @@ if (empty(\$queryList) && !empty(\$query)) {
 \$qualities = ['high', 'medium', 'low'];
 
 while ((time() - \$startTime) < \$maxRunTime) {
-    // Check if we've reached the target email count across all workers
-    if (\$pdo) {
-        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-        if (\$currentTotal >= \$maxEmails) {
-            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
-            break; // Stop this worker, target reached
-        }
+    // Check if we've reached the target email count (approximate from files)
+    \$currentTotal = getApproximateEmailCount(\$rawDataDir);
+    if (\$currentTotal >= \$maxEmails) {
+        echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
+        break; // Stop this worker, target reached
     }
     
     // Output heartbeat
@@ -1025,16 +973,9 @@ while ((time() - \$startTime) < \$maxRunTime) {
     sleep(rand(10, 30));
     
     // Generate realistic emails with real source URLs
+    \$emailBatch = [];
     \$found = rand(3, 8);
     for (\$i = 0; \$i < \$found; \$i++) {
-        // Check target again before each email
-        if (\$pdo) {
-            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-            if (\$currentTotal >= \$maxEmails) {
-                break 2; // Break out of both loops
-            }
-        }
-        
         \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
         \$lastName = ['smith', 'johnson', 'williams', 'jones', 'brown', 'davis', 'miller', 'wilson'][rand(0, 7)];
         \$domain = \$domains[rand(0, count(\$domains) - 1)];
@@ -1042,7 +983,7 @@ while ((time() - \$startTime) < \$maxRunTime) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Check for duplicates in memory cache first
+        // Simple in-memory deduplication for this worker only
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
             continue; // Skip duplicate email (already seen in this worker)
@@ -1093,30 +1034,28 @@ while ((time() - \$startTime) < \$maxRunTime) {
             }
         }
         
-        \$emailData = [
+        // Add to batch (no database operations)
+        \$emailBatch[] = [
             'email' => \$email,
             'quality' => \$quality,
             'source_url' => \$sourceUrl,
             'timestamp' => time(),
             'confidence' => rand(60, 95) / 100,
-            'worker_id' => \$workerId
+            'worker_id' => \$workerId,
+            'job_id' => \$jobId
         ];
-        
-        // Save to database first, fallback to file
-        if (\$pdo) {
-            if (!saveEmailToDB(\$pdo, \$jobId, \$emailData)) {
-                saveEmailToFile(\$emailFile, \$emailData);
-            }
-        } else {
-            saveEmailToFile(\$emailFile, \$emailData);
-        }
         \$extractedCount++;
+    }
+    
+    // Write entire batch to raw JSON file (no deduplication, no database)
+    if (!empty(\$emailBatch)) {
+        writeEmailsToRawFile(\$workerOutputFile, \$emailBatch);
     }
     
     echo json_encode([
         'type' => 'emails_found',
         'worker_id' => \$workerId,
-        'count' => \$found,
+        'count' => count(\$emailBatch),
         'time' => time()
     ]) . "\\n";
     flush();
@@ -1213,11 +1152,17 @@ PHP;
         $spawned = 0;
         $current = count($this->workers);
         
-        // Cap at max workers
-        $actualCount = min($count, $this->maxWorkers - $current);
+        // Hard cap at 200 workers
+        if ($current >= 200) {
+            Utils::logMessage('WARNING', "Batch spawn requested but hard limit of 200 workers already reached (current: {$current})");
+            return 0;
+        }
+        
+        // Cap at max workers (200)
+        $actualCount = min($count, 200 - $current);
         
         if ($actualCount <= 0) {
-            Utils::logMessage('WARNING', "Batch spawn requested for {$count} workers, but maximum capacity reached or invalid count (current: {$current}, max: {$this->maxWorkers})");
+            Utils::logMessage('WARNING', "Batch spawn requested for {$count} workers, but maximum capacity reached or invalid count (current: {$current}, max: 200)");
             return 0;
         }
         
@@ -1228,6 +1173,15 @@ PHP;
         Utils::logMessage('INFO', "Starting batch spawn: {$actualCount} workers in {$totalBatches} batches");
         
         for ($batchNum = 0; $batchNum < $totalBatches; $batchNum++) {
+            // Check system load before each batch
+            if (function_exists('sys_getloadavg')) {
+                $load = sys_getloadavg();
+                if ($load[0] > 20) {
+                    Utils::logMessage('WARNING', "Stopping batch spawn: system load too high ({$load[0]})");
+                    break;
+                }
+            }
+            
             $workersInThisBatch = min($batchSize, $actualCount - $spawned);
             
             for ($i = 0; $i < $workersInThisBatch; $i++) {
@@ -1238,6 +1192,11 @@ PHP;
                 } catch (Exception $e) {
                     $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
                     Utils::logMessage('ERROR', $errorMsg);
+                    
+                    // If we hit the worker limit or load limit, stop trying
+                    if (strpos($e->getMessage(), 'limit') !== false || strpos($e->getMessage(), 'load') !== false) {
+                        break 2; // Break out of both loops
+                    }
                 }
             }
             
