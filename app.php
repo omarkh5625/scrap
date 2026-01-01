@@ -1414,15 +1414,22 @@ class JobManager {
     public function checkAllJobs() {
         foreach ($this->jobs as $jobId => $job) {
             if ($job['status'] === 'running') {
-                // Skip jobs without API key (they should have been stopped on load)
+                // Skip jobs without API key only if they also have no workers
+                // Jobs with workers are actively running and should continue
                 if (empty($job['api_key'])) {
-                    Utils::logMessage('WARNING', "Skipping job {$jobId} - no API key");
-                    // Auto-stop it if somehow still running
-                    $this->jobs[$jobId]['status'] = 'stopped';
-                    $this->jobs[$jobId]['worker_count'] = 0;
-                    $this->jobs[$jobId]['workers_running'] = 0;
-                    $this->saveJob($jobId);
-                    continue;
+                    if (isset($job['workers_running']) && $job['workers_running'] > 0) {
+                        // Job has workers running, skip the API key check
+                        // This happens during normal operation after DB reload
+                        Utils::logMessage('DEBUG', "Job {$jobId} has {$job['workers_running']} workers running, continuing without API key check");
+                    } else {
+                        // Job has no API key and no workers - stop it
+                        Utils::logMessage('WARNING', "Stopping job {$jobId} - no API key and no workers");
+                        $this->jobs[$jobId]['status'] = 'stopped';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->jobs[$jobId]['workers_running'] = 0;
+                        $this->saveJob($jobId);
+                        continue;
+                    }
                 }
                 
                 // Restore worker governor if it doesn't exist
