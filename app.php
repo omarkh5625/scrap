@@ -728,6 +728,7 @@ class WorkerGovernor {
 \$query = \$config['query'] ?? '';
 \$country = \$config['country'] ?? 'us';
 \$language = \$config['language'] ?? 'en';
+\$maxEmails = \$config['max_emails'] ?? 10000;
 
 // Database configuration
 \$dbHost = '{$dbHost}';
@@ -758,6 +759,18 @@ function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$max
         }
     }
     return null;
+}
+
+// Helper function to get current email count from database
+function getCurrentEmailCount(\$pdo, \$jobId) {
+    try {
+        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id");
+        \$stmt->execute([':job_id' => \$jobId]);
+        \$result = \$stmt->fetch();
+        return (int)\$result['count'];
+    } catch (PDOException \$e) {
+        return 0;
+    }
 }
 
 // Helper function to save email to database
@@ -858,12 +871,21 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
 \$qualities = ['high', 'medium', 'low'];
 
 while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
+    // Check if we've reached the target email count across all workers
+    if (\$pdo) {
+        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+        if (\$currentTotal >= \$maxEmails) {
+            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
+            break; // Stop this worker, target reached
+        }
+    }
+    
     // Output heartbeat
     echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
     flush();
     
-    // Fetch real URLs from Serper API if cache is empty
-    if (empty(\$urlCache) && !empty(\$apiKey)) {
+    // Fetch real URLs from Serper API if cache is empty or needs refresh
+    if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey)) {
         \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
         if (!empty(\$results)) {
             foreach (\$results as \$result) {
@@ -880,6 +902,14 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     // Generate realistic emails with real source URLs
     \$found = rand(3, 8);
     for (\$i = 0; \$i < \$found; \$i++) {
+        // Check target again before each email
+        if (\$pdo) {
+            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+            if (\$currentTotal >= \$maxEmails) {
+                break 2; // Break out of both loops
+            }
+        }
+        
         \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
         \$lastName = ['smith', 'johnson', 'williams', 'jones', 'brown', 'davis', 'miller', 'wilson'][rand(0, 7)];
         \$domain = \$domains[rand(0, count(\$domains) - 1)];
@@ -887,11 +917,30 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Use real URL from cache or fallback
+        // Use real URL from cache, prefer actual URLs over fallback
         if (!empty(\$urlCache)) {
             \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
         } else {
-            \$sourceUrl = 'https://search-result-pending.local/query';
+            // Try to fetch URLs one more time before using fallback
+            if (!empty(\$apiKey)) {
+                \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
+                if (!empty(\$results)) {
+                    foreach (\$results as \$result) {
+                        if (isset(\$result['link'])) {
+                            \$urlCache[] = \$result['link'];
+                        }
+                    }
+                    if (!empty(\$urlCache)) {
+                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
+                    } else {
+                        \$sourceUrl = 'https://search-result-pending.local/query';
+                    }
+                } else {
+                    \$sourceUrl = 'https://search-result-pending.local/query';
+                }
+            } else {
+                \$sourceUrl = 'https://search-result-pending.local/query';
+            }
         }
         
         \$emailData = [
