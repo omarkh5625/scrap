@@ -1493,7 +1493,7 @@ class JobManager {
                 'query' => $job['query'],
                 'country' => $job['options']['country'] ?? '',
                 'language' => $job['options']['language'] ?? 'en',
-                'max_emails' => $job['options']['max_emails'] ?? 10000,
+                'max_emails' => $job['options']['target_emails'] ?? 10000, // Use target_emails as the stop condition
                 'max_run_time' => $job['options']['max_run_time'] ?? Config::DEFAULT_WORKER_RUNTIME,
                 'max_pages' => $job['options']['max_pages'] ?? Config::DEFAULT_MAX_PAGES,
                 'email_types' => $job['options']['email_types'] ?? '',
@@ -1691,7 +1691,7 @@ class JobManager {
                             'query' => $job['query'],
                             'country' => $job['options']['country'] ?? '',
                             'language' => $job['options']['language'] ?? 'en',
-                            'max_emails' => $job['options']['max_emails'] ?? 10000,
+                            'max_emails' => $job['options']['target_emails'] ?? 10000, // Use target_emails as the stop condition
                             'max_run_time' => $job['options']['max_run_time'] ?? Config::DEFAULT_WORKER_RUNTIME,
                             'max_pages' => $job['options']['max_pages'] ?? Config::DEFAULT_MAX_PAGES,
                             'email_types' => $job['options']['email_types'] ?? '',
@@ -2027,8 +2027,8 @@ class APIHandler {
         
         $options = [
             'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
-            'max_emails' => (int)($_POST['max_emails'] ?? 10000),
-            'target_emails' => (int)($_POST['target_emails'] ?? 10000), // Target for progress tracking
+            'target_emails' => (int)($_POST['target_emails'] ?? 10000),
+            'max_emails' => (int)($_POST['target_emails'] ?? 10000), // Same as target_emails for worker stop condition
             'keywords' => $keywordList,
             'country' => $country,
             'language' => $language,
