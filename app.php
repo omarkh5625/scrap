@@ -1326,11 +1326,31 @@ class JobManager {
             $this->stopJob($jobId);
         }
         
+        // Delete from database if configured
+        if ($this->db->isConfigured()) {
+            try {
+                // Delete related emails first
+                $this->db->execute("DELETE FROM emails WHERE job_id = :job_id", [':job_id' => $jobId]);
+                
+                // Delete job from database (cascade will delete job_errors)
+                $this->db->execute("DELETE FROM jobs WHERE id = :job_id", [':job_id' => $jobId]);
+                
+                Utils::logMessage('INFO', "Job {$jobId} deleted from database");
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to delete job from database: {$e->getMessage()}");
+                // Continue with memory/file deletion even if database deletion fails
+            }
+        }
+        
         unset($this->jobs[$jobId]);
         
         // Delete job file
         $jobFile = $this->dataDir . "/job_{$jobId}.json";
         @unlink($jobFile);
+        
+        // Delete email file
+        $emailFile = $this->dataDir . "/job_{$jobId}_emails.json";
+        @unlink($emailFile);
         
         Utils::logMessage('INFO', "Job deleted: {$jobId}");
         
