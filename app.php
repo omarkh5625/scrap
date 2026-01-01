@@ -61,7 +61,13 @@ class Database {
     private function __construct() {
         $this->isConfigured = defined('DB_HOST') && defined('DB_NAME') && defined('DB_USER');
         if ($this->isConfigured) {
-            $this->connect();
+            try {
+                $this->connect();
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Database initialization failed: {$e->getMessage()}");
+                $this->isConfigured = false;
+                $this->pdo = null;
+            }
         }
     }
     
@@ -116,7 +122,9 @@ class Database {
         }
         
         Utils::logMessage('ERROR', "Failed to connect to database after {$attempts} attempts: {$lastError}");
-        throw new Exception("Database connection failed: {$lastError}");
+        // Don't throw exception - mark as not configured instead
+        $this->isConfigured = false;
+        $this->pdo = null;
     }
     
     public function getConnection() {
@@ -126,19 +134,32 @@ class Database {
         
         // Ensure connection is alive
         if ($this->pdo === null) {
-            $this->connect();
+            try {
+                $this->connect();
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to establish database connection: {$e->getMessage()}");
+                return null;
+            }
         }
         
         return $this->pdo;
     }
     
     public function query($sql, $params = []) {
+        if (!$this->isConfigured) {
+            throw new Exception('Database not configured');
+        }
+        
         $attempts = 0;
         $lastError = null;
         
         while ($attempts < Config::DB_RETRY_ATTEMPTS) {
             try {
                 $pdo = $this->getConnection();
+                if ($pdo === null) {
+                    throw new Exception('Failed to get database connection');
+                }
+                
                 $stmt = $pdo->prepare($sql);
                 $stmt->execute($params);
                 return $stmt;
@@ -154,6 +175,10 @@ class Database {
                 if ($attempts < Config::DB_RETRY_ATTEMPTS) {
                     sleep(Config::DB_RETRY_DELAY);
                 }
+            } catch (Exception $e) {
+                $lastError = $e->getMessage();
+                Utils::logMessage('ERROR', "Query failed: {$lastError}");
+                throw $e;
             }
         }
         
@@ -1317,7 +1342,30 @@ class JobManager {
         $this->dataDir = Config::DATA_DIR;
         @mkdir($this->dataDir, 0755, true);
         $this->db = Database::getInstance();
+        $this->ensureDatabaseSchema();
         $this->loadJobs();
+    }
+    
+    private function ensureDatabaseSchema() {
+        if (!$this->db->isConfigured()) {
+            return;
+        }
+        
+        try {
+            // Check if completed_at column exists
+            $stmt = $this->db->query("SHOW COLUMNS FROM jobs LIKE 'completed_at'");
+            $result = $stmt->fetch();
+            
+            if (!$result) {
+                // Add completed_at column
+                Utils::logMessage('INFO', "Adding completed_at column to jobs table");
+                $this->db->execute("ALTER TABLE jobs ADD COLUMN completed_at DATETIME NULL AFTER started_at");
+                Utils::logMessage('INFO', "completed_at column added successfully");
+            }
+        } catch (Exception $e) {
+            Utils::logMessage('WARNING', "Could not check/add completed_at column: {$e->getMessage()}");
+            // Don't fail - system will work with file-based storage
+        }
     }
     
     public function createJob($name, $apiKey, $query, $options = []) {
