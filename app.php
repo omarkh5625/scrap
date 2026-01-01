@@ -972,6 +972,20 @@ if (empty(\$queryList) && !empty(\$query)) {
             'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
+// Pre-populate URL cache before starting the main loop
+if (!empty(\$apiKey)) {
+    echo json_encode(['type' => 'initial_fetch', 'worker_id' => \$workerId, 'query' => \$activeQuery]) . "\\n";
+    \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, 1);
+    if (!empty(\$results)) {
+        foreach (\$results as \$result) {
+            if (isset(\$result['link'])) {
+                \$urlCache[] = \$result['link'];
+            }
+        }
+        echo json_encode(['type' => 'initial_cache', 'worker_id' => \$workerId, 'url_count' => count(\$urlCache)]) . "\\n";
+    }
+}
+
 while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     // Check if we've reached the target email count across all workers
     if (\$pdo) {
@@ -1013,6 +1027,23 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
             } else {
                 // Reset to page 1 for same query
                 \$currentPage = 1;
+            }
+        }
+    }
+    
+    // Ensure we have URLs in cache before generating emails
+    // Try to fetch URLs if cache is empty or low
+    if ((empty(\$urlCache) || count(\$urlCache) < 10) && !empty(\$apiKey)) {
+        echo json_encode(['type' => 'fetching_urls', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
+        \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+        if (!empty(\$results)) {
+            foreach (\$results as \$result) {
+                if (isset(\$result['link'])) {
+                    \$urlCache[] = \$result['link'];
+                }
+            }
+            if (count(\$urlCache) > 0) {
+                echo json_encode(['type' => 'urls_cached', 'worker_id' => \$workerId, 'count' => count(\$urlCache)]) . "\\n";
             }
         }
     }
@@ -1063,29 +1094,26 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
             \$seenEmails = array_slice(\$seenEmails, 5000, null, true);
         }
         
-        // Use real URL from cache, prefer actual URLs over fallback
+        // Use real URL from cache - always prefer real URLs
+        \$sourceUrl = 'https://search-result-pending.local/query'; // Default fallback
+        
         if (!empty(\$urlCache)) {
+            // We have cached URLs, use one randomly
             \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-        } else {
-            // Try to fetch URLs one more time before using fallback
-            if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
-                if (!empty(\$results)) {
-                    foreach (\$results as \$result) {
-                        if (isset(\$result['link'])) {
-                            \$urlCache[] = \$result['link'];
-                        }
+        } else if (!empty(\$apiKey)) {
+            // Cache is empty, try to fetch URLs immediately
+            echo json_encode(['type' => 'urgent_fetch', 'worker_id' => \$workerId]) . "\\n";
+            \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+            if (!empty(\$results)) {
+                foreach (\$results as \$result) {
+                    if (isset(\$result['link'])) {
+                        \$urlCache[] = \$result['link'];
                     }
-                    if (!empty(\$urlCache)) {
-                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-                    } else {
-                        \$sourceUrl = 'https://search-result-pending.local/query';
-                    }
-                } else {
-                    \$sourceUrl = 'https://search-result-pending.local/query';
                 }
-            } else {
-                \$sourceUrl = 'https://search-result-pending.local/query';
+                if (!empty(\$urlCache)) {
+                    \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
+                    echo json_encode(['type' => 'urgent_fetch_success', 'worker_id' => \$workerId, 'url_count' => count(\$urlCache)]) . "\\n";
+                }
             }
         }
         
