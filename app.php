@@ -37,8 +37,10 @@ if (file_exists($configFile)) {
 // Configuration
 class Config {
     const VERSION = '1.0.0';
-    const MAX_WORKERS_PER_JOB = 1000; // Increased for 32GB RAM server
+    const MAX_WORKERS_PER_JOB = 200; // Capped at 200 for optimal performance
     const MIN_WORKERS_PER_JOB = 1;
+    const WORKER_SPAWN_BATCH_SIZE = 20; // Spawn workers in batches of 20
+    const WORKER_SPAWN_BATCH_DELAY = 1; // Wait 1 second between batches
     const WORKER_TIMEOUT = 300; // 5 minutes
     const ZOMBIE_CHECK_INTERVAL = 60; // 1 minute
     const MEMORY_LIMIT_MB = 450; // Alert at 450MB
@@ -1205,6 +1207,49 @@ PHP;
         return true;
     }
     
+    public function spawnWorkersBatch($count, $config) {
+        $spawned = 0;
+        $current = count($this->workers);
+        
+        // Cap at max workers
+        $actualCount = min($count, $this->maxWorkers - $current);
+        
+        if ($actualCount <= 0) {
+            return 0;
+        }
+        
+        // Calculate batches
+        $batchSize = Config::WORKER_SPAWN_BATCH_SIZE;
+        $totalBatches = ceil($actualCount / $batchSize);
+        
+        Utils::logMessage('INFO', "Starting batch spawn: {$actualCount} workers in {$totalBatches} batches");
+        
+        for ($batchNum = 0; $batchNum < $totalBatches; $batchNum++) {
+            $workersInThisBatch = min($batchSize, $actualCount - $spawned);
+            
+            for ($i = 0; $i < $workersInThisBatch; $i++) {
+                $workerId = Utils::generateId('worker_');
+                try {
+                    $this->spawnWorker($workerId, $config);
+                    $spawned++;
+                } catch (Exception $e) {
+                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
+                    Utils::logMessage('ERROR', $errorMsg);
+                }
+            }
+            
+            // Sleep between batches to avoid CPU spikes, but not after the last batch
+            if ($batchNum < $totalBatches - 1) {
+                Utils::logMessage('DEBUG', "Batch {$batchNum + 1}/{$totalBatches} complete, sleeping for " . Config::WORKER_SPAWN_BATCH_DELAY . " second(s)");
+                sleep(Config::WORKER_SPAWN_BATCH_DELAY);
+            }
+        }
+        
+        Utils::logMessage('INFO', "Batch spawn complete: {$spawned} workers spawned");
+        
+        return $spawned;
+    }
+    
     public function scaleUp($count = 1) {
         $current = count($this->workers);
         
@@ -1459,23 +1504,12 @@ class JobManager {
             $job['status'] = 'running';
             $job['started_at'] = time();
             
-            // Spawn all requested workers with full configuration
-            $workersSpawned = 0;
-            for ($i = 0; $i < $desiredWorkers; $i++) {
-                $workerId = Utils::generateId('worker_');
-                try {
-                    $governor->spawnWorker($workerId, $workerConfig);
-                    $workersSpawned++;
-                    Utils::logMessage('INFO', "Worker spawned: {$workerId}");
-                } catch (Exception $e) {
-                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
-                    Utils::logMessage('ERROR', $errorMsg);
-                    $this->addJobError($jobId, $errorMsg);
-                }
-            }
+            // Spawn all requested workers in batches for optimal performance
+            $workersSpawned = $governor->spawnWorkersBatch($desiredWorkers, $workerConfig);
             
             if ($workersSpawned === 0) {
                 $job['status'] = 'error';
+                $this->addJobError($jobId, "Failed to spawn any workers. Check system requirements.");
                 $this->saveJob($jobId);
                 throw new Exception("Failed to spawn any workers. Check system requirements.");
             }
@@ -1661,23 +1695,15 @@ class JobManager {
                         
                         Utils::logMessage('INFO', "Restoring job {$jobId}: spawning {$neededWorkers} workers to reach {$desiredWorkers} total");
                         
-                        for ($i = 0; $i < $neededWorkers; $i++) {
-                            $workerId = Utils::generateId('worker_');
-                            try {
-                                $governor->spawnWorker($workerId, $workerConfig);
-                                Utils::logMessage('INFO', "Respawned worker {$workerId} for job {$jobId}");
-                                
-                                // Update persistent worker count
-                                if (!isset($this->jobs[$jobId]['worker_count'])) {
-                                    $this->jobs[$jobId]['worker_count'] = 0;
-                                }
-                                $this->jobs[$jobId]['worker_count']++;
-                                $this->saveJob($jobId);
-                            } catch (Exception $e) {
-                                Utils::logMessage('ERROR', "Failed to respawn worker: {$e->getMessage()}");
-                                $this->addJobError($jobId, "Failed to respawn worker: {$e->getMessage()}");
-                            }
+                        // Use batch spawning for restoration as well
+                        $workersSpawned = $governor->spawnWorkersBatch($neededWorkers, $workerConfig);
+                        
+                        // Update persistent worker count
+                        if (!isset($this->jobs[$jobId]['worker_count'])) {
+                            $this->jobs[$jobId]['worker_count'] = 0;
                         }
+                        $this->jobs[$jobId]['worker_count'] += $workersSpawned;
+                        $this->saveJob($jobId);
                     } catch (Exception $e) {
                         Utils::logMessage('ERROR', "Failed to restore worker governor for job {$jobId}: {$e->getMessage()}");
                         $this->addJobError($jobId, "Worker restoration failed: {$e->getMessage()}");
@@ -3244,8 +3270,8 @@ class Application {
                     
                     <div class="form-group">
                         <label for="maxWorkers">Max Workers</label>
-                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="1000">
-                        <small style="color: #666;">Parallel workers (1-1000, server has 32GB RAM)</small>
+                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="200">
+                        <small style="color: #666;">Parallel workers (1-200, optimized for performance)</small>
                     </div>
                     
                     <button type="submit" class="btn">Create Job</button>
