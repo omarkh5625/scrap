@@ -1784,42 +1784,64 @@ class APIHandler {
     }
     
     public function handle() {
+        // Start output buffering to catch any stray output
+        ob_start();
+        
         $method = $_SERVER['REQUEST_METHOD'];
         $action = $_POST['action'] ?? $_GET['action'] ?? '';
         
         try {
             switch ($action) {
                 case 'create_job':
-                    return $this->createJob();
+                    $result = $this->createJob();
+                    ob_end_clean(); // Clean the buffer
+                    return $result;
                     
                 case 'start_job':
-                    return $this->startJob();
+                    $result = $this->startJob();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'stop_job':
-                    return $this->stopJob();
+                    $result = $this->stopJob();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'delete_job':
-                    return $this->deleteJob();
+                    $result = $this->deleteJob();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'get_job':
-                    return $this->getJob();
+                    $result = $this->getJob();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'get_jobs':
-                    return $this->getJobs();
+                    $result = $this->getJobs();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'get_stats':
-                    return $this->getStats();
+                    $result = $this->getStats();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'scale_workers':
-                    return $this->scaleWorkers();
+                    $result = $this->scaleWorkers();
+                    ob_end_clean();
+                    return $result;
                     
                 case 'test_connection':
-                    return $this->testConnection();
+                    $result = $this->testConnection();
+                    ob_end_clean();
+                    return $result;
                     
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
         } catch (Exception $e) {
+            ob_end_clean(); // Clean buffer on error too
             return $this->jsonResponse([
                 'success' => false,
                 'error' => $e->getMessage()
