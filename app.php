@@ -52,6 +52,8 @@ class Config {
     const LOG_DIR = '/tmp/email_extraction/logs';
     const DB_RETRY_ATTEMPTS = 3;
     const DB_RETRY_DELAY = 2; // seconds
+    const DEFAULT_MAX_PAGES = 200; // Default max pages per query (configurable per job)
+    const DEFAULT_WORKER_RUNTIME = 7200; // Default 2 hours (configurable per job)
 }
 
 // Database Connection Manager
@@ -734,6 +736,8 @@ class WorkerGovernor {
 \$emailTypes = \$config['email_types'] ?? '';
 \$customDomains = \$config['custom_domains'] ?? [];
 \$keywords = \$config['keywords'] ?? [];
+\$maxPages = \$config['max_pages'] ?? 200; // Configurable max pages per query
+\$maxRunTime = \$config['max_run_time'] ?? 7200; // Configurable worker runtime
 
 // Database configuration
 \$dbHost = '{$dbHost}';
@@ -936,11 +940,9 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
 
 // Extraction work with real URLs
 \$startTime = time();
-\$maxRunTime = \$config['max_run_time'] ?? 300;
 \$extractedCount = 0;
 \$urlCache = [];
 \$currentPage = 1;
-\$maxPages = 200; // Expanded to 200 pages for maximum coverage
 \$seenEmails = []; // In-memory deduplication cache for this worker
 \$noResultsCount = 0; // Track consecutive failed queries
 \$currentQueryIndex = 0; // Track which query/keyword we're using
@@ -1492,7 +1494,8 @@ class JobManager {
                 'country' => $job['options']['country'] ?? '',
                 'language' => $job['options']['language'] ?? 'en',
                 'max_emails' => $job['options']['max_emails'] ?? 10000,
-                'max_run_time' => 7200, // 2 hours - allow workers to run longer to reach target
+                'max_run_time' => $job['options']['max_run_time'] ?? Config::DEFAULT_WORKER_RUNTIME,
+                'max_pages' => $job['options']['max_pages'] ?? Config::DEFAULT_MAX_PAGES,
                 'email_types' => $job['options']['email_types'] ?? '',
                 'custom_domains' => $job['options']['custom_domains'] ?? [],
                 'keywords' => $job['options']['keywords'] ?? []
@@ -1689,7 +1692,8 @@ class JobManager {
                             'country' => $job['options']['country'] ?? '',
                             'language' => $job['options']['language'] ?? 'en',
                             'max_emails' => $job['options']['max_emails'] ?? 10000,
-                            'max_run_time' => 7200, // 2 hours - allow workers to run longer to reach target
+                            'max_run_time' => $job['options']['max_run_time'] ?? Config::DEFAULT_WORKER_RUNTIME,
+                            'max_pages' => $job['options']['max_pages'] ?? Config::DEFAULT_MAX_PAGES,
                             'email_types' => $job['options']['email_types'] ?? '',
                             'custom_domains' => $job['options']['custom_domains'] ?? [],
                             'keywords' => $job['options']['keywords'] ?? []
