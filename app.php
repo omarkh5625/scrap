@@ -1414,6 +1414,17 @@ class JobManager {
     public function checkAllJobs() {
         foreach ($this->jobs as $jobId => $job) {
             if ($job['status'] === 'running') {
+                // Skip jobs without API key (they should have been stopped on load)
+                if (empty($job['api_key'])) {
+                    Utils::logMessage('WARNING', "Skipping job {$jobId} - no API key");
+                    // Auto-stop it if somehow still running
+                    $this->jobs[$jobId]['status'] = 'stopped';
+                    $this->jobs[$jobId]['worker_count'] = 0;
+                    $this->jobs[$jobId]['workers_running'] = 0;
+                    $this->saveJob($jobId);
+                    continue;
+                }
+                
                 // Restore worker governor if it doesn't exist
                 if (!$job['worker_governor']) {
                     try {
@@ -1632,6 +1643,16 @@ class JobManager {
                         'target_emails' => isset($jobData['options']) ? 
                             (json_decode($jobData['options'], true)['target_emails'] ?? 10000) : 10000
                     ];
+                    
+                    // If job is running but has no API key (after page refresh), mark it as stopped
+                    // User will need to click Start button again which will provide the API key
+                    if ($this->jobs[$jobId]['status'] === 'running' && empty($this->jobs[$jobId]['api_key'])) {
+                        $this->jobs[$jobId]['status'] = 'stopped';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->jobs[$jobId]['workers_running'] = 0;
+                        $this->saveJob($jobId);
+                        Utils::logMessage('INFO', "Job {$jobId} auto-stopped on load (missing API key)");
+                    }
                 }
                 
                 Utils::logMessage('INFO', "Loaded " . count($this->jobs) . " jobs from database");
