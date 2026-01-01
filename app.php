@@ -1644,14 +1644,16 @@ class JobManager {
                             (json_decode($jobData['options'], true)['target_emails'] ?? 10000) : 10000
                     ];
                     
-                    // If job is running but has no API key (after page refresh), mark it as stopped
-                    // User will need to click Start button again which will provide the API key
-                    if ($this->jobs[$jobId]['status'] === 'running' && empty($this->jobs[$jobId]['api_key'])) {
+                    // If job is running but has no API key (after true page refresh),
+                    // mark it as stopped ONLY if it has no workers running.
+                    // Jobs with workers_running > 0 are actively working and should not be stopped.
+                    if ($this->jobs[$jobId]['status'] === 'running' && 
+                        empty($this->jobs[$jobId]['api_key']) && 
+                        $this->jobs[$jobId]['workers_running'] == 0) {
                         $this->jobs[$jobId]['status'] = 'stopped';
                         $this->jobs[$jobId]['worker_count'] = 0;
-                        $this->jobs[$jobId]['workers_running'] = 0;
                         $this->saveJob($jobId);
-                        Utils::logMessage('INFO', "Job {$jobId} auto-stopped on load (missing API key)");
+                        Utils::logMessage('INFO', "Job {$jobId} auto-stopped on load (missing API key and no active workers)");
                     }
                 }
                 
