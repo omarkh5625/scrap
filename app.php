@@ -1861,10 +1861,17 @@ class APIHandler {
         // Get the created job to return in response
         $createdJob = $this->jobManager->getJob($jobId);
         
+        // Log for debugging
+        Utils::logMessage('INFO', "Job created via API: {$jobId}, database configured: " . ($this->jobManager->db->isConfigured() ? 'yes' : 'no'));
+        
         return $this->jsonResponse([
             'success' => true,
             'job_id' => $jobId,
-            'job' => $createdJob
+            'job' => $createdJob,
+            'debug' => [
+                'database_configured' => $this->jobManager->db->isConfigured(),
+                'job_saved_to_db' => $this->jobManager->db->isConfigured()
+            ]
         ]);
     }
     
@@ -1941,9 +1948,16 @@ class APIHandler {
     private function getJobs() {
         $jobs = $this->jobManager->getAllJobs();
         
+        // Log for debugging
+        Utils::logMessage('DEBUG', "getJobs API called, returning " . count($jobs) . " jobs, database configured: " . ($this->jobManager->db->isConfigured() ? 'yes' : 'no'));
+        
         return $this->jsonResponse([
             'success' => true,
-            'jobs' => $jobs
+            'jobs' => $jobs,
+            'debug' => [
+                'count' => count($jobs),
+                'database_configured' => $this->jobManager->db->isConfigured()
+            ]
         ]);
     }
     
@@ -3273,12 +3287,22 @@ class Application {
                 try {
                     const result = await API.call('create_job', formData);
                     
+                    console.log('Create job response:', result);
+                    
                     if (result.success) {
-                        UI.showAlert('Job created successfully!');
+                        const debugInfo = result.debug || {};
+                        let message = 'Job created successfully!';
+                        
+                        if (!debugInfo.database_configured) {
+                            message += ' (Using file storage - database not configured)';
+                        }
+                        
+                        UI.showAlert(message);
                         document.getElementById('createJobForm').reset();
                         
                         // Small delay to ensure database write completes
                         setTimeout(() => {
+                            console.log('Refreshing jobs after creation...');
                             this.refreshJobs();
                         }, 500);
                     } else {
@@ -3356,6 +3380,9 @@ class Application {
                         API.get('get_jobs'),
                         API.get('get_stats')
                     ]);
+                    
+                    console.log('Jobs refresh result:', jobsResult);
+                    console.log('Jobs count:', jobsResult.jobs ? jobsResult.jobs.length : 0);
                     
                     if (jobsResult.success) {
                         UI.renderJobs(jobsResult.jobs);
