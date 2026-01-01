@@ -756,11 +756,11 @@ class WorkerGovernor {
 \$maxRunTime = \$config['max_run_time'] ?? 7200; // Configurable worker runtime
 
 // Raw data directory for this worker
-\$rawDataDir = '/data/raw/job_' . \$jobId;
+\$rawDataDir = \$dataDir . '/raw/job_' . \$jobId;
 if (!file_exists(\$rawDataDir)) {
     @mkdir(\$rawDataDir, 0755, true);
 }
-\$workerOutputFile = \$rawDataDir . '/worker_' . \$workerId . '.json';
+\$workerOutputFile = \$rawDataDir . '/worker_' . \$workerId;
 
 // Helper function to check if email matches selected types
 function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
@@ -819,19 +819,35 @@ function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
 }
 
 // Helper function to write emails to raw JSON file (no deduplication, no database)
-function writeEmailsToRawFile(\$filePath, \$emailBatch) {
+function writeEmailsToRawFile(\$baseFilePath, \$emailBatch, \$workerId) {
+    \$timestamp = time();
+    \$microtime = str_replace('.', '_', (string)microtime(true));
+    
     \$data = [
         'emails' => \$emailBatch,
         'count' => count(\$emailBatch),
-        'timestamp' => time()
+        'timestamp' => \$timestamp,
+        'worker_id' => \$workerId
     ];
     
-    // Append to file with unique timestamp to avoid conflicts
-    \$uniqueFile = \$filePath . '.' . microtime(true) . '.tmp';
-    file_put_contents(\$uniqueFile, json_encode(\$data) . "\\n", LOCK_EX);
+    // Create unique filename with worker ID and timestamp to avoid conflicts
+    \$uniqueFile = \$baseFilePath . '_' . \$microtime . '.tmp';
+    \$finalFile = \$baseFilePath . '_' . \$timestamp . '.json';
+    
+    // Write to temp file first
+    if (file_put_contents(\$uniqueFile, json_encode(\$data, JSON_PRETTY_PRINT), LOCK_EX) === false) {
+        error_log("Failed to write to temp file: \$uniqueFile");
+        return false;
+    }
     
     // Atomic rename
-    @rename(\$uniqueFile, \$filePath . '.' . time() . '.json');
+    if (!rename(\$uniqueFile, \$finalFile)) {
+        error_log("Failed to rename \$uniqueFile to \$finalFile");
+        @unlink(\$uniqueFile); // Clean up temp file
+        return false;
+    }
+    
+    return true;
 }
 
 // Helper function to count emails from raw files (approximate)
@@ -1049,7 +1065,7 @@ while ((time() - \$startTime) < \$maxRunTime) {
     
     // Write entire batch to raw JSON file (no deduplication, no database)
     if (!empty(\$emailBatch)) {
-        writeEmailsToRawFile(\$workerOutputFile, \$emailBatch);
+        writeEmailsToRawFile(\$workerOutputFile, \$emailBatch, \$workerId);
     }
     
     echo json_encode([
