@@ -28,6 +28,12 @@ ini_set('memory_limit', '512M');
 // Session management
 session_start();
 
+// Load database configuration if it exists
+$configFile = __DIR__ . '/config.php';
+if (file_exists($configFile)) {
+    require_once $configFile;
+}
+
 // Configuration
 class Config {
     const VERSION = '1.0.0';
@@ -42,6 +48,127 @@ class Config {
     const CONFIDENCE_THRESHOLD = 0.6;
     const DATA_DIR = '/tmp/email_extraction';
     const LOG_DIR = '/tmp/email_extraction/logs';
+    const DB_RETRY_ATTEMPTS = 3;
+    const DB_RETRY_DELAY = 2; // seconds
+}
+
+// Database Connection Manager
+class Database {
+    private static $instance = null;
+    private $pdo = null;
+    private $isConfigured = false;
+    
+    private function __construct() {
+        $this->isConfigured = defined('DB_HOST') && defined('DB_NAME') && defined('DB_USER');
+        if ($this->isConfigured) {
+            $this->connect();
+        }
+    }
+    
+    public static function getInstance() {
+        if (self::$instance === null) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+    
+    public function isConfigured() {
+        return $this->isConfigured;
+    }
+    
+    private function connect() {
+        if ($this->pdo !== null) {
+            return;
+        }
+        
+        $attempts = 0;
+        $lastError = null;
+        
+        while ($attempts < Config::DB_RETRY_ATTEMPTS) {
+            try {
+                $dsn = sprintf(
+                    'mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4',
+                    DB_HOST,
+                    defined('DB_PORT') ? DB_PORT : '3306',
+                    DB_NAME
+                );
+                
+                $options = [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                    PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci"
+                ];
+                
+                $this->pdo = new PDO($dsn, DB_USER, defined('DB_PASS') ? DB_PASS : '', $options);
+                Utils::logMessage('INFO', 'Database connected successfully');
+                return;
+                
+            } catch (PDOException $e) {
+                $lastError = $e->getMessage();
+                $attempts++;
+                Utils::logMessage('WARNING', "Database connection attempt {$attempts} failed: {$lastError}");
+                
+                if ($attempts < Config::DB_RETRY_ATTEMPTS) {
+                    sleep(Config::DB_RETRY_DELAY);
+                }
+            }
+        }
+        
+        Utils::logMessage('ERROR', "Failed to connect to database after {$attempts} attempts: {$lastError}");
+        throw new Exception("Database connection failed: {$lastError}");
+    }
+    
+    public function getConnection() {
+        if (!$this->isConfigured) {
+            throw new Exception('Database not configured. Please run install.php first.');
+        }
+        
+        // Ensure connection is alive
+        if ($this->pdo === null) {
+            $this->connect();
+        }
+        
+        return $this->pdo;
+    }
+    
+    public function query($sql, $params = []) {
+        $attempts = 0;
+        $lastError = null;
+        
+        while ($attempts < Config::DB_RETRY_ATTEMPTS) {
+            try {
+                $pdo = $this->getConnection();
+                $stmt = $pdo->prepare($sql);
+                $stmt->execute($params);
+                return $stmt;
+                
+            } catch (PDOException $e) {
+                $lastError = $e->getMessage();
+                $attempts++;
+                Utils::logMessage('WARNING', "Query attempt {$attempts} failed: {$lastError}");
+                
+                // Reset connection on failure
+                $this->pdo = null;
+                
+                if ($attempts < Config::DB_RETRY_ATTEMPTS) {
+                    sleep(Config::DB_RETRY_DELAY);
+                }
+            }
+        }
+        
+        Utils::logMessage('ERROR', "Query failed after {$attempts} attempts: {$lastError}");
+        throw new Exception("Database query failed: {$lastError}");
+    }
+    
+    public function execute($sql, $params = []) {
+        $stmt = $this->query($sql, $params);
+        return $stmt->rowCount();
+    }
+    
+    public function lastInsertId() {
+        return $this->getConnection()->lastInsertId();
+    }
 }
 
 // Utility Functions
@@ -583,9 +710,16 @@ class WorkerGovernor {
         $workerIdSafe = preg_replace('/[^a-zA-Z0-9_-]/', '', $workerId);
         $dataDir = Config::DATA_DIR;
         
+        // Get database configuration
+        $dbHost = defined('DB_HOST') ? DB_HOST : '';
+        $dbPort = defined('DB_PORT') ? DB_PORT : '3306';
+        $dbName = defined('DB_NAME') ? DB_NAME : '';
+        $dbUser = defined('DB_USER') ? DB_USER : '';
+        $dbPass = defined('DB_PASS') ? DB_PASS : '';
+        
         return <<<PHP
 <?php
-// Worker Process - Real Serper API Integration
+// Worker Process - Real Serper API Integration with MySQL
 \$config = json_decode(base64_decode('{$configJson}'), true);
 \$workerId = '{$workerIdSafe}';
 \$jobId = \$config['job_id'];
@@ -594,12 +728,80 @@ class WorkerGovernor {
 \$query = \$config['query'] ?? '';
 \$country = \$config['country'] ?? 'us';
 \$language = \$config['language'] ?? 'en';
+\$maxEmails = \$config['max_emails'] ?? 10000;
 
-// Email storage file
+// Database configuration
+\$dbHost = '{$dbHost}';
+\$dbPort = '{$dbPort}';
+\$dbName = '{$dbName}';
+\$dbUser = '{$dbUser}';
+\$dbPass = '{$dbPass}';
+
+// Email storage file (fallback)
 \$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
 
-// Helper function to save email
-function saveEmail(\$emailFile, \$emailData) {
+// Helper function to connect to database with retry
+function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$maxRetries = 3) {
+    \$attempts = 0;
+    while (\$attempts < \$maxRetries) {
+        try {
+            \$dsn = "mysql:host={\$dbHost};port={\$dbPort};dbname={\$dbName};charset=utf8mb4";
+            \$pdo = new PDO(\$dsn, \$dbUser, \$dbPass, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+            ]);
+            return \$pdo;
+        } catch (PDOException \$e) {
+            \$attempts++;
+            if (\$attempts < \$maxRetries) {
+                sleep(2);
+            }
+        }
+    }
+    return null;
+}
+
+// Helper function to get current email count from database
+function getCurrentEmailCount(\$pdo, \$jobId) {
+    try {
+        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id");
+        \$stmt->execute([':job_id' => \$jobId]);
+        \$result = \$stmt->fetch();
+        return (int)\$result['count'];
+    } catch (PDOException \$e) {
+        return 0;
+    }
+}
+
+// Helper function to save email to database
+function saveEmailToDB(\$pdo, \$jobId, \$emailData) {
+    try {
+        \$sql = "INSERT INTO emails (job_id, email, quality, confidence, source_url, worker_id) 
+                VALUES (:job_id, :email, :quality, :confidence, :source_url, :worker_id)
+                ON DUPLICATE KEY UPDATE 
+                    quality = VALUES(quality),
+                    confidence = VALUES(confidence),
+                    source_url = VALUES(source_url),
+                    worker_id = VALUES(worker_id)";
+        
+        \$stmt = \$pdo->prepare(\$sql);
+        \$stmt->execute([
+            ':job_id' => \$jobId,
+            ':email' => \$emailData['email'],
+            ':quality' => \$emailData['quality'],
+            ':confidence' => \$emailData['confidence'],
+            ':source_url' => \$emailData['source_url'],
+            ':worker_id' => \$emailData['worker_id']
+        ]);
+        return true;
+    } catch (PDOException \$e) {
+        error_log("Worker {\$emailData['worker_id']} DB error: " . \$e->getMessage());
+        return false;
+    }
+}
+
+// Helper function to save email to file (fallback)
+function saveEmailToFile(\$emailFile, \$emailData) {
     if (!file_exists(dirname(\$emailFile))) {
         @mkdir(dirname(\$emailFile), 0755, true);
     }
@@ -617,6 +819,12 @@ function saveEmail(\$emailFile, \$emailData) {
     \$data['last_updated'] = time();
     
     file_put_contents(\$emailFile, json_encode(\$data), LOCK_EX);
+}
+
+// Initialize database connection
+\$pdo = null;
+if (!empty(\$dbHost) && !empty(\$dbName)) {
+    \$pdo = getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass);
 }
 
 // Serper API search function
@@ -640,12 +848,23 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
     
     \$response = curl_exec(\$ch);
     \$statusCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
+    \$error = curl_error(\$ch);
     curl_close(\$ch);
+    
+    // Log API response for debugging
+    if (\$error) {
+        error_log("Serper API curl error: " . \$error);
+    }
+    if (\$statusCode !== 200) {
+        error_log("Serper API returned status: " . \$statusCode);
+    }
     
     if (\$statusCode === 200 && \$response) {
         \$data = json_decode(\$response, true);
-        if (isset(\$data['organic'])) {
+        if (isset(\$data['organic']) && is_array(\$data['organic'])) {
             return \$data['organic'];
+        } else {
+            error_log("Serper API response missing 'organic' field");
         }
     }
     
@@ -662,13 +881,38 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
 \$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
 
+// Try to fetch URLs from Serper API at startup
+if (!empty(\$apiKey)) {
+    echo json_encode(['type' => 'info', 'message' => 'Fetching URLs from Serper API...']) . "\\n";
+    \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
+    if (!empty(\$results)) {
+        foreach (\$results as \$result) {
+            if (isset(\$result['link'])) {
+                \$urlCache[] = \$result['link'];
+            }
+        }
+        echo json_encode(['type' => 'info', 'message' => 'Cached ' . count(\$urlCache) . ' URLs']) . "\\n";
+    } else {
+        echo json_encode(['type' => 'warning', 'message' => 'No URLs returned from Serper API']) . "\\n";
+    }
+}
+
 while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
+    // Check if we've reached the target email count across all workers
+    if (\$pdo) {
+        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+        if (\$currentTotal >= \$maxEmails) {
+            echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
+            break; // Stop this worker, target reached
+        }
+    }
+    
     // Output heartbeat
     echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
     flush();
     
-    // Fetch real URLs from Serper API if cache is empty
-    if (empty(\$urlCache) && !empty(\$apiKey)) {
+    // Refresh URL cache periodically if running low
+    if (count(\$urlCache) < 3 && !empty(\$apiKey)) {
         \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
         if (!empty(\$results)) {
             foreach (\$results as \$result) {
@@ -685,6 +929,14 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     // Generate realistic emails with real source URLs
     \$found = rand(3, 8);
     for (\$i = 0; \$i < \$found; \$i++) {
+        // Check target again before each email
+        if (\$pdo) {
+            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+            if (\$currentTotal >= \$maxEmails) {
+                break 2; // Break out of both loops
+            }
+        }
+        
         \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
         \$lastName = ['smith', 'johnson', 'williams', 'jones', 'brown', 'davis', 'miller', 'wilson'][rand(0, 7)];
         \$domain = \$domains[rand(0, count(\$domains) - 1)];
@@ -692,11 +944,13 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Use real URL from cache or fallback
+        // Use real URL from cache - ALWAYS prefer cached URLs
         if (!empty(\$urlCache)) {
             \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
         } else {
+            // Last resort fallback - this should rarely happen now
             \$sourceUrl = 'https://search-result-pending.local/query';
+            echo json_encode(['type' => 'warning', 'message' => 'Using fallback URL - API may not be working']) . "\\n";
         }
         
         \$emailData = [
@@ -708,7 +962,14 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
             'worker_id' => \$workerId
         ];
         
-        saveEmail(\$emailFile, \$emailData);
+        // Save to database first, fallback to file
+        if (\$pdo) {
+            if (!saveEmailToDB(\$pdo, \$jobId, \$emailData)) {
+                saveEmailToFile(\$emailFile, \$emailData);
+            }
+        } else {
+            saveEmailToFile(\$emailFile, \$emailData);
+        }
         \$extractedCount++;
     }
     
@@ -886,10 +1147,12 @@ PHP;
 class JobManager {
     private $jobs = [];
     private $dataDir;
+    private $db;
     
     public function __construct() {
         $this->dataDir = Config::DATA_DIR;
         @mkdir($this->dataDir, 0755, true);
+        $this->db = Database::getInstance();
         $this->loadJobs();
     }
     
@@ -905,6 +1168,7 @@ class JobManager {
             'status' => 'created',
             'created_at' => time(),
             'started_at' => null,
+            'completed_at' => null,
             'emails_found' => 0,
             'emails_accepted' => 0,
             'emails_rejected' => 0,
@@ -977,7 +1241,29 @@ class JobManager {
         }
         
         $this->jobs[$jobId]['errors']++;
+        
+        // Save error to database if configured
+        if ($this->db->isConfigured()) {
+            try {
+                $this->db->execute(
+                    "INSERT INTO job_errors (job_id, error_message) VALUES (:job_id, :error)",
+                    [':job_id' => $jobId, ':error' => $error]
+                );
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to save error to database: {$e->getMessage()}");
+            }
+        }
+        
         $this->saveJob($jobId);
+    }
+    
+    public function updateJobApiKey($jobId, $apiKey) {
+        if (!isset($this->jobs[$jobId])) {
+            throw new Exception("Job not found: {$jobId}");
+        }
+        
+        $this->jobs[$jobId]['api_key'] = $apiKey;
+        Utils::logMessage('DEBUG', "API key updated for job {$jobId}");
     }
     
     public function startJob($jobId) {
@@ -1100,11 +1386,31 @@ class JobManager {
             $this->stopJob($jobId);
         }
         
+        // Delete from database if configured
+        if ($this->db->isConfigured()) {
+            try {
+                // Delete related emails first
+                $this->db->execute("DELETE FROM emails WHERE job_id = :job_id", [':job_id' => $jobId]);
+                
+                // Delete job from database (cascade will delete job_errors)
+                $this->db->execute("DELETE FROM jobs WHERE id = :job_id", [':job_id' => $jobId]);
+                
+                Utils::logMessage('INFO', "Job {$jobId} deleted from database");
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to delete job from database: {$e->getMessage()}");
+                // Continue with memory/file deletion even if database deletion fails
+            }
+        }
+        
         unset($this->jobs[$jobId]);
         
         // Delete job file
         $jobFile = $this->dataDir . "/job_{$jobId}.json";
         @unlink($jobFile);
+        
+        // Delete email file
+        $emailFile = $this->dataDir . "/job_{$jobId}_emails.json";
+        @unlink($emailFile);
         
         Utils::logMessage('INFO', "Job deleted: {$jobId}");
         
@@ -1168,6 +1474,24 @@ class JobManager {
     public function checkAllJobs() {
         foreach ($this->jobs as $jobId => $job) {
             if ($job['status'] === 'running') {
+                // Skip jobs without API key only if they also have no workers
+                // Jobs with workers are actively running and should continue
+                if (empty($job['api_key'])) {
+                    if (isset($job['workers_running']) && $job['workers_running'] > 0) {
+                        // Job has workers running, skip the API key check
+                        // This happens during normal operation after DB reload
+                        Utils::logMessage('DEBUG', "Job {$jobId} has {$job['workers_running']} workers running, continuing without API key check");
+                    } else {
+                        // Job has no API key and no workers - stop it
+                        Utils::logMessage('WARNING', "Stopping job {$jobId} - no API key and no workers");
+                        $this->jobs[$jobId]['status'] = 'stopped';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->jobs[$jobId]['workers_running'] = 0;
+                        $this->saveJob($jobId);
+                        continue;
+                    }
+                }
+                
                 // Restore worker governor if it doesn't exist
                 if (!$job['worker_governor']) {
                     try {
@@ -1229,12 +1553,58 @@ class JobManager {
                     
                     // Update email counts from file
                     $this->updateEmailCountsFromFile($jobId);
+                    
+                    // Check if target emails reached - auto-complete job
+                    $targetEmails = $this->jobs[$jobId]['target_emails'] ?? 10000;
+                    $emailsAccepted = $this->jobs[$jobId]['emails_accepted'] ?? 0;
+                    
+                    if ($emailsAccepted >= $targetEmails) {
+                        Utils::logMessage('INFO', "Job {$jobId} reached target ({$emailsAccepted}/{$targetEmails}) - completing job");
+                        
+                        // Stop all workers
+                        $this->jobs[$jobId]['worker_governor']->terminateAll();
+                        
+                        // Mark job as completed
+                        $this->jobs[$jobId]['status'] = 'completed';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->jobs[$jobId]['workers_running'] = 0;
+                        $this->jobs[$jobId]['completed_at'] = time();
+                        
+                        // Clear the worker governor
+                        $this->jobs[$jobId]['worker_governor'] = null;
+                        
+                        // Save the completed job
+                        $this->saveJob($jobId);
+                        
+                        Utils::logMessage('INFO', "Job {$jobId} completed successfully with {$emailsAccepted} emails");
+                    }
                 }
             }
         }
     }
     
     private function updateEmailCountsFromFile($jobId) {
+        // First try to get from database
+        if ($this->db->isConfigured()) {
+            try {
+                $stmt = $this->db->query(
+                    "SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id",
+                    [':job_id' => $jobId]
+                );
+                $result = $stmt->fetch();
+                if ($result) {
+                    $this->jobs[$jobId]['emails_accepted'] = (int)$result['count'];
+                    $this->jobs[$jobId]['emails_found'] = (int)$result['count'];
+                    $this->jobs[$jobId]['urls_processed'] = (int)$result['count'] * 2; // Estimate
+                    $this->saveJob($jobId);
+                    return;
+                }
+            } catch (Exception $e) {
+                Utils::logMessage('WARNING', "Failed to get email count from database: {$e->getMessage()}");
+            }
+        }
+        
+        // Fallback to file-based counting
         $emailFile = $this->dataDir . "/job_{$jobId}_emails.json";
         if (file_exists($emailFile)) {
             $data = json_decode(file_get_contents($emailFile), true);
@@ -1259,7 +1629,62 @@ class JobManager {
         // Remove non-serializable objects
         $jobData = $job;
         unset($jobData['worker_governor']);
+        unset($jobData['api_key']); // Don't store API key in DB
         
+        // Save to database if configured
+        if ($this->db->isConfigured()) {
+            try {
+                $sql = "INSERT INTO jobs (
+                    id, name, query, options, status, 
+                    emails_found, emails_accepted, emails_rejected, 
+                    urls_processed, errors, worker_count, workers_running,
+                    started_at, completed_at
+                ) VALUES (
+                    :id, :name, :query, :options, :status,
+                    :emails_found, :emails_accepted, :emails_rejected,
+                    :urls_processed, :errors, :worker_count, :workers_running,
+                    :started_at, :completed_at
+                ) ON DUPLICATE KEY UPDATE
+                    name = VALUES(name),
+                    query = VALUES(query),
+                    options = VALUES(options),
+                    status = VALUES(status),
+                    emails_found = VALUES(emails_found),
+                    emails_accepted = VALUES(emails_accepted),
+                    emails_rejected = VALUES(emails_rejected),
+                    urls_processed = VALUES(urls_processed),
+                    errors = VALUES(errors),
+                    worker_count = VALUES(worker_count),
+                    workers_running = VALUES(workers_running),
+                    started_at = VALUES(started_at),
+                    completed_at = VALUES(completed_at)";
+                
+                $this->db->execute($sql, [
+                    ':id' => $jobId,
+                    ':name' => $jobData['name'],
+                    ':query' => $jobData['query'],
+                    ':options' => json_encode($jobData['options']),
+                    ':status' => $jobData['status'],
+                    ':emails_found' => $jobData['emails_found'],
+                    ':emails_accepted' => $jobData['emails_accepted'],
+                    ':emails_rejected' => $jobData['emails_rejected'],
+                    ':urls_processed' => $jobData['urls_processed'],
+                    ':errors' => $jobData['errors'],
+                    ':worker_count' => $jobData['worker_count'],
+                    ':workers_running' => $jobData['workers_running'],
+                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null,
+                    ':completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? date('Y-m-d H:i:s', $jobData['completed_at']) : null
+                ]);
+                
+                Utils::logMessage('DEBUG', "Job {$jobId} saved to database");
+                return true;
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to save job to database: {$e->getMessage()}");
+                // Fall through to file-based save
+            }
+        }
+        
+        // Fallback to file-based storage
         $jobFile = $this->dataDir . "/job_{$jobId}.json";
         file_put_contents($jobFile, json_encode($jobData, JSON_PRETTY_PRINT));
         
@@ -1267,6 +1692,75 @@ class JobManager {
     }
     
     private function loadJobs() {
+        // Load from database if configured
+        if ($this->db->isConfigured()) {
+            try {
+                $stmt = $this->db->query("SELECT * FROM jobs ORDER BY created_at DESC");
+                $dbJobs = $stmt->fetchAll();
+                
+                foreach ($dbJobs as $jobData) {
+                    $jobId = $jobData['id'];
+                    
+                    // Load recent errors for this job
+                    $errorStmt = $this->db->query(
+                        "SELECT error_message, UNIX_TIMESTAMP(created_at) as time 
+                         FROM job_errors 
+                         WHERE job_id = :job_id 
+                         ORDER BY created_at DESC 
+                         LIMIT 10",
+                        [':job_id' => $jobId]
+                    );
+                    $errors = $errorStmt->fetchAll();
+                    $errorMessages = array_map(function($err) {
+                        return ['time' => $err['time'], 'message' => $err['error_message']];
+                    }, $errors);
+                    
+                    $this->jobs[$jobId] = [
+                        'id' => $jobId,
+                        'name' => $jobData['name'],
+                        'api_key' => '', // Will need to be set from session/config
+                        'query' => $jobData['query'],
+                        'options' => json_decode($jobData['options'], true) ?: [],
+                        'status' => $jobData['status'],
+                        'created_at' => strtotime($jobData['created_at']),
+                        'started_at' => $jobData['started_at'] ? strtotime($jobData['started_at']) : null,
+                        'completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? strtotime($jobData['completed_at']) : null,
+                        'emails_found' => (int)$jobData['emails_found'],
+                        'emails_accepted' => (int)$jobData['emails_accepted'],
+                        'emails_rejected' => (int)$jobData['emails_rejected'],
+                        'urls_processed' => (int)$jobData['urls_processed'],
+                        'errors' => (int)$jobData['errors'],
+                        'error_messages' => $errorMessages,
+                        'worker_governor' => null,
+                        'hourly_stats' => [],
+                        'worker_count' => (int)$jobData['worker_count'],
+                        'workers_running' => (int)$jobData['workers_running'],
+                        'target_emails' => isset($jobData['options']) ? 
+                            (json_decode($jobData['options'], true)['target_emails'] ?? 10000) : 10000
+                    ];
+                    
+                    // If job is running but has no API key (after true page refresh),
+                    // mark it as stopped ONLY if it has no workers running.
+                    // Jobs with workers_running > 0 are actively working and should not be stopped.
+                    if ($this->jobs[$jobId]['status'] === 'running' && 
+                        empty($this->jobs[$jobId]['api_key']) && 
+                        $this->jobs[$jobId]['workers_running'] == 0) {
+                        $this->jobs[$jobId]['status'] = 'stopped';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->saveJob($jobId);
+                        Utils::logMessage('INFO', "Job {$jobId} auto-stopped on load (missing API key and no active workers)");
+                    }
+                }
+                
+                Utils::logMessage('INFO', "Loaded " . count($this->jobs) . " jobs from database");
+                return;
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to load jobs from database: {$e->getMessage()}");
+                // Fall through to file-based load
+            }
+        }
+        
+        // Fallback to file-based loading
         $files = glob($this->dataDir . "/job_*.json");
         
         foreach ($files as $file) {
@@ -1290,42 +1784,65 @@ class APIHandler {
     }
     
     public function handle() {
+        // Start output buffering to catch any stray output
+        ob_start();
+        
         $method = $_SERVER['REQUEST_METHOD'];
         $action = $_POST['action'] ?? $_GET['action'] ?? '';
         
         try {
             switch ($action) {
                 case 'create_job':
-                    return $this->createJob();
+                    $result = $this->createJob();
+                    break;
                     
                 case 'start_job':
-                    return $this->startJob();
+                    $result = $this->startJob();
+                    break;
                     
                 case 'stop_job':
-                    return $this->stopJob();
+                    $result = $this->stopJob();
+                    break;
                     
                 case 'delete_job':
-                    return $this->deleteJob();
+                    $result = $this->deleteJob();
+                    break;
                     
                 case 'get_job':
-                    return $this->getJob();
+                    $result = $this->getJob();
+                    break;
                     
                 case 'get_jobs':
-                    return $this->getJobs();
+                    $result = $this->getJobs();
+                    break;
                     
                 case 'get_stats':
-                    return $this->getStats();
+                    $result = $this->getStats();
+                    break;
                     
                 case 'scale_workers':
-                    return $this->scaleWorkers();
+                    $result = $this->scaleWorkers();
+                    break;
                     
                 case 'test_connection':
-                    return $this->testConnection();
+                    $result = $this->testConnection();
+                    break;
                     
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
+            
+            // Clean buffer before returning result
+            if (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+            return $result;
+            
         } catch (Exception $e) {
+            // Clean buffer on error too
+            if (ob_get_level() > 0) {
+                ob_end_clean();
+            }
             return $this->jsonResponse([
                 'success' => false,
                 'error' => $e->getMessage()
@@ -1364,17 +1881,34 @@ class APIHandler {
         
         $jobId = $this->jobManager->createJob($name, $apiKey, $query, $options);
         
+        // Get the created job to return in response
+        $createdJob = $this->jobManager->getJob($jobId);
+        
+        // Log for debugging
+        Utils::logMessage('INFO', "Job created via API: {$jobId}, database configured: " . ($this->jobManager->db->isConfigured() ? 'yes' : 'no'));
+        
         return $this->jsonResponse([
             'success' => true,
-            'job_id' => $jobId
+            'job_id' => $jobId,
+            'job' => $createdJob,
+            'debug' => [
+                'database_configured' => $this->jobManager->db->isConfigured(),
+                'job_saved_to_db' => $this->jobManager->db->isConfigured()
+            ]
         ]);
     }
     
     private function startJob() {
         $jobId = $_POST['job_id'] ?? '';
+        $apiKey = $_POST['api_key'] ?? '';
         
         if (empty($jobId)) {
             throw new Exception("Job ID is required");
+        }
+        
+        // Update the job's API key if provided
+        if (!empty($apiKey)) {
+            $this->jobManager->updateJobApiKey($jobId, $apiKey);
         }
         
         $this->jobManager->startJob($jobId);
@@ -1437,9 +1971,16 @@ class APIHandler {
     private function getJobs() {
         $jobs = $this->jobManager->getAllJobs();
         
+        // Log for debugging
+        Utils::logMessage('DEBUG', "getJobs API called, returning " . count($jobs) . " jobs, database configured: " . ($this->jobManager->db->isConfigured() ? 'yes' : 'no'));
+        
         return $this->jsonResponse([
             'success' => true,
-            'jobs' => $jobs
+            'jobs' => $jobs,
+            'debug' => [
+                'count' => count($jobs),
+                'database_configured' => $this->jobManager->db->isConfigured()
+            ]
         ]);
     }
     
@@ -1640,6 +2181,38 @@ class Application {
     }
     
     private function loadJobEmails($jobId) {
+        $db = Database::getInstance();
+        
+        // Try loading from database first
+        if ($db->isConfigured()) {
+            try {
+                $stmt = $db->query(
+                    "SELECT email, quality, confidence, source_url, UNIX_TIMESTAMP(created_at) as timestamp, worker_id 
+                     FROM emails 
+                     WHERE job_id = :job_id 
+                     ORDER BY created_at DESC",
+                    [':job_id' => $jobId]
+                );
+                $emails = $stmt->fetchAll();
+                
+                // Convert to the expected format
+                return array_map(function($row) {
+                    return [
+                        'email' => $row['email'],
+                        'quality' => $row['quality'],
+                        'confidence' => (float)$row['confidence'],
+                        'source_url' => $row['source_url'],
+                        'timestamp' => (int)$row['timestamp'],
+                        'worker_id' => $row['worker_id']
+                    ];
+                }, $emails);
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to load emails from database: {$e->getMessage()}");
+                // Fall through to file-based loading
+            }
+        }
+        
+        // Fallback to file-based loading
         $emailFile = Config::DATA_DIR . "/job_{$jobId}_emails.json";
         if (!file_exists($emailFile)) {
             return [];
@@ -1659,6 +2232,57 @@ class Application {
         $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
         $perPage = 50;
         
+        $db = Database::getInstance();
+        
+        // Try loading from database with pagination
+        if ($db->isConfigured()) {
+            try {
+                // Get total count
+                $countStmt = $db->query(
+                    "SELECT COUNT(*) as total FROM emails WHERE job_id = :job_id",
+                    [':job_id' => $jobId]
+                );
+                $countResult = $countStmt->fetch();
+                $total = (int)$countResult['total'];
+                
+                $totalPages = max(1, ceil($total / $perPage));
+                $page = min($page, $totalPages);
+                $offset = ($page - 1) * $perPage;
+                
+                // Get paginated emails with properly bound parameters
+                $pdo = $db->getConnection();
+                $stmt = $pdo->prepare(
+                    "SELECT email, quality, confidence, source_url, UNIX_TIMESTAMP(created_at) as timestamp, worker_id 
+                     FROM emails 
+                     WHERE job_id = :job_id 
+                     ORDER BY created_at DESC 
+                     LIMIT :limit OFFSET :offset"
+                );
+                $stmt->bindValue(':job_id', $jobId, PDO::PARAM_STR);
+                $stmt->bindValue(':limit', (int)$perPage, PDO::PARAM_INT);
+                $stmt->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
+                $stmt->execute();
+                
+                $emailsPage = array_map(function($row) {
+                    return [
+                        'email' => $row['email'],
+                        'quality' => $row['quality'],
+                        'confidence' => (float)$row['confidence'],
+                        'source_url' => $row['source_url'],
+                        'timestamp' => (int)$row['timestamp'],
+                        'worker_id' => $row['worker_id']
+                    ];
+                }, $stmt->fetchAll());
+                
+                $this->outputResultsHTML($job, $emailsPage, $page, $totalPages, $total);
+                return;
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to load emails from database: {$e->getMessage()}");
+                // Fall through to file-based loading
+            }
+        }
+        
+        // Fallback to file-based loading
         $allEmails = $this->loadJobEmails($jobId);
         $total = count($allEmails);
         $totalPages = max(1, ceil($total / $perPage));
@@ -2296,6 +2920,37 @@ class Application {
         .pulse {
             animation: pulse 2s infinite;
         }
+        
+        .db-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px;
+            background: #f6f8fa;
+            border-radius: 6px;
+            margin-top: 15px;
+            font-size: 12px;
+        }
+        
+        .db-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        
+        .db-indicator.connected {
+            background: #28a745;
+            box-shadow: 0 0 8px rgba(40, 167, 69, 0.6);
+        }
+        
+        .db-indicator.disconnected {
+            background: #dc3545;
+        }
+        
+        .db-status-text {
+            flex: 1;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -2303,6 +2958,20 @@ class Application {
         <div class="sidebar">
             <h1>📧 Email Extractor</h1>
             <div class="version">Version <?php echo Config::VERSION; ?></div>
+            
+            <?php 
+            $db = Database::getInstance();
+            $dbConfigured = $db->isConfigured();
+            ?>
+            
+            <?php if (!$dbConfigured): ?>
+                <div style="background: #fff3cd; border: 1px solid #ffc107; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px;">
+                    <strong>⚠️ Database Not Configured</strong><br>
+                    <p style="margin-top: 8px; color: #856404;">
+                        Please run <a href="install.php" style="color: #0066ff; text-decoration: underline;">install.php</a> to set up MySQL database for persistent email storage.
+                    </p>
+                </div>
+            <?php endif; ?>
             
             <div class="sidebar-section">
                 <h3>System Stats</h3>
@@ -2322,6 +2991,16 @@ class Application {
                     <div class="stats-item">
                         <span class="stats-label">Memory</span>
                         <span class="stats-value" id="stat-memory">0 MB</span>
+                    </div>
+                </div>
+                <div class="db-status">
+                    <div class="db-indicator <?php echo $dbConfigured ? 'connected' : 'disconnected'; ?>"></div>
+                    <div class="db-status-text">
+                        <?php if ($dbConfigured): ?>
+                            <strong>Database:</strong> MySQL Connected
+                        <?php else: ?>
+                            <strong>Database:</strong> File Storage (Temporary)
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>
@@ -2631,21 +3310,47 @@ class Application {
                 try {
                     const result = await API.call('create_job', formData);
                     
+                    console.log('Create job response:', result);
+                    
                     if (result.success) {
-                        UI.showAlert('Job created successfully!');
+                        const debugInfo = result.debug || {};
+                        let message = 'Job created successfully!';
+                        
+                        if (!debugInfo.database_configured) {
+                            message += ' (Using file storage - database not configured)';
+                        }
+                        
+                        UI.showAlert(message);
                         document.getElementById('createJobForm').reset();
-                        this.refreshJobs();
+                        
+                        // Small delay to ensure database write completes
+                        setTimeout(() => {
+                            console.log('Refreshing jobs after creation...');
+                            this.refreshJobs();
+                        }, 500);
                     } else {
                         UI.showAlert(result.error || 'Failed to create job', 'error');
                     }
                 } catch (error) {
+                    console.error('Create job error:', error);
                     UI.showAlert('Error: ' + error.message, 'error');
                 }
             },
             
             async startJob(jobId) {
                 try {
-                    const result = await API.call('start_job', {job_id: jobId});
+                    // Get API key from localStorage
+                    const apiKey = localStorage.getItem('serper_api_key') || document.getElementById('apiKey').value;
+                    
+                    if (!apiKey) {
+                        UI.showAlert('Please enter your API key first', 'error');
+                        return;
+                    }
+                    
+                    const result = await API.call('start_job', {
+                        job_id: jobId,
+                        api_key: apiKey
+                    });
                     
                     if (result.success) {
                         UI.showAlert('Job started successfully!');
@@ -2699,6 +3404,9 @@ class Application {
                         API.get('get_stats')
                     ]);
                     
+                    console.log('Jobs refresh result:', jobsResult);
+                    console.log('Jobs count:', jobsResult.jobs ? jobsResult.jobs.length : 0);
+                    
                     if (jobsResult.success) {
                         UI.renderJobs(jobsResult.jobs);
                     }
@@ -2712,6 +3420,23 @@ class Application {
             }
         };
         
+        // API Key persistence
+        const apiKeyInput = document.getElementById('apiKey');
+        
+        // Load saved API key from localStorage
+        const savedApiKey = localStorage.getItem('serper_api_key');
+        if (savedApiKey) {
+            apiKeyInput.value = savedApiKey;
+        }
+        
+        // Save API key to localStorage when it changes
+        apiKeyInput.addEventListener('change', () => {
+            const apiKey = apiKeyInput.value.trim();
+            if (apiKey) {
+                localStorage.setItem('serper_api_key', apiKey);
+            }
+        });
+        
         // Initialize
         // Test Connection Button
         document.getElementById('testConnectionBtn').addEventListener('click', async () => {
@@ -2720,6 +3445,9 @@ class Application {
                 UI.showAlert('Please enter an API key first', 'error');
                 return;
             }
+            
+            // Save API key when testing
+            localStorage.setItem('serper_api_key', apiKey);
             
             const btn = document.getElementById('testConnectionBtn');
             const status = document.getElementById('connectionStatus');
@@ -2756,9 +3484,16 @@ class Application {
         document.getElementById('createJobForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
+            const apiKey = document.getElementById('apiKey').value;
+            
+            // Save API key to localStorage
+            if (apiKey) {
+                localStorage.setItem('serper_api_key', apiKey);
+            }
+            
             const formData = {
                 name: document.getElementById('jobName').value,
-                api_key: document.getElementById('apiKey').value,
+                api_key: apiKey,
                 query: document.getElementById('query').value,
                 keywords: document.getElementById('keywords').value,
                 country: document.getElementById('country').value,
