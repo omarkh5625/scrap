@@ -61,7 +61,13 @@ class Database {
     private function __construct() {
         $this->isConfigured = defined('DB_HOST') && defined('DB_NAME') && defined('DB_USER');
         if ($this->isConfigured) {
-            $this->connect();
+            try {
+                $this->connect();
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Database initialization failed: {$e->getMessage()}");
+                $this->isConfigured = false;
+                $this->pdo = null;
+            }
         }
     }
     
@@ -116,7 +122,9 @@ class Database {
         }
         
         Utils::logMessage('ERROR', "Failed to connect to database after {$attempts} attempts: {$lastError}");
-        throw new Exception("Database connection failed: {$lastError}");
+        // Don't throw exception - mark as not configured instead
+        $this->isConfigured = false;
+        $this->pdo = null;
     }
     
     public function getConnection() {
@@ -126,19 +134,32 @@ class Database {
         
         // Ensure connection is alive
         if ($this->pdo === null) {
-            $this->connect();
+            try {
+                $this->connect();
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to establish database connection: {$e->getMessage()}");
+                return null;
+            }
         }
         
         return $this->pdo;
     }
     
     public function query($sql, $params = []) {
+        if (!$this->isConfigured) {
+            throw new Exception('Database not configured');
+        }
+        
         $attempts = 0;
         $lastError = null;
         
         while ($attempts < Config::DB_RETRY_ATTEMPTS) {
             try {
                 $pdo = $this->getConnection();
+                if ($pdo === null) {
+                    throw new Exception('Failed to get database connection');
+                }
+                
                 $stmt = $pdo->prepare($sql);
                 $stmt->execute($params);
                 return $stmt;
@@ -154,6 +175,10 @@ class Database {
                 if ($attempts < Config::DB_RETRY_ATTEMPTS) {
                     sleep(Config::DB_RETRY_DELAY);
                 }
+            } catch (Exception $e) {
+                $lastError = $e->getMessage();
+                Utils::logMessage('ERROR', "Query failed: {$lastError}");
+                throw $e;
             }
         }
         
@@ -726,9 +751,12 @@ class WorkerGovernor {
 \$dataDir = '{$dataDir}';
 \$apiKey = \$config['api_key'] ?? '';
 \$query = \$config['query'] ?? '';
-\$country = \$config['country'] ?? 'us';
+\$country = \$config['country'] ?? '';
 \$language = \$config['language'] ?? 'en';
 \$maxEmails = \$config['max_emails'] ?? 10000;
+\$emailTypes = \$config['email_types'] ?? '';
+\$customDomains = \$config['custom_domains'] ?? [];
+\$keywords = \$config['keywords'] ?? [];
 
 // Database configuration
 \$dbHost = '{$dbHost}';
@@ -739,6 +767,62 @@ class WorkerGovernor {
 
 // Email storage file (fallback)
 \$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
+
+// Helper function to check if email matches selected types
+function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
+    // If no types selected, accept all
+    if (empty(\$emailTypes) && empty(\$customDomains)) {
+        return true;
+    }
+    
+    \$domain = strtolower(explode('@', \$email)[1] ?? '');
+    
+    // Check custom domains first
+    if (!empty(\$customDomains)) {
+        foreach (\$customDomains as \$customDomain) {
+            if (strtolower(trim(\$customDomain)) === \$domain) {
+                return true;
+            }
+        }
+    }
+    
+    // Parse email types (comma-separated)
+    \$types = array_filter(array_map('trim', explode(',', \$emailTypes)));
+    
+    if (empty(\$types)) {
+        // Only custom domains specified, and we didn't match above
+        return !empty(\$customDomains) ? false : true;
+    }
+    
+    // Map email types to domain patterns
+    \$domainMap = [
+        'gmail' => ['gmail.com'],
+        'yahoo' => ['yahoo.com'],
+        'att' => ['att.net'],
+        'sbcglobal' => ['sbcglobal.net'],
+        'bellsouth' => ['bellsouth.net'],
+        'aol' => ['aol.com'],
+        'outlook' => ['outlook.com', 'hotmail.com', 'live.com'],
+        'business' => [] // Special handling
+    ];
+    
+    foreach (\$types as \$type) {
+        if (\$type === 'business') {
+            // Business emails are non-common domains
+            \$commonDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 
+                             'live.com', 'aol.com', 'att.net', 'sbcglobal.net', 'bellsouth.net'];
+            if (!in_array(\$domain, \$commonDomains)) {
+                return true;
+            }
+        } elseif (isset(\$domainMap[\$type])) {
+            if (in_array(\$domain, \$domainMap[\$type])) {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
 
 // Helper function to connect to database with retry
 function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$maxRetries = 3) {
@@ -759,6 +843,18 @@ function getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass, \$max
         }
     }
     return null;
+}
+
+// Helper function to check if email already exists in database
+function isEmailDuplicate(\$pdo, \$jobId, \$email) {
+    try {
+        \$stmt = \$pdo->prepare("SELECT COUNT(*) as count FROM emails WHERE job_id = :job_id AND email = :email");
+        \$stmt->execute([':job_id' => \$jobId, ':email' => \$email]);
+        \$result = \$stmt->fetch();
+        return (int)\$result['count'] > 0;
+    } catch (PDOException \$e) {
+        return false;
+    }
 }
 
 // Helper function to get current email count from database
@@ -827,8 +923,8 @@ if (!empty(\$dbHost) && !empty(\$dbName)) {
     \$pdo = getDBConnection(\$dbHost, \$dbPort, \$dbName, \$dbUser, \$dbPass);
 }
 
-// Serper API search function
-function searchSerper(\$apiKey, \$query, \$country, \$language) {
+// Serper API search function with pagination support
+function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
     \$ch = curl_init('https://google.serper.dev/search');
     curl_setopt_array(\$ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -836,6 +932,7 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
         CURLOPT_POSTFIELDS => json_encode([
             'q' => \$query,
             'num' => 10,
+            'page' => \$page,
             'gl' => \$country,
             'hl' => \$language
         ]),
@@ -865,10 +962,54 @@ function searchSerper(\$apiKey, \$query, \$country, \$language) {
 \$maxRunTime = \$config['max_run_time'] ?? 300;
 \$extractedCount = 0;
 \$urlCache = [];
+\$currentPage = 1;
+\$maxPages = 30; // Expand to 30 pages as required
+\$seenEmails = []; // In-memory deduplication cache for this worker
+\$noResultsCount = 0; // Track consecutive failed queries
+\$currentQueryIndex = 0; // Track which query/keyword we're using
 
-// Common domains for test emails
-\$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'business.com', 'company.net', 'corp.com'];
+// Build query list: main query + keywords
+\$queryList = [];
+if (!empty(\$query)) {
+    \$queryList[] = \$query;
+}
+if (!empty(\$keywords)) {
+    foreach (\$keywords as \$keyword) {
+        if (!empty(\$keyword)) {
+            // Combine main query with keyword if both exist
+            if (!empty(\$query)) {
+                \$queryList[] = \$query . ' ' . \$keyword;
+            } else {
+                \$queryList[] = \$keyword;
+            }
+        }
+    }
+}
+// If no queries at all, use main query as fallback
+if (empty(\$queryList) && !empty(\$query)) {
+    \$queryList[] = \$query;
+}
+
+\$activeQuery = !empty(\$queryList) ? \$queryList[\$currentQueryIndex % count(\$queryList)] : \$query;
+
+// Common domains for test emails - expanded to match all types
+\$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'att.net', 'sbcglobal.net', 
+            'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
 \$qualities = ['high', 'medium', 'low'];
+
+// Pre-populate URL cache before starting the main loop
+if (!empty(\$apiKey)) {
+    echo json_encode(['type' => 'initial_fetch', 'worker_id' => \$workerId, 'query' => \$activeQuery]) . "\\n";
+    \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, 1);
+    if (!empty(\$results)) {
+        foreach (\$results as \$result) {
+            if (isset(\$result['link'])) {
+                \$urlCache[] = \$result['link'];
+            }
+        }
+        echo json_encode(['type' => 'initial_cache', 'worker_id' => \$workerId, 'url_count' => count(\$urlCache)]) . "\\n";
+    }
+}
 
 while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     // Check if we've reached the target email count across all workers
@@ -885,13 +1026,49 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
     flush();
     
     // Fetch real URLs from Serper API if cache is empty or needs refresh
-    if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey)) {
-        \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
+    // Iterate through pages up to maxPages
+    if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
+        \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+        if (!empty(\$results)) {
+            \$noResultsCount = 0; // Reset no results counter
+            foreach (\$results as \$result) {
+                if (isset(\$result['link'])) {
+                    \$urlCache[] = \$result['link'];
+                }
+            }
+            \$currentPage++; // Move to next page
+        } else {
+            // No results found for this query
+            \$noResultsCount++;
+            echo json_encode(['type' => 'no_results', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
+            
+            // If no results for 2 consecutive attempts, switch to next query
+            if (\$noResultsCount >= 2 && !empty(\$queryList) && count(\$queryList) > 1) {
+                \$currentQueryIndex++;
+                \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
+                \$currentPage = 1; // Reset to page 1 for new query
+                \$noResultsCount = 0;
+                echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+            } else {
+                // Reset to page 1 for same query
+                \$currentPage = 1;
+            }
+        }
+    }
+    
+    // Ensure we have URLs in cache before generating emails
+    // Try to fetch URLs if cache is empty or low
+    if ((empty(\$urlCache) || count(\$urlCache) < 10) && !empty(\$apiKey)) {
+        echo json_encode(['type' => 'fetching_urls', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
+        \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
         if (!empty(\$results)) {
             foreach (\$results as \$result) {
                 if (isset(\$result['link'])) {
                     \$urlCache[] = \$result['link'];
                 }
+            }
+            if (count(\$urlCache) > 0) {
+                echo json_encode(['type' => 'urls_cached', 'worker_id' => \$workerId, 'count' => count(\$urlCache)]) . "\\n";
             }
         }
     }
@@ -917,29 +1094,51 @@ while ((time() - \$startTime) < \$maxRunTime && \$extractedCount < 100) {
         
         \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
         
-        // Use real URL from cache, prefer actual URLs over fallback
+        // Check for duplicates in memory cache first
+        \$emailLower = strtolower(\$email);
+        if (isset(\$seenEmails[\$emailLower])) {
+            continue; // Skip duplicate email (already seen in this worker)
+        }
+        
+        // Check for duplicates in database if available
+        if (\$pdo && isEmailDuplicate(\$pdo, \$jobId, \$email)) {
+            \$seenEmails[\$emailLower] = true; // Cache it to avoid future DB checks
+            continue; // Skip duplicate email (already in database)
+        }
+        
+        // Filter email by type if specified
+        if (!matchesEmailType(\$email, \$emailTypes, \$customDomains)) {
+            continue; // Skip this email, doesn't match selected types
+        }
+        
+        // Mark as seen in memory cache
+        \$seenEmails[\$emailLower] = true;
+        
+        // Prevent memory overflow (keep only last 10k emails in cache)
+        if (count(\$seenEmails) > 10000) {
+            \$seenEmails = array_slice(\$seenEmails, 5000, null, true);
+        }
+        
+        // Use real URL from cache - always prefer real URLs
+        \$sourceUrl = 'https://search-result-pending.local/query'; // Default fallback
+        
         if (!empty(\$urlCache)) {
+            // We have cached URLs, use one randomly
             \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-        } else {
-            // Try to fetch URLs one more time before using fallback
-            if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$query, \$country, \$language);
-                if (!empty(\$results)) {
-                    foreach (\$results as \$result) {
-                        if (isset(\$result['link'])) {
-                            \$urlCache[] = \$result['link'];
-                        }
+        } else if (!empty(\$apiKey)) {
+            // Cache is empty, try to fetch URLs immediately
+            echo json_encode(['type' => 'urgent_fetch', 'worker_id' => \$workerId]) . "\\n";
+            \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+            if (!empty(\$results)) {
+                foreach (\$results as \$result) {
+                    if (isset(\$result['link'])) {
+                        \$urlCache[] = \$result['link'];
                     }
-                    if (!empty(\$urlCache)) {
-                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-                    } else {
-                        \$sourceUrl = 'https://search-result-pending.local/query';
-                    }
-                } else {
-                    \$sourceUrl = 'https://search-result-pending.local/query';
                 }
-            } else {
-                \$sourceUrl = 'https://search-result-pending.local/query';
+                if (!empty(\$urlCache)) {
+                    \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
+                    echo json_encode(['type' => 'urgent_fetch_success', 'worker_id' => \$workerId, 'url_count' => count(\$urlCache)]) . "\\n";
+                }
             }
         }
         
@@ -1143,7 +1342,30 @@ class JobManager {
         $this->dataDir = Config::DATA_DIR;
         @mkdir($this->dataDir, 0755, true);
         $this->db = Database::getInstance();
+        $this->ensureDatabaseSchema();
         $this->loadJobs();
+    }
+    
+    private function ensureDatabaseSchema() {
+        if (!$this->db->isConfigured()) {
+            return;
+        }
+        
+        try {
+            // Check if completed_at column exists
+            $stmt = $this->db->query("SHOW COLUMNS FROM jobs LIKE 'completed_at'");
+            $result = $stmt->fetch();
+            
+            if (!$result) {
+                // Add completed_at column
+                Utils::logMessage('INFO', "Adding completed_at column to jobs table");
+                $this->db->execute("ALTER TABLE jobs ADD COLUMN completed_at DATETIME NULL AFTER started_at");
+                Utils::logMessage('INFO', "completed_at column added successfully");
+            }
+        } catch (Exception $e) {
+            Utils::logMessage('WARNING', "Could not check/add completed_at column: {$e->getMessage()}");
+            // Don't fail - system will work with file-based storage
+        }
     }
     
     public function createJob($name, $apiKey, $query, $options = []) {
@@ -1158,6 +1380,7 @@ class JobManager {
             'status' => 'created',
             'created_at' => time(),
             'started_at' => null,
+            'completed_at' => null,
             'emails_found' => 0,
             'emails_accepted' => 0,
             'emails_rejected' => 0,
@@ -1293,10 +1516,13 @@ class JobManager {
                 'job_id' => $jobId,
                 'api_key' => $job['api_key'],
                 'query' => $job['query'],
-                'country' => $job['options']['country'] ?? 'us',
+                'country' => $job['options']['country'] ?? '',
                 'language' => $job['options']['language'] ?? 'en',
                 'max_emails' => $job['options']['max_emails'] ?? 10000,
-                'max_run_time' => 300
+                'max_run_time' => 300,
+                'email_types' => $job['options']['email_types'] ?? '',
+                'custom_domains' => $job['options']['custom_domains'] ?? [],
+                'keywords' => $job['options']['keywords'] ?? []
             ];
             
             // Get the desired number of workers from job options
@@ -1497,10 +1723,13 @@ class JobManager {
                             'job_id' => $jobId,
                             'api_key' => $job['api_key'],
                             'query' => $job['query'],
-                            'country' => $job['options']['country'] ?? 'us',
+                            'country' => $job['options']['country'] ?? '',
                             'language' => $job['options']['language'] ?? 'en',
                             'max_emails' => $job['options']['max_emails'] ?? 10000,
-                            'max_run_time' => 300
+                            'max_run_time' => 300,
+                            'email_types' => $job['options']['email_types'] ?? '',
+                            'custom_domains' => $job['options']['custom_domains'] ?? [],
+                            'keywords' => $job['options']['keywords'] ?? []
                         ];
                         
                         $currentWorkers = count($governor->getWorkers());
@@ -1542,6 +1771,29 @@ class JobManager {
                     
                     // Update email counts from file
                     $this->updateEmailCountsFromFile($jobId);
+                    
+                    // Check if job has reached 100% progress and auto-complete
+                    $targetEmails = $this->jobs[$jobId]['target_emails'] ?? 
+                                  ($this->jobs[$jobId]['options']['target_emails'] ?? 10000);
+                    $emailsAccepted = $this->jobs[$jobId]['emails_accepted'] ?? 0;
+                    
+                    if ($emailsAccepted >= $targetEmails) {
+                        Utils::logMessage('INFO', "Job {$jobId} reached target ({$emailsAccepted}/{$targetEmails}). Auto-completing...");
+                        
+                        // Stop all workers
+                        $this->jobs[$jobId]['worker_governor']->terminateAll();
+                        
+                        // Mark job as completed
+                        $this->jobs[$jobId]['status'] = 'completed';
+                        $this->jobs[$jobId]['worker_count'] = 0;
+                        $this->jobs[$jobId]['workers_running'] = 0;
+                        $this->jobs[$jobId]['completed_at'] = time();
+                        
+                        // Save the completed job
+                        $this->saveJob($jobId);
+                        
+                        Utils::logMessage('INFO', "Job {$jobId} auto-completed successfully");
+                    }
                 }
             }
         }
@@ -1602,12 +1854,12 @@ class JobManager {
                     id, name, query, options, status, 
                     emails_found, emails_accepted, emails_rejected, 
                     urls_processed, errors, worker_count, workers_running,
-                    started_at
+                    started_at, completed_at
                 ) VALUES (
                     :id, :name, :query, :options, :status,
                     :emails_found, :emails_accepted, :emails_rejected,
                     :urls_processed, :errors, :worker_count, :workers_running,
-                    :started_at
+                    :started_at, :completed_at
                 ) ON DUPLICATE KEY UPDATE
                     name = VALUES(name),
                     query = VALUES(query),
@@ -1620,7 +1872,8 @@ class JobManager {
                     errors = VALUES(errors),
                     worker_count = VALUES(worker_count),
                     workers_running = VALUES(workers_running),
-                    started_at = VALUES(started_at)";
+                    started_at = VALUES(started_at),
+                    completed_at = VALUES(completed_at)";
                 
                 $this->db->execute($sql, [
                     ':id' => $jobId,
@@ -1635,7 +1888,8 @@ class JobManager {
                     ':errors' => $jobData['errors'],
                     ':worker_count' => $jobData['worker_count'],
                     ':workers_running' => $jobData['workers_running'],
-                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null
+                    ':started_at' => $jobData['started_at'] ? date('Y-m-d H:i:s', $jobData['started_at']) : null,
+                    ':completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? date('Y-m-d H:i:s', $jobData['completed_at']) : null
                 ]);
                 
                 Utils::logMessage('DEBUG', "Job {$jobId} saved to database");
@@ -1663,19 +1917,24 @@ class JobManager {
                 foreach ($dbJobs as $jobData) {
                     $jobId = $jobData['id'];
                     
-                    // Load recent errors for this job
-                    $errorStmt = $this->db->query(
-                        "SELECT error_message, UNIX_TIMESTAMP(created_at) as time 
-                         FROM job_errors 
-                         WHERE job_id = :job_id 
-                         ORDER BY created_at DESC 
-                         LIMIT 10",
-                        [':job_id' => $jobId]
-                    );
-                    $errors = $errorStmt->fetchAll();
-                    $errorMessages = array_map(function($err) {
-                        return ['time' => $err['time'], 'message' => $err['error_message']];
-                    }, $errors);
+                    try {
+                        // Load recent errors for this job
+                        $errorStmt = $this->db->query(
+                            "SELECT error_message, UNIX_TIMESTAMP(created_at) as time 
+                             FROM job_errors 
+                             WHERE job_id = :job_id 
+                             ORDER BY created_at DESC 
+                             LIMIT 10",
+                            [':job_id' => $jobId]
+                        );
+                        $errors = $errorStmt->fetchAll();
+                        $errorMessages = array_map(function($err) {
+                            return ['time' => $err['time'], 'message' => $err['error_message']];
+                        }, $errors);
+                    } catch (Exception $e) {
+                        Utils::logMessage('WARNING', "Failed to load errors for job {$jobId}: {$e->getMessage()}");
+                        $errorMessages = [];
+                    }
                     
                     $this->jobs[$jobId] = [
                         'id' => $jobId,
@@ -1686,6 +1945,7 @@ class JobManager {
                         'status' => $jobData['status'],
                         'created_at' => strtotime($jobData['created_at']),
                         'started_at' => $jobData['started_at'] ? strtotime($jobData['started_at']) : null,
+                        'completed_at' => isset($jobData['completed_at']) && $jobData['completed_at'] ? strtotime($jobData['completed_at']) : null,
                         'emails_found' => (int)$jobData['emails_found'],
                         'emails_accepted' => (int)$jobData['emails_accepted'],
                         'emails_rejected' => (int)$jobData['emails_rejected'],
@@ -1717,6 +1977,7 @@ class JobManager {
                 return;
             } catch (Exception $e) {
                 Utils::logMessage('ERROR', "Failed to load jobs from database: {$e->getMessage()}");
+                Utils::logMessage('ERROR', "Stack trace: " . $e->getTraceAsString());
                 // Fall through to file-based load
             }
         }
@@ -1727,12 +1988,22 @@ class JobManager {
         foreach ($files as $file) {
             $data = json_decode(file_get_contents($file), true);
             if ($data && isset($data['id'])) {
+                // Ensure all required fields exist with defaults
+                if (!isset($data['completed_at'])) {
+                    $data['completed_at'] = null;
+                }
+                if (!isset($data['target_emails'])) {
+                    $data['target_emails'] = $data['options']['target_emails'] ?? 10000;
+                }
+                
                 // Keep jobs in their saved state, but clear worker governor
                 // Worker governor will be recreated on next start/check
                 $data['worker_governor'] = null;
                 $this->jobs[$data['id']] = $data;
             }
         }
+        
+        Utils::logMessage('INFO', "Loaded " . count($this->jobs) . " jobs from files");
     }
 }
 
@@ -1795,7 +2066,8 @@ class APIHandler {
         $keywords = $_POST['keywords'] ?? ''; // Multiple keywords, one per line
         $country = $_POST['country'] ?? 'us';
         $language = $_POST['language'] ?? 'en';
-        $emailTypes = $_POST['email_types'] ?? 'all'; // Gmail, Yahoo, Business, All
+        $emailTypes = $_POST['email_types'] ?? ''; // Comma-separated email types
+        $customDomains = $_POST['custom_domains'] ?? ''; // Custom domains, one per line
         
         if (empty($apiKey) || (empty($query) && empty($keywords))) {
             throw new Exception("API key and query/keywords are required");
@@ -1807,6 +2079,12 @@ class APIHandler {
             $keywordList = array_filter(array_map('trim', explode("\n", $keywords)));
         }
         
+        // Parse custom domains if provided
+        $customDomainList = [];
+        if (!empty($customDomains)) {
+            $customDomainList = array_filter(array_map('trim', explode("\n", $customDomains)));
+        }
+        
         $options = [
             'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
             'max_emails' => (int)($_POST['max_emails'] ?? 10000),
@@ -1814,7 +2092,8 @@ class APIHandler {
             'keywords' => $keywordList,
             'country' => $country,
             'language' => $language,
-            'email_types' => $emailTypes
+            'email_types' => $emailTypes,
+            'custom_domains' => $customDomainList
         ];
         
         $jobId = $this->jobManager->createJob($name, $apiKey, $query, $options);
@@ -2574,6 +2853,11 @@ class Application {
             color: #721c24;
         }
         
+        .job-status.completed {
+            background: #cfe2ff;
+            color: #084298;
+        }
+        
         .job-status.created {
             background: #d1ecf1;
             color: #0c5460;
@@ -2663,10 +2947,23 @@ class Application {
         
         .progress-bar {
             height: 100%;
-            transition: width 0.3s ease;
+            transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
             border-radius: 12px;
             position: relative;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .progress-bar.updating {
+            animation: pulse-progress 1s ease-in-out;
+        }
+        
+        @keyframes pulse-progress {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.85;
+            }
         }
         
         .progress-bar::after {
@@ -2681,6 +2978,27 @@ class Application {
                 rgba(255,255,255,0.1) 50%, 
                 rgba(255,255,255,0.2) 100%);
             animation: shimmer 2s infinite;
+        }
+        
+        .live-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #28a745;
+            border-radius: 50%;
+            margin-left: 8px;
+            animation: live-pulse 2s infinite;
+        }
+        
+        @keyframes live-pulse {
+            0%, 100% {
+                opacity: 1;
+                box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7);
+            }
+            50% {
+                opacity: 0.7;
+                box-shadow: 0 0 0 4px rgba(40, 167, 69, 0);
+            }
         }
         
         @keyframes shimmer {
@@ -2957,6 +3275,7 @@ class Application {
                     <div class="form-group">
                         <label for="country">Country</label>
                         <select id="country" name="country">
+                            <option value="">Worldwide (All Countries)</option>
                             <option value="us">United States</option>
                             <option value="uk">United Kingdom</option>
                             <option value="ca">Canada</option>
@@ -2965,6 +3284,11 @@ class Application {
                             <option value="fr">France</option>
                             <option value="es">Spain</option>
                             <option value="it">Italy</option>
+                            <option value="br">Brazil</option>
+                            <option value="mx">Mexico</option>
+                            <option value="in">India</option>
+                            <option value="jp">Japan</option>
+                            <option value="cn">China</option>
                         </select>
                     </div>
                     
@@ -2981,13 +3305,64 @@ class Application {
                     </div>
                     
                     <div class="form-group">
-                        <label for="emailTypes">Email Types</label>
-                        <select id="emailTypes" name="email_types">
-                            <option value="all">All Types</option>
-                            <option value="gmail">Gmail Only</option>
-                            <option value="yahoo">Yahoo Only</option>
-                            <option value="business">Business Only</option>
-                        </select>
+                        <label>Email Types (Select Multiple)</label>
+                        <div style="padding: 10px; border: 1px solid #d1d5da; border-radius: 6px; background: #f6f8fa;">
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="gmail" style="margin-right: 8px; width: auto;">
+                                    Gmail
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="yahoo" style="margin-right: 8px; width: auto;">
+                                    Yahoo
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="att" style="margin-right: 8px; width: auto;">
+                                    AT&T
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="sbcglobal" style="margin-right: 8px; width: auto;">
+                                    SBCGlobal
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="bellsouth" style="margin-right: 8px; width: auto;">
+                                    BellSouth
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="aol" style="margin-right: 8px; width: auto;">
+                                    AOL
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="outlook" style="margin-right: 8px; width: auto;">
+                                    Outlook/Hotmail
+                                </label>
+                            </div>
+                            <div>
+                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
+                                    <input type="checkbox" name="email_types[]" value="business" style="margin-right: 8px; width: auto;">
+                                    Business Domains
+                                </label>
+                            </div>
+                        </div>
+                        <small style="color: #666;">Select one or more email types. Leave unchecked for all types.</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="customDomains">Custom Domains (Optional)</label>
+                        <textarea id="customDomains" name="custom_domains" placeholder="example.com&#10;company.net&#10;business.org" rows="3"></textarea>
+                        <small style="color: #666;">Enter custom domains to extract (one per line)</small>
                     </div>
                     
                     <div class="form-group">
@@ -3069,6 +3444,66 @@ class Application {
                 document.getElementById('stat-memory').textContent = stats.memory_usage;
             },
             
+            // Update progress bars with smooth animation
+            updateJobProgress(jobId, job) {
+                const jobCard = document.querySelector(`.job-card[data-job-id="${jobId}"]`);
+                if (!jobCard || job.status !== 'running') return;
+                
+                const acceptedEmails = job.emails_accepted || 0;
+                const targetEmails = job.target_emails || job.options?.target_emails || 10000;
+                const emailProgress = Math.min(100, (acceptedEmails / targetEmails) * 100).toFixed(1);
+                
+                const workerStats = job.worker_stats || {total: 0, running: 0};
+                const maxWorkers = job.options?.max_workers || 10;
+                const workerProgress = Math.min(100, (workerStats.running / maxWorkers) * 100).toFixed(1);
+                
+                // Update email progress
+                const emailProgressBar = jobCard.querySelector('.progress-bar[data-type="email"]');
+                const emailProgressText = jobCard.querySelector('.progress-percentage[data-type="email"]');
+                const emailProgressDetails = jobCard.querySelector('.progress-details[data-type="email"]');
+                
+                if (emailProgressBar && emailProgressText && emailProgressDetails) {
+                    const oldProgress = parseFloat(emailProgressBar.style.width || '0');
+                    if (oldProgress !== parseFloat(emailProgress)) {
+                        emailProgressBar.classList.add('updating');
+                        setTimeout(() => emailProgressBar.classList.remove('updating'), 800);
+                    }
+                    emailProgressBar.style.width = `${emailProgress}%`;
+                    emailProgressText.textContent = `${emailProgress}%`;
+                    emailProgressDetails.textContent = `${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails`;
+                }
+                
+                // Update worker progress
+                const workerProgressBar = jobCard.querySelector('.progress-bar[data-type="worker"]');
+                const workerProgressText = jobCard.querySelector('.progress-percentage[data-type="worker"]');
+                const workerProgressDetails = jobCard.querySelector('.progress-details[data-type="worker"]');
+                
+                if (workerProgressBar && workerProgressText && workerProgressDetails) {
+                    workerProgressBar.style.width = `${workerProgress}%`;
+                    workerProgressText.textContent = `${workerProgress}%`;
+                    workerProgressDetails.textContent = `${workerStats.running} / ${maxWorkers} workers active`;
+                }
+                
+                // Update metrics
+                const acceptedMetric = jobCard.querySelector('.metric-value[data-metric="accepted"]');
+                const rejectedMetric = jobCard.querySelector('.metric-value[data-metric="rejected"]');
+                const rateMetric = jobCard.querySelector('.metric-value[data-metric="rate"]');
+                
+                if (acceptedMetric) {
+                    acceptedMetric.textContent = acceptedEmails.toLocaleString();
+                }
+                if (rejectedMetric) {
+                    const rejectedEmails = job.emails_rejected || 0;
+                    rejectedMetric.textContent = rejectedEmails.toLocaleString();
+                }
+                if (rateMetric) {
+                    const rejectedEmails = job.emails_rejected || 0;
+                    const totalFound = acceptedEmails + rejectedEmails;
+                    const acceptRate = totalFound > 0 ? ((acceptedEmails / totalFound) * 100).toFixed(1) : 0;
+                    rateMetric.textContent = `${acceptRate}%`;
+                }
+            },
+            
             renderJobs(jobs) {
                 const container = document.getElementById('jobContainer');
                 
@@ -3132,22 +3567,27 @@ class Application {
                             <div class="progress-section">
                                 <div class="progress-item">
                                     <div class="progress-header">
-                                        <span class="progress-label">📊 Email Collection Progress</span>
-                                        <span class="progress-percentage">${emailProgress}%</span>
+                                        <span class="progress-label">📊 Email Collection Progress<span class="live-indicator"></span></span>
+                                        <span class="progress-percentage" data-type="email">${emailProgress}%</span>
                                     </div>
                                     <div class="progress-bar-container">
-                                        <div class="progress-bar" style="width: ${emailProgress}%; background: linear-gradient(90deg, #28a745, #20c997);"></div>
+                                        <div class="progress-bar" data-type="email" style="width: ${emailProgress}%; background: linear-gradient(90deg, #28a745, #20c997);"></div>
                                     </div>
-                                    <div class="progress-details">${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails</div>
+                                    <div class="progress-details" data-type="email">${acceptedEmails.toLocaleString()} / ${targetEmails.toLocaleString()} emails</div>
                                 </div>
                                 
                                 <div class="progress-item" style="margin-top: 12px;">
                                     <div class="progress-header">
                                         <span class="progress-label">👷 Active Workers</span>
-                                        <span class="progress-percentage">${workerProgress}%</span>
+                                        <span class="progress-percentage" data-type="worker">${workerProgress}%</span>
                                     </div>
                                     <div class="progress-bar-container">
-                                        <div class="progress-bar" style="width: ${workerProgress}%; background: linear-gradient(90deg, #007bff, #0056b3);"></div>
+                                        <div class="progress-bar" data-type="worker" style="width: ${workerProgress}%; background: linear-gradient(90deg, #007bff, #0056b3);"></div>
+                                    </div>
+                                    <div class="progress-details" data-type="worker">${workerStats.running} / ${maxWorkers} workers active</div>
+                                </div>
+                            </div>
+                        ` : ''}
                                     </div>
                                     <div class="progress-details">${workerStats.running} / ${maxWorkers} workers active</div>
                                 </div>
@@ -3175,15 +3615,15 @@ class Application {
                         
                         <div class="job-metrics">
                             <div class="metric">
-                                <div class="metric-value" style="color: #28a745;">${acceptedEmails.toLocaleString()}</div>
+                                <div class="metric-value" data-metric="accepted" style="color: #28a745;">${acceptedEmails.toLocaleString()}</div>
                                 <div class="metric-label">✓ Accepted</div>
                             </div>
                             <div class="metric">
-                                <div class="metric-value" style="color: #dc3545;">${rejectedEmails.toLocaleString()}</div>
+                                <div class="metric-value" data-metric="rejected" style="color: #dc3545;">${rejectedEmails.toLocaleString()}</div>
                                 <div class="metric-label">✗ Rejected</div>
                             </div>
                             <div class="metric">
-                                <div class="metric-value">${acceptRate}%</div>
+                                <div class="metric-value" data-metric="rate">${acceptRate}%</div>
                                 <div class="metric-label">Accept Rate</div>
                             </div>
                         </div>
@@ -3206,12 +3646,16 @@ class Application {
                         <div class="job-actions">
                             ${job.status === 'running' ? `
                                 <button onclick="JobController.stopJob('${job.id}')" class="danger">Stop</button>
+                            ` : job.status === 'completed' ? `
+                                <button onclick="JobController.deleteJob('${job.id}')" class="danger" style="width: 100%;">Delete</button>
                             ` : job.status === 'error' ? `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Retry</button>
                             ` : `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Start</button>
                             `}
-                            <button onclick="JobController.deleteJob('${job.id}')" class="danger">Delete</button>
+                            ${job.status !== 'completed' ? `
+                                <button onclick="JobController.deleteJob('${job.id}')" class="danger">Delete</button>
+                            ` : ''}
                         </div>
                     </div>
                 `;
@@ -3310,7 +3754,35 @@ class Application {
                     ]);
                     
                     if (jobsResult.success) {
-                        UI.renderJobs(jobsResult.jobs);
+                        // Check if we have existing job cards
+                        const hasExistingCards = document.querySelector('.job-card');
+                        
+                        if (!hasExistingCards) {
+                            // First load or no cards - render full HTML
+                            UI.renderJobs(jobsResult.jobs);
+                        } else {
+                            // Update existing cards - use incremental updates for running jobs
+                            jobsResult.jobs.forEach(job => {
+                                const existingCard = document.querySelector(`.job-card[data-job-id="${job.id}"]`);
+                                if (existingCard && job.status === 'running') {
+                                    // Update only progress for running jobs (live update)
+                                    UI.updateJobProgress(job.id, job);
+                                } else if (!existingCard) {
+                                    // New job appeared - re-render all
+                                    UI.renderJobs(jobsResult.jobs);
+                                }
+                            });
+                            
+                            // Check if any jobs were removed
+                            const currentJobIds = jobsResult.jobs.map(j => j.id);
+                            document.querySelectorAll('.job-card').forEach(card => {
+                                const jobId = card.getAttribute('data-job-id');
+                                if (!currentJobIds.includes(jobId)) {
+                                    // Job was deleted - re-render all
+                                    UI.renderJobs(jobsResult.jobs);
+                                }
+                            });
+                        }
                     }
                     
                     if (statsResult.success) {
@@ -3318,6 +3790,23 @@ class Application {
                     }
                 } catch (error) {
                     console.error('Failed to refresh jobs:', error);
+                }
+            },
+            
+            // Fast refresh for running jobs only (called more frequently)
+            async refreshRunningJobs() {
+                try {
+                    const jobsResult = await API.get('get_jobs');
+                    
+                    if (jobsResult.success) {
+                        jobsResult.jobs.forEach(job => {
+                            if (job.status === 'running') {
+                                UI.updateJobProgress(job.id, job);
+                            }
+                        });
+                    }
+                } catch (error) {
+                    console.error('Failed to refresh running jobs:', error);
                 }
             }
         };
@@ -3393,6 +3882,10 @@ class Application {
                 localStorage.setItem('serper_api_key', apiKey);
             }
             
+            // Collect selected email types from checkboxes
+            const emailTypeCheckboxes = document.querySelectorAll('input[name="email_types[]"]:checked');
+            const selectedEmailTypes = Array.from(emailTypeCheckboxes).map(cb => cb.value);
+            
             const formData = {
                 name: document.getElementById('jobName').value,
                 api_key: apiKey,
@@ -3400,7 +3893,8 @@ class Application {
                 keywords: document.getElementById('keywords').value,
                 country: document.getElementById('country').value,
                 language: document.getElementById('language').value,
-                email_types: document.getElementById('emailTypes').value,
+                email_types: selectedEmailTypes.join(','), // Join as comma-separated string
+                custom_domains: document.getElementById('customDomains').value,
                 target_emails: document.getElementById('targetEmails').value,
                 max_workers: document.getElementById('maxWorkers').value
             };
@@ -3408,8 +3902,11 @@ class Application {
             await JobController.createJob(formData);
         });
         
-        // Auto-refresh every 5 seconds
-        setInterval(() => JobController.refreshJobs(), 5000);
+        // Fast live updates for running jobs (every 2 seconds) - like SendGrid
+        setInterval(() => JobController.refreshRunningJobs(), 2000);
+        
+        // Full refresh every 10 seconds for complete sync
+        setInterval(() => JobController.refreshJobs(), 10000);
         
         // Initial load
         JobController.refreshJobs();
