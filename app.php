@@ -1197,6 +1197,15 @@ class JobManager {
         $this->saveJob($jobId);
     }
     
+    public function updateJobApiKey($jobId, $apiKey) {
+        if (!isset($this->jobs[$jobId])) {
+            throw new Exception("Job not found: {$jobId}");
+        }
+        
+        $this->jobs[$jobId]['api_key'] = $apiKey;
+        Utils::logMessage('DEBUG', "API key updated for job {$jobId}");
+    }
+    
     public function startJob($jobId) {
         if (!isset($this->jobs[$jobId])) {
             throw new Exception("Job not found: {$jobId}");
@@ -1719,9 +1728,15 @@ class APIHandler {
     
     private function startJob() {
         $jobId = $_POST['job_id'] ?? '';
+        $apiKey = $_POST['api_key'] ?? '';
         
         if (empty($jobId)) {
             throw new Exception("Job ID is required");
+        }
+        
+        // Update the job's API key if provided
+        if (!empty($apiKey)) {
+            $this->jobManager->updateJobApiKey($jobId, $apiKey);
         }
         
         $this->jobManager->startJob($jobId);
@@ -3130,7 +3145,18 @@ class Application {
             
             async startJob(jobId) {
                 try {
-                    const result = await API.call('start_job', {job_id: jobId});
+                    // Get API key from localStorage
+                    const apiKey = localStorage.getItem('serper_api_key') || document.getElementById('apiKey').value;
+                    
+                    if (!apiKey) {
+                        UI.showAlert('Please enter your API key first', 'error');
+                        return;
+                    }
+                    
+                    const result = await API.call('start_job', {
+                        job_id: jobId,
+                        api_key: apiKey
+                    });
                     
                     if (result.success) {
                         UI.showAlert('Job started successfully!');
