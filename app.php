@@ -960,8 +960,9 @@ function fetchUrlContent(\$url) {
     curl_setopt_array(\$ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
-        CURLOPT_TIMEOUT => 10,
+        CURLOPT_MAXREDIRS => 2,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_CONNECTTIMEOUT => 3,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     ]);
@@ -998,7 +999,39 @@ function getEmailQuality(\$email, \$content) {
     return 'low';
 }
 
-// Extraction work with REAL email scraping
+// Batch save emails to database for better performance
+function saveBatchToDB(\$pdo, \$jobId, \$emailBatch) {
+    if (empty(\$emailBatch)) return 0;
+    
+    try {
+        \$pdo->beginTransaction();
+        \$sql = "INSERT IGNORE INTO emails (job_id, email, quality, confidence, source_url, worker_id) 
+                VALUES (:job_id, :email, :quality, :confidence, :source_url, :worker_id)";
+        \$stmt = \$pdo->prepare(\$sql);
+        
+        \$saved = 0;
+        foreach (\$emailBatch as \$emailData) {
+            \$stmt->execute([
+                ':job_id' => \$jobId,
+                ':email' => \$emailData['email'],
+                ':quality' => \$emailData['quality'],
+                ':confidence' => \$emailData['confidence'],
+                ':source_url' => \$emailData['source_url'],
+                ':worker_id' => \$emailData['worker_id']
+            ]);
+            \$saved += \$stmt->rowCount();
+        }
+        
+        \$pdo->commit();
+        return \$saved;
+    } catch (PDOException \$e) {
+        \$pdo->rollBack();
+        error_log("Batch save error: " . \$e->getMessage());
+        return 0;
+    }
+}
+
+// Extraction work with REAL email scraping - OPTIMIZED
 \$startTime = time();
 \$extractedCount = 0;
 \$urlsToProcess = [];
@@ -1006,6 +1039,9 @@ function getEmailQuality(\$email, \$content) {
 \$seenEmails = []; // In-memory deduplication cache for this worker
 \$currentQueryIndex = 0;
 \$currentPage = 1;
+\$emailBatch = []; // Batch buffer for database inserts
+\$lastCountCheck = time(); // For periodic count checking
+\$localEmailCount = 0; // Local counter
 
 // Build query list: main query + keywords
 \$queryList = [];
@@ -1026,26 +1062,38 @@ if (empty(\$queryList)) {
 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
 
 while ((time() - \$startTime) < \$maxRunTime) {
-    // Check if we've reached the target email count
-    if (\$pdo) {
+    // Check target limit periodically (every 10 seconds) instead of every iteration
+    if (\$pdo && (time() - \$lastCountCheck) >= 10) {
         \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+        \$lastCountCheck = time();
         if (\$currentTotal >= \$maxEmails) {
+            // Save any remaining emails in batch
+            if (!empty(\$emailBatch)) {
+                saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+            }
             echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
             break;
         }
     }
     
-    // Output heartbeat
-    echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
-    flush();
+    // Output heartbeat less frequently
+    if (\$extractedCount % 50 == 0) {
+        echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
+        flush();
+    }
     
-    // Fetch URLs from Serper API if we need more
-    if (count(\$urlsToProcess) < 10 && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
+    // Fetch URLs from Serper API - fetch more at once
+    if (count(\$urlsToProcess) < 50 && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
         \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
         if (!empty(\$results)) {
             foreach (\$results as \$result) {
-                if (isset(\$result['link']) && !in_array(\$result['link'], \$processedUrls)) {
-                    \$urlsToProcess[] = \$result['link'];
+                if (isset(\$result['link'])) {
+                    \$url = \$result['link'];
+                    // Use hash for O(1) lookup instead of in_array
+                    if (!isset(\$processedUrls[\$url])) {
+                        \$urlsToProcess[] = \$url;
+                        \$processedUrls[\$url] = true;
+                    }
                 }
             }
             \$currentPage++;
@@ -1062,17 +1110,16 @@ while ((time() - \$startTime) < \$maxRunTime) {
     
     // Process URLs and extract REAL emails
     if (empty(\$urlsToProcess)) {
-        sleep(2); // Short sleep if no URLs to process
+        // Don't sleep, just continue to fetch more URLs
         continue;
     }
     
     \$url = array_shift(\$urlsToProcess);
-    \$processedUrls[] = \$url;
     
     // Fetch and parse the URL content
     \$content = fetchUrlContent(\$url);
     if (\$content === false) {
-        continue; // Skip failed URLs
+        continue; // Skip failed URLs quickly
     }
     
     // Extract emails from the page content
@@ -1080,22 +1127,14 @@ while ((time() - \$startTime) < \$maxRunTime) {
     \$foundCount = 0;
     
     foreach (\$extractedEmails as \$email) {
-        // Check target limit
-        if (\$pdo) {
-            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-            if (\$currentTotal >= \$maxEmails) {
-                break 2;
-            }
+        // Check local counter for quick exit
+        if (\$localEmailCount >= \$maxEmails) {
+            break 2;
         }
         
-        // Deduplicate
+        // Deduplicate using memory cache only (much faster)
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
-            continue;
-        }
-        
-        if (\$pdo && isEmailDuplicate(\$pdo, \$jobId, \$email)) {
-            \$seenEmails[\$emailLower] = true;
             continue;
         }
         
@@ -1108,8 +1147,8 @@ while ((time() - \$startTime) < \$maxRunTime) {
         \$seenEmails[\$emailLower] = true;
         
         // Prevent memory overflow
-        if (count(\$seenEmails) > 10000) {
-            \$seenEmails = array_slice(\$seenEmails, 5000, null, true);
+        if (count(\$seenEmails) > 50000) {
+            \$seenEmails = array_slice(\$seenEmails, 25000, null, true);
         }
         
         // Determine email quality
@@ -1124,19 +1163,36 @@ while ((time() - \$startTime) < \$maxRunTime) {
             'worker_id' => \$workerId
         ];
         
-        // Save to database first, fallback to file
-        if (\$pdo) {
-            if (!saveEmailToDB(\$pdo, \$jobId, \$emailData)) {
-                saveEmailToFile(\$emailFile, \$emailData);
-            }
-        } else {
-            saveEmailToFile(\$emailFile, \$emailData);
-        }
+        // Add to batch instead of immediate save
+        \$emailBatch[] = \$emailData;
         \$extractedCount++;
+        \$localEmailCount++;
         \$foundCount++;
+        
+        // Flush batch when it reaches 100 emails
+        if (count(\$emailBatch) >= 100) {
+            if (\$pdo) {
+                \$saved = saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+                if (\$saved > 0) {
+                    echo json_encode([
+                        'type' => 'batch_saved',
+                        'worker_id' => \$workerId,
+                        'count' => \$saved,
+                        'time' => time()
+                    ]) . "\\n";
+                    flush();
+                }
+            } else {
+                // Fallback to file
+                foreach (\$emailBatch as \$ed) {
+                    saveEmailToFile(\$emailFile, \$ed);
+                }
+            }
+            \$emailBatch = [];
+        }
     }
     
-    if (\$foundCount > 0) {
+    if (\$foundCount > 0 && \$foundCount % 20 == 0) {
         echo json_encode([
             'type' => 'emails_found',
             'worker_id' => \$workerId,
@@ -1147,8 +1203,18 @@ while ((time() - \$startTime) < \$maxRunTime) {
         flush();
     }
     
-    // Very short delay between URL processing (optimize for speed)
-    usleep(100000); // 0.1 second
+    // No delay - process URLs as fast as possible
+}
+
+// Save any remaining emails in batch
+if (!empty(\$emailBatch)) {
+    if (\$pdo) {
+        saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+    } else {
+        foreach (\$emailBatch as \$ed) {
+            saveEmailToFile(\$emailFile, \$ed);
+        }
+    }
 }
 
 echo json_encode(['type' => 'completed', 'worker_id' => \$workerId, 'total_extracted' => \$extractedCount]) . "\\n";
