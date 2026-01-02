@@ -3728,7 +3728,7 @@ class Application {
                     container.innerHTML = `
                         <div class="empty-state">
                             <h3>No Jobs Yet</h3>
-                            <p>Create your first job using the form on the left</p>
+                            <p>Create your first job using the form above</p>
                         </div>
                     `;
                     return;
