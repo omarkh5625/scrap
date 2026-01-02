@@ -1098,20 +1098,27 @@ function saveBatchToJSONOptimized(\$emailFile, \$emailBatch) {
     }
     
     // Read existing data
-    \$existingData = ['emails' => [], 'count' => 0, 'processed_urls' => [], 'url_hashes' => [], 'email_hashes' => []];
+    \$existingData = ['emails' => [], 'count' => 0];
     if (file_exists(\$emailFile)) {
         \$content = file_get_contents(\$emailFile);
         \$json = json_decode(\$content, true);
         if (\$json) {
             \$existingData = \$json;
-            // Ensure hashes exist
-            if (!isset(\$existingData['email_hashes'])) {
-                \$existingData['email_hashes'] = [];
-            }
-            if (!isset(\$existingData['url_hashes'])) {
-                \$existingData['url_hashes'] = [];
-            }
         }
+    }
+    
+    // Ensure required keys exist
+    if (!isset(\$existingData['emails'])) {
+        \$existingData['emails'] = [];
+    }
+    if (!isset(\$existingData['email_hashes'])) {
+        \$existingData['email_hashes'] = [];
+    }
+    if (!isset(\$existingData['url_hashes'])) {
+        \$existingData['url_hashes'] = [];
+    }
+    if (!isset(\$existingData['processed_urls'])) {
+        \$existingData['processed_urls'] = [];
     }
     
     // Add new emails with deduplication
