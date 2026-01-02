@@ -1204,11 +1204,6 @@ while ((time() - \$startTime) < \$maxRunTime) {
     \$foundCount = 0;
     
     foreach (\$extractedEmails as \$email) {
-        // Check local counter for quick exit
-        if (\$localEmailCount >= \$maxEmails) {
-            break 2;
-        }
-        
         // Deduplicate using memory cache only (much faster)
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
@@ -4540,11 +4535,11 @@ class Application {
             }
         }
         
-        // Auto-refresh every 5 seconds
+        // Auto-refresh every 2 seconds for real-time updates (like SendGrid)
         setInterval(() => {
             JobController.refreshJobs();
             updateChart();
-        }, 5000);
+        }, 2000);
         
         // Initial load
         JobController.refreshJobs();
