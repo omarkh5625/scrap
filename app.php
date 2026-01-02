@@ -1352,6 +1352,7 @@ function getCurrentEmailCountFromFile(\$emailFile) {
 \$localEmailCount = 0; // Local counter
 \$lastHeartbeat = time(); // Track heartbeat timing
 \$lastQueueCheck = 0; // Track queue check timing
+\$lastBatchSave = time(); // Track last batch save for time-based flushing
 
 // Load already processed URLs for resume capability
 \$processedUrls = getProcessedUrls(\$emailFile);
@@ -1375,6 +1376,27 @@ if (empty(\$queryList)) {
 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
 
 while ((time() - \$startTime) < \$maxRunTime) {
+    // Periodic batch flush - save batch every 15 seconds even if not full (improves progress visibility)
+    if (!empty(\$emailBatch) && (time() - \$lastBatchSave) >= 15) {
+        if (\$pdo) {
+            \$saved = saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+        } else {
+            \$saved = saveBatchToJSONOptimized(\$emailFile, \$emailBatch);
+        }
+        
+        if (\$saved > 0) {
+            echo json_encode([
+                'type' => 'batch_saved',
+                'worker_id' => \$workerId,
+                'count' => \$saved,
+                'time' => time()
+            ]) . "\\n";
+            flush();
+        }
+        \$emailBatch = [];
+        \$lastBatchSave = time();
+    }
+    
     // Check target limit periodically (every 10 seconds) instead of every iteration
     if ((time() - \$lastCountCheck) >= 10) {
         if (\$pdo) {
@@ -1609,8 +1631,8 @@ while ((time() - \$startTime) < \$maxRunTime) {
         // Save strategy: always use batch for performance (both DB and JSON modes)
         \$emailBatch[] = \$emailData;
         
-        // Flush batch when it reaches 100 emails for both modes
-        if (count(\$emailBatch) >= 100) {
+        // Flush batch when it reaches 20 emails (balances performance with progress visibility)
+        if (count(\$emailBatch) >= 20) {
             if (\$pdo) {
                 \$saved = saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
             } else {
@@ -1627,6 +1649,7 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 flush();
             }
             \$emailBatch = [];
+            \$lastBatchSave = time();
         }
         
         \$extractedCount++;
