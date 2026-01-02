@@ -1153,13 +1153,18 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 }
                 \$currentPage++;
             } else {
-                // No results, try next query
+                // No results, try next query immediately
                 if (count(\$queryList) > 1) {
                     \$currentQueryIndex++;
                     \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
                     \$currentPage = 1;
                     echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
                     flush();
+                } else {
+                    // Single query with no results, signal that more queries needed
+                    echo json_encode(['type' => 'needs_more_queries', 'worker_id' => \$workerId, 'exhausted_query' => \$activeQuery]) . "\\n";
+                    flush();
+                    // Continue processing existing URLs
                 }
             }
         } else {
@@ -1171,7 +1176,10 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 echo json_encode(['type' => 'query_cycle', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
                 flush();
             } else {
-                // Single query and max pages reached, reset to page 1 to keep working
+                // Single query exhausted all pages, signal need for more queries
+                echo json_encode(['type' => 'needs_more_queries', 'worker_id' => \$workerId, 'exhausted_query' => \$activeQuery, 'pages_searched' => \$maxPages]) . "\\n";
+                flush();
+                // Reset to continue with same query (will keep trying)
                 \$currentPage = 1;
             }
         }
@@ -1621,6 +1629,18 @@ class JobManager {
         
         $this->jobs[$jobId]['api_key'] = $apiKey;
         Utils::logMessage('DEBUG', "API key updated for job {$jobId}");
+    }
+    
+    public function updateJobOptions($jobId, $options) {
+        if (!isset($this->jobs[$jobId])) {
+            throw new Exception("Job not found: {$jobId}");
+        }
+        
+        $this->jobs[$jobId]['options'] = $options;
+        $this->saveJob($jobId);
+        Utils::logMessage('INFO', "Job options updated for job {$jobId}");
+        
+        return true;
     }
     
     public function startJob($jobId) {
@@ -2161,6 +2181,9 @@ class APIHandler {
                 case 'get_email_rate':
                     return $this->getEmailRate();
                     
+                case 'add_keywords':
+                    return $this->addKeywords();
+                    
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
@@ -2422,6 +2445,48 @@ class APIHandler {
             'success' => true,
             'job_id' => $jobId,
             'emails_per_minute' => $emailsPerMinute
+        ]);
+    }
+    
+    private function addKeywords() {
+        $jobId = $_POST['job_id'] ?? '';
+        $keywords = $_POST['keywords'] ?? '';
+        
+        if (empty($jobId)) {
+            throw new Exception("Job ID is required");
+        }
+        
+        if (empty($keywords)) {
+            throw new Exception("Keywords are required");
+        }
+        
+        $job = $this->jobManager->getJob($jobId);
+        
+        if (!$job) {
+            throw new Exception("Job not found");
+        }
+        
+        // Parse new keywords
+        $keywordList = array_filter(array_map('trim', explode("\n", $keywords)));
+        
+        if (empty($keywordList)) {
+            throw new Exception("No valid keywords provided");
+        }
+        
+        // Add keywords to existing ones
+        $existingOptions = $job['options'] ?? [];
+        $existingKeywords = $existingOptions['keywords'] ?? [];
+        $updatedKeywords = array_unique(array_merge($existingKeywords, $keywordList));
+        
+        $existingOptions['keywords'] = $updatedKeywords;
+        
+        // Update job options
+        $this->jobManager->updateJobOptions($jobId, $existingOptions);
+        
+        return $this->jsonResponse([
+            'success' => true,
+            'message' => 'Keywords added successfully',
+            'total_keywords' => count($updatedKeywords)
         ]);
     }
     
@@ -3689,6 +3754,69 @@ class Application {
             flex: 1;
             color: #666;
         }
+        
+        /* Modal Styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 9998;
+        }
+        
+        .modal-overlay.active {
+            display: block;
+        }
+        
+        .modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            z-index: 9999;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+        }
+        
+        .modal h2 {
+            margin-bottom: 20px;
+            color: #1a1a1a;
+        }
+        
+        .modal-body {
+            margin-bottom: 25px;
+        }
+        
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .modal-actions button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        
+        .modal-actions .btn-cancel {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .modal-actions .btn-primary {
+            background: #0066ff;
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -3846,6 +3974,25 @@ class Application {
                         <p>Create your first job using the form above</p>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal for adding more queries -->
+    <div class="modal-overlay" id="queryModal">
+        <div class="modal">
+            <h2>🔍 Add More Search Queries</h2>
+            <div class="modal-body">
+                <p style="margin-bottom: 15px;">This job has exhausted its current queries. Add more keywords to continue collecting emails:</p>
+                <div class="form-group">
+                    <label for="modalKeywords">Additional Keywords (one per line)</label>
+                    <textarea id="modalKeywords" rows="5" style="width: 100%; padding: 10px; border: 1px solid #d1d5da; border-radius: 6px;" placeholder="new york&#10;miami&#10;chicago"></textarea>
+                </div>
+                <input type="hidden" id="modalJobId">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeQueryModal()">Cancel</button>
+                <button class="btn-primary" onclick="addMoreQueries()">Add Queries & Continue</button>
             </div>
         </div>
     </div>
@@ -4271,6 +4418,54 @@ class Application {
                 });
             }, 10);
         };
+        
+        // Modal functions for adding more queries
+        let needsQueriesJobId = null;
+        
+        function openQueryModal(jobId) {
+            needsQueriesJobId = jobId;
+            document.getElementById('modalJobId').value = jobId;
+            document.getElementById('queryModal').classList.add('active');
+        }
+        
+        function closeQueryModal() {
+            document.getElementById('queryModal').classList.remove('active');
+            document.getElementById('modalKeywords').value = '';
+            needsQueriesJobId = null;
+        }
+        
+        async function addMoreQueries() {
+            const keywords = document.getElementById('modalKeywords').value;
+            const jobId = needsQueriesJobId;
+            
+            if (!keywords.trim()) {
+                UI.showAlert('Please enter at least one keyword', 'error');
+                return;
+            }
+            
+            try {
+                // Update job with new keywords (this would require a new backend endpoint)
+                const result = await API.call('add_keywords', {
+                    job_id: jobId,
+                    keywords: keywords
+                });
+                
+                if (result.success) {
+                    UI.showAlert('Keywords added! Job will continue...', 'success');
+                    closeQueryModal();
+                    JobController.refreshJobs();
+                } else {
+                    UI.showAlert(result.error || 'Failed to add keywords', 'error');
+                }
+            } catch (error) {
+                UI.showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        // Listen for needs_more_queries events
+        window.addEventListener('job_needs_queries', function(e) {
+            openQueryModal(e.detail.jobId);
+        });
         
         // Chart.js initialization
         let emailRateChart = null;
