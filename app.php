@@ -941,14 +941,35 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
     \$statusCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
     curl_close(\$ch);
     
+    // Log errors for debugging
+    if (\$statusCode !== 200) {
+        error_log("Serper API Error: HTTP \$statusCode - Response: \$response");
+    }
+    
     if (\$statusCode === 200 && \$response) {
         \$data = json_decode(\$response, true);
         if (isset(\$data['organic'])) {
-            return \$data['organic'];
+            return ['success' => true, 'results' => \$data['organic']];
         }
+        return ['success' => true, 'results' => []];
     }
     
-    return [];
+    // Return error information
+    \$errorMsg = '';
+    \$data = json_decode(\$response, true);
+    if (isset(\$data['message'])) {
+        \$errorMsg = \$data['message'];
+    } elseif (isset(\$data['error'])) {
+        \$errorMsg = \$data['error'];
+    }
+    
+    return [
+        'success' => false, 
+        'error' => true,
+        'status_code' => \$statusCode,
+        'message' => \$errorMsg ?: 'Unknown error',
+        'results' => []
+    ];
 }
 
 // Email extraction functions
@@ -1264,7 +1285,41 @@ while ((time() - \$startTime) < \$maxRunTime) {
     if (count(\$urlsToProcess) < 50 && !empty(\$apiKey)) {
         // Try fetching from current page if we haven't exceeded max pages
         if (\$currentPage <= \$maxPages) {
-            \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+            \$apiResponse = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+            
+            // Check for API errors
+            if (isset(\$apiResponse['error']) && \$apiResponse['error']) {
+                \$statusCode = \$apiResponse['status_code'];
+                \$errorMsg = \$apiResponse['message'];
+                
+                // Determine error type
+                if (\$statusCode == 401) {
+                    \$errorType = 'Invalid Serper API Key (401)';
+                } elseif (\$statusCode == 429) {
+                    \$errorType = 'Rate Limited (429) - Too many requests';
+                } elseif (\$statusCode >= 500) {
+                    \$errorType = "Serper API Error (\$statusCode)";
+                } else {
+                    \$errorType = "API Error (\$statusCode)";
+                }
+                
+                echo json_encode([
+                    'type' => 'serper_api_error',
+                    'worker_id' => \$workerId,
+                    'error_type' => \$errorType,
+                    'status_code' => \$statusCode,
+                    'message' => \$errorMsg,
+                    'query' => \$activeQuery
+                ]) . "\\n";
+                flush();
+                
+                // Wait before retrying to avoid hammering the API
+                sleep(5);
+                continue;
+            }
+            
+            \$results = \$apiResponse['results'] ?? [];
+            
             if (!empty(\$results)) {
                 foreach (\$results as \$result) {
                     if (isset(\$result['link'])) {
