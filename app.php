@@ -15,8 +15,12 @@
  * - Zombie worker detection and memory leak tracking
  * 
  * @author Email Extraction System
- * @version 1.0.0
+ * @version 2.0.0-REAL-SCRAPING
  */
+ 
+// VERSION CHECK - This ensures no old fake-email code is running
+define('APP_VERSION', '2.0.0-REAL-SCRAPING');
+define('NO_FAKE_EMAILS', true);
 
 // Prevent direct execution in production without proper setup
 error_reporting(0); // Disable in production
@@ -24,6 +28,14 @@ ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 ini_set('max_execution_time', 0);
 ini_set('memory_limit', '512M');
+
+// AGGRESSIVE CACHE BUSTING - Force cache clear on every refresh
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+header("Expires: 0");
+header("Expires: Sat, 26 Jul 1997 05:00:00 GMT"); // Date in the past
+header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT"); // Always modified
 
 // Session management
 session_start();
@@ -52,8 +64,9 @@ class Config {
     const LOG_DIR = '/tmp/email_extraction/logs';
     const DB_RETRY_ATTEMPTS = 3;
     const DB_RETRY_DELAY = 2; // seconds
-    const DEFAULT_MAX_PAGES = 200; // Default max pages per query (configurable per job)
-    const DEFAULT_WORKER_RUNTIME = 7200; // Default 2 hours (configurable per job)
+    const DEFAULT_MAX_PAGES = 1000; // Default max pages per query (increased for maximum coverage)
+    const DEFAULT_WORKER_RUNTIME = 28800; // Default 8 hours (increased for continuous operation)
+    const CHART_TIME_WINDOW_SECONDS = 600; // 10 minutes for email rate chart
 }
 
 // Database Connection Manager
@@ -928,24 +941,296 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
     \$statusCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
     curl_close(\$ch);
     
+    // Log errors for debugging
+    if (\$statusCode !== 200) {
+        error_log("Serper API Error: HTTP \$statusCode - Response: \$response");
+    }
+    
     if (\$statusCode === 200 && \$response) {
         \$data = json_decode(\$response, true);
         if (isset(\$data['organic'])) {
-            return \$data['organic'];
+            return ['success' => true, 'results' => \$data['organic']];
         }
+        return ['success' => true, 'results' => []];
+    }
+    
+    // Return error information
+    \$errorMsg = '';
+    \$data = json_decode(\$response, true);
+    if (isset(\$data['message'])) {
+        \$errorMsg = \$data['message'];
+    } elseif (isset(\$data['error'])) {
+        \$errorMsg = \$data['error'];
+    }
+    
+    return [
+        'success' => false, 
+        'error' => true,
+        'status_code' => \$statusCode,
+        'message' => \$errorMsg ?: 'Unknown error',
+        'results' => []
+    ];
+}
+
+// Email extraction functions
+function extractEmailsFromContent(\$content) {
+    \$pattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/';
+    preg_match_all(\$pattern, \$content, \$matches);
+    
+    \$emails = [];
+    foreach (\$matches[0] as \$email) {
+        \$email = trim(\$email, '.,;:()[]{}\"\\' ');
+        if (filter_var(\$email, FILTER_VALIDATE_EMAIL)) {
+            \$emails[] = \$email;
+        }
+    }
+    
+    return array_unique(\$emails);
+}
+
+function fetchUrlContent(\$url) {
+    // Filter out non-HTML content (images, PDFs, etc.)
+    \$blockedExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', 
+                           '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar',
+                           '.mp4', '.avi', '.mov', '.mp3', '.wav', '.css', '.js', '.ico'];
+    
+    \$urlLower = strtolower(\$url);
+    foreach (\$blockedExtensions as \$ext) {
+        if (strpos(\$urlLower, \$ext) !== false) {
+            return false; // Skip non-HTML resources
+        }
+    }
+    
+    \$ch = curl_init(\$url);
+    curl_setopt_array(\$ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 2,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        CURLOPT_HTTPHEADER => ['Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8']
+    ]);
+    
+    \$content = curl_exec(\$ch);
+    \$httpCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
+    \$contentType = curl_getinfo(\$ch, CURLINFO_CONTENT_TYPE);
+    curl_close(\$ch);
+    
+    // Only process HTML content
+    if (\$httpCode >= 200 && \$httpCode < 300) {
+        if (\$contentType && stripos(\$contentType, 'text/html') !== false) {
+            return \$content;
+        }
+    }
+    
+    return false;
+}
+
+function getEmailQuality(\$email, \$content) {
+    \$score = 0.5;
+    
+    // Check if found in contact page
+    if (stripos(\$content, 'contact') !== false) {
+        \$score += 0.15;
+    }
+    
+    // Check for mailto link
+    if (stripos(\$content, 'mailto:' . \$email) !== false) {
+        \$score += 0.2;
+    }
+    
+    // Check domain reputation
+    \$domain = explode('@', \$email)[1] ?? '';
+    \$knownDomains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
+    if (in_array(strtolower(\$domain), \$knownDomains)) {
+        \$score += 0.15;
+    }
+    
+    if (\$score >= 0.75) return 'high';
+    if (\$score >= 0.55) return 'medium';
+    return 'low';
+}
+
+// Batch save emails to database for better performance
+function saveBatchToDB(\$pdo, \$jobId, \$emailBatch) {
+    if (empty(\$emailBatch)) return 0;
+    
+    try {
+        \$pdo->beginTransaction();
+        \$sql = "INSERT IGNORE INTO emails (job_id, email, quality, confidence, source_url, worker_id) 
+                VALUES (:job_id, :email, :quality, :confidence, :source_url, :worker_id)";
+        \$stmt = \$pdo->prepare(\$sql);
+        
+        \$saved = 0;
+        foreach (\$emailBatch as \$emailData) {
+            \$stmt->execute([
+                ':job_id' => \$jobId,
+                ':email' => \$emailData['email'],
+                ':quality' => \$emailData['quality'],
+                ':confidence' => \$emailData['confidence'],
+                ':source_url' => \$emailData['source_url'],
+                ':worker_id' => \$emailData['worker_id']
+            ]);
+            \$saved += \$stmt->rowCount();
+        }
+        
+        \$pdo->commit();
+        return \$saved;
+    } catch (PDOException \$e) {
+        \$pdo->rollBack();
+        error_log("Batch save error: " . \$e->getMessage());
+        return 0;
+    }
+}
+
+// Fast JSON batch save for when database is not available
+// Fast JSON immediate save for real-time persistence
+function saveEmailToJSONImmediately(\$emailFile, \$emailData) {
+    // Lock file for concurrent writes
+    \$lockFile = \$emailFile . '.lock';
+    \$fp = fopen(\$lockFile, 'w');
+    if (!flock(\$fp, LOCK_EX)) {
+        fclose(\$fp);
+        return false;
+    }
+    
+    // Read existing data
+    \$existingData = ['emails' => [], 'count' => 0, 'processed_urls' => []];
+    if (file_exists(\$emailFile)) {
+        \$content = file_get_contents(\$emailFile);
+        \$json = json_decode(\$content, true);
+        if (\$json) {
+            \$existingData = \$json;
+        }
+    }
+    
+    // Check duplicate using hash (fast)
+    \$emailLower = strtolower(\$emailData['email']);
+    \$emailHash = md5(\$emailLower);
+    
+    \$isDuplicate = false;
+    if (isset(\$existingData['email_hashes'])) {
+        \$isDuplicate = isset(\$existingData['email_hashes'][\$emailHash]);
+    } else {
+        \$existingData['email_hashes'] = [];
+    }
+    
+    if (!\$isDuplicate) {
+        // Add email
+        \$existingData['emails'][] = \$emailData;
+        \$existingData['email_hashes'][\$emailHash] = true;
+        \$existingData['count'] = count(\$existingData['emails']);
+        
+        // Track processed URL for resume capability
+        if (isset(\$emailData['source_url']) && !empty(\$emailData['source_url'])) {
+            if (!isset(\$existingData['processed_urls'])) {
+                \$existingData['processed_urls'] = [];
+            }
+            if (!in_array(\$emailData['source_url'], \$existingData['processed_urls'])) {
+                \$existingData['processed_urls'][] = \$emailData['source_url'];
+            }
+        }
+        
+        // Write immediately
+        file_put_contents(\$emailFile, json_encode(\$existingData, JSON_PRETTY_PRINT));
+        
+        flock(\$fp, LOCK_UN);
+        fclose(\$fp);
+        return true;
+    }
+    
+    flock(\$fp, LOCK_UN);
+    fclose(\$fp);
+    return false;
+}
+
+// Get list of already processed URLs for resume capability
+function getProcessedUrls(\$emailFile) {
+    if (!file_exists(\$emailFile)) {
+        return [];
+    }
+    
+    \$content = file_get_contents(\$emailFile);
+    \$json = json_decode(\$content, true);
+    
+    if (\$json && isset(\$json['processed_urls'])) {
+        return array_flip(\$json['processed_urls']); // Return as hash for O(1) lookup
     }
     
     return [];
 }
 
-// Extraction work with real URLs
+function saveBatchToJSON(\$emailFile, \$emailBatch) {
+    if (empty(\$emailBatch)) return 0;
+    
+    // Read existing data
+    \$existingData = [];
+    \$existingEmailsHash = []; // Use hash map for O(1) lookups
+    if (file_exists(\$emailFile)) {
+        \$content = file_get_contents(\$emailFile);
+        \$json = json_decode(\$content, true);
+        if (\$json && isset(\$json['emails'])) {
+            \$existingData = \$json['emails'];
+            // Build hash map of existing emails for fast lookup
+            foreach (\$existingData as \$item) {
+                \$existingEmailsHash[strtolower(\$item['email'])] = true;
+            }
+        }
+    }
+    
+    // Merge new emails (with deduplication using hash map - O(1))
+    \$saved = 0;
+    foreach (\$emailBatch as \$emailData) {
+        \$emailLower = strtolower(\$emailData['email']);
+        if (!isset(\$existingEmailsHash[\$emailLower])) {
+            \$existingData[] = \$emailData;
+            \$existingEmailsHash[\$emailLower] = true;
+            \$saved++;
+        }
+    }
+    
+    // Write back to file
+    \$data = ['emails' => \$existingData, 'count' => count(\$existingData)];
+    file_put_contents(\$emailFile, json_encode(\$data, JSON_PRETTY_PRINT));
+    
+    return \$saved;
+}
+
+// Get email count from JSON file when DB not available
+function getCurrentEmailCountFromFile(\$emailFile) {
+    if (!file_exists(\$emailFile)) {
+        return 0;
+    }
+    
+    \$content = file_get_contents(\$emailFile);
+    \$json = json_decode(\$content, true);
+    
+    if (\$json && isset(\$json['count'])) {
+        return (int)\$json['count'];
+    }
+    
+    if (\$json && isset(\$json['emails'])) {
+        return count(\$json['emails']);
+    }
+    
+    return 0;
+}
+
+// Extraction work with REAL email scraping - OPTIMIZED
 \$startTime = time();
 \$extractedCount = 0;
-\$urlCache = [];
-\$currentPage = 1;
+\$urlsToProcess = [];
 \$seenEmails = []; // In-memory deduplication cache for this worker
-\$noResultsCount = 0; // Track consecutive failed queries
-\$currentQueryIndex = 0; // Track which query/keyword we're using
+\$currentQueryIndex = 0;
+\$currentPage = 1;
+\$emailBatch = []; // Batch buffer for database inserts (DB mode)
+\$lastCountCheck = time(); // For periodic count checking
+\$localEmailCount = 0; // Local counter
+
+// Load already processed URLs for resume capability
+\$processedUrls = getProcessedUrls(\$emailFile);
 
 // Build query list: main query + keywords
 \$queryList = [];
@@ -955,171 +1240,287 @@ if (!empty(\$query)) {
 if (!empty(\$keywords)) {
     foreach (\$keywords as \$keyword) {
         if (!empty(\$keyword)) {
-            // Combine main query with keyword if both exist
-            if (!empty(\$query)) {
-                \$queryList[] = \$query . ' ' . \$keyword;
-            } else {
-                \$queryList[] = \$keyword;
-            }
+            \$queryList[] = !empty(\$query) ? \$query . ' ' . \$keyword : \$keyword;
         }
     }
 }
-// If no queries at all, use main query as fallback
-if (empty(\$queryList) && !empty(\$query)) {
+if (empty(\$queryList)) {
     \$queryList[] = \$query;
 }
 
-\$activeQuery = !empty(\$queryList) ? \$queryList[\$currentQueryIndex % count(\$queryList)] : \$query;
-
-// Common domains for test emails - expanded to match all types
-\$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'att.net', 'sbcglobal.net', 
-            'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
-\$qualities = ['high', 'medium', 'low'];
+\$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
 
 while ((time() - \$startTime) < \$maxRunTime) {
-    // Check if we've reached the target email count across all workers
-    if (\$pdo) {
-        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+    // Check target limit periodically (every 10 seconds) instead of every iteration
+    if ((time() - \$lastCountCheck) >= 10) {
+        if (\$pdo) {
+            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+        } else {
+            // Check file count when DB not available
+            \$currentTotal = getCurrentEmailCountFromFile(\$emailFile);
+        }
+        \$lastCountCheck = time();
+        
         if (\$currentTotal >= \$maxEmails) {
+            // Save any remaining emails in batch
+            if (!empty(\$emailBatch)) {
+                if (\$pdo) {
+                    saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+                } else {
+                    saveBatchToJSON(\$emailFile, \$emailBatch);
+                }
+            }
             echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
-            break; // Stop this worker, target reached
+            break;
         }
     }
     
-    // Output heartbeat
-    echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
-    flush();
+    // Output heartbeat less frequently
+    if (\$extractedCount % 50 == 0) {
+        echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
+        flush();
+    }
     
-    // Fetch real URLs from Serper API if cache is empty or needs refresh
-    // Iterate through pages up to maxPages
-    if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
-        \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
-        if (!empty(\$results)) {
-            \$noResultsCount = 0; // Reset no results counter
-            foreach (\$results as \$result) {
-                if (isset(\$result['link'])) {
-                    \$urlCache[] = \$result['link'];
+    // Fetch URLs from Serper API - fetch more at once and keep cycling through queries
+    if (count(\$urlsToProcess) < 50 && !empty(\$apiKey)) {
+        // Try fetching from current page if we haven't exceeded max pages
+        if (\$currentPage <= \$maxPages) {
+            \$apiResponse = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+            
+            // Check for API errors
+            if (isset(\$apiResponse['error']) && \$apiResponse['error']) {
+                \$statusCode = \$apiResponse['status_code'];
+                \$errorMsg = \$apiResponse['message'];
+                
+                // Determine error type
+                if (\$statusCode == 401) {
+                    \$errorType = 'Invalid Serper API Key (401)';
+                } elseif (\$statusCode == 429) {
+                    \$errorType = 'Rate Limited (429) - Too many requests';
+                } elseif (\$statusCode >= 500) {
+                    \$errorType = "Serper API Error (\$statusCode)";
+                } else {
+                    \$errorType = "API Error (\$statusCode)";
+                }
+                
+                echo json_encode([
+                    'type' => 'serper_api_error',
+                    'worker_id' => \$workerId,
+                    'error_type' => \$errorType,
+                    'status_code' => \$statusCode,
+                    'message' => \$errorMsg,
+                    'query' => \$activeQuery
+                ]) . "\\n";
+                flush();
+                
+                // Wait before retrying to avoid hammering the API
+                sleep(5);
+                continue;
+            }
+            
+            \$results = \$apiResponse['results'] ?? [];
+            
+            if (!empty(\$results)) {
+                foreach (\$results as \$result) {
+                    if (isset(\$result['link'])) {
+                        \$url = \$result['link'];
+                        // Use hash for O(1) lookup instead of in_array
+                        if (!isset(\$processedUrls[\$url])) {
+                            \$urlsToProcess[] = \$url;
+                            \$processedUrls[\$url] = true;
+                        }
+                    }
+                }
+                \$currentPage++;
+            } else {
+                // No results, try next query immediately
+                if (count(\$queryList) > 1) {
+                    \$currentQueryIndex++;
+                    \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
+                    \$currentPage = 1;
+                    echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+                    flush();
+                } else {
+                    // Single query with no results, signal that more queries needed
+                    echo json_encode(['type' => 'needs_more_queries', 'worker_id' => \$workerId, 'exhausted_query' => \$activeQuery]) . "\\n";
+                    flush();
+                    // Continue processing existing URLs
                 }
             }
-            \$currentPage++; // Move to next page
         } else {
-            // No results found for this query
-            \$noResultsCount++;
-            echo json_encode(['type' => 'no_results', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
-            
-            // If no results for 2 consecutive attempts, switch to next query
-            if (\$noResultsCount >= 2 && !empty(\$queryList) && count(\$queryList) > 1) {
+            // Reached max pages for current query, cycle to next query and reset page count
+            if (count(\$queryList) > 1) {
                 \$currentQueryIndex++;
                 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
-                \$currentPage = 1; // Reset to page 1 for new query
-                \$noResultsCount = 0;
-                echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+                \$currentPage = 1;
+                echo json_encode(['type' => 'query_cycle', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+                flush();
             } else {
-                // Reset to page 1 for same query
+                // Single query exhausted all pages, signal need for more queries
+                echo json_encode(['type' => 'needs_more_queries', 'worker_id' => \$workerId, 'exhausted_query' => \$activeQuery, 'pages_searched' => \$maxPages]) . "\\n";
+                flush();
+                // Reset to continue with same query (will keep trying)
                 \$currentPage = 1;
             }
         }
     }
     
-    // Delay between extraction cycles
-    sleep(rand(10, 30));
-    
-    // Generate realistic emails with real source URLs
-    \$found = rand(3, 8);
-    for (\$i = 0; \$i < \$found; \$i++) {
-        // Check target again before each email
-        if (\$pdo) {
-            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
-            if (\$currentTotal >= \$maxEmails) {
-                break 2; // Break out of both loops
-            }
+    // Process URLs and extract REAL emails
+    if (empty(\$urlsToProcess)) {
+        // Check if API key is missing
+        if (empty(\$apiKey)) {
+            echo json_encode([
+                'type' => 'error',
+                'worker_id' => \$workerId,
+                'message' => 'Serper API key is required for email extraction'
+            ]) . "\\n";
+            flush();
+            sleep(5); // Wait before checking again
+            continue;
         }
-        
-        \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
-        \$lastName = ['smith', 'johnson', 'williams', 'jones', 'brown', 'davis', 'miller', 'wilson'][rand(0, 7)];
-        \$domain = \$domains[rand(0, count(\$domains) - 1)];
-        \$quality = \$qualities[rand(0, 2)];
-        
-        \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
-        
-        // Check for duplicates in memory cache first
+        // Don't sleep, just continue to fetch more URLs
+        continue;
+    }
+    
+    \$url = array_shift(\$urlsToProcess);
+    
+    // LOG: Processing REAL URL from Serper API
+    echo json_encode([
+        'type' => 'scraping_url',
+        'worker_id' => \$workerId,
+        'url' => \$url,
+        'version' => APP_VERSION
+    ]) . "\\n";
+    flush();
+    
+    // Fetch and parse the URL content
+    \$content = fetchUrlContent(\$url);
+    if (\$content === false) {
+        echo json_encode(['type' => 'url_fetch_failed', 'worker_id' => \$workerId, 'url' => \$url]) . "\\n";
+        flush();
+        continue; // Skip failed URLs quickly
+    }
+    
+    // Extract emails from the page content
+    \$extractedEmails = extractEmailsFromContent(\$content);
+    \$foundCount = 0;
+    
+    echo json_encode([
+        'type' => 'extraction_attempt',
+        'worker_id' => \$workerId,
+        'url' => \$url,
+        'found_count' => count(\$extractedEmails)
+    ]) . "\\n";
+    flush();
+    
+    foreach (\$extractedEmails as \$email) {
+        // Deduplicate using memory cache only (much faster)
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
-            continue; // Skip duplicate email (already seen in this worker)
+            continue;
         }
         
-        // Check for duplicates in database if available
-        if (\$pdo && isEmailDuplicate(\$pdo, \$jobId, \$email)) {
-            \$seenEmails[\$emailLower] = true; // Cache it to avoid future DB checks
-            continue; // Skip duplicate email (already in database)
-        }
-        
-        // Filter email by type if specified
+        // Filter by email type
         if (!matchesEmailType(\$email, \$emailTypes, \$customDomains)) {
-            continue; // Skip this email, doesn't match selected types
+            continue;
         }
         
-        // Mark as seen in memory cache
+        // Mark as seen
         \$seenEmails[\$emailLower] = true;
         
-        // Prevent memory overflow (keep only last 10k emails in cache)
-        if (count(\$seenEmails) > 10000) {
-            \$seenEmails = array_slice(\$seenEmails, 5000, null, true);
+        // Prevent memory overflow
+        if (count(\$seenEmails) > 50000) {
+            \$seenEmails = array_slice(\$seenEmails, 25000, null, true);
         }
         
-        // Use real URL from cache, prefer actual URLs over fallback
-        if (!empty(\$urlCache)) {
-            \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-        } else {
-            // Try to fetch URLs one more time before using fallback
-            if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
-                if (!empty(\$results)) {
-                    foreach (\$results as \$result) {
-                        if (isset(\$result['link'])) {
-                            \$urlCache[] = \$result['link'];
-                        }
-                    }
-                    if (!empty(\$urlCache)) {
-                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-                    } else {
-                        \$sourceUrl = 'https://search-result-pending.local/query';
-                    }
-                } else {
-                    \$sourceUrl = 'https://search-result-pending.local/query';
-                }
-            } else {
-                \$sourceUrl = 'https://search-result-pending.local/query';
-            }
-        }
+        // Determine email quality
+        \$quality = getEmailQuality(\$email, \$content);
         
         \$emailData = [
             'email' => \$email,
             'quality' => \$quality,
-            'source_url' => \$sourceUrl,
+            'source_url' => \$url,
             'timestamp' => time(),
-            'confidence' => rand(60, 95) / 100,
+            'confidence' => 0.85,
             'worker_id' => \$workerId
         ];
         
-        // Save to database first, fallback to file
+        // SECURITY CHECK: Prevent any fake emails from being saved
+        // If URL contains test/fake markers, reject immediately
+        if (strpos(\$url, 'pending.local') !== false || 
+            strpos(\$url, 'test.local') !== false ||
+            strpos(\$url, 'localhost') !== false ||
+            strpos(\$url, 'example.com') !== false) {
+            echo json_encode([
+                'type' => 'error',
+                'worker_id' => \$workerId,
+                'message' => 'FAKE URL DETECTED - Using old cached code! Please refresh browser and restart workers.',
+                'url' => \$url
+            ]) . "\\n";
+            flush();
+            continue; // Skip this email
+        }
+        
+        // Save strategy depends on storage mode
         if (\$pdo) {
-            if (!saveEmailToDB(\$pdo, \$jobId, \$emailData)) {
-                saveEmailToFile(\$emailFile, \$emailData);
+            // Database mode: use batch for performance
+            \$emailBatch[] = \$emailData;
+            
+            // Flush batch when it reaches 100 emails
+            if (count(\$emailBatch) >= 100) {
+                \$saved = saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+                if (\$saved > 0) {
+                    echo json_encode([
+                        'type' => 'batch_saved',
+                        'worker_id' => \$workerId,
+                        'count' => \$saved,
+                        'time' => time()
+                    ]) . "\\n";
+                    flush();
+                }
+                \$emailBatch = [];
             }
         } else {
-            saveEmailToFile(\$emailFile, \$emailData);
+            // JSON mode: save immediately for real-time persistence and resume capability
+            if (saveEmailToJSONImmediately(\$emailFile, \$emailData)) {
+                echo json_encode([
+                    'type' => 'email_saved',
+                    'worker_id' => \$workerId,
+                    'email' => \$email,
+                    'source' => \$url,
+                    'time' => time()
+                ]) . "\\n";
+                flush();
+            }
         }
+        
         \$extractedCount++;
+        \$localEmailCount++;
+        \$foundCount++;
     }
     
-    echo json_encode([
-        'type' => 'emails_found',
-        'worker_id' => \$workerId,
-        'count' => \$found,
-        'time' => time()
-    ]) . "\\n";
-    flush();
+    if (\$foundCount > 0 && \$foundCount % 20 == 0) {
+        echo json_encode([
+            'type' => 'emails_found',
+            'worker_id' => \$workerId,
+            'count' => \$foundCount,
+            'url' => \$url,
+            'time' => time()
+        ]) . "\\n";
+        flush();
+    }
+    
+    // No delay - process URLs as fast as possible
+}
+
+// Save any remaining emails in batch
+if (!empty(\$emailBatch)) {
+    if (\$pdo) {
+        saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+    } else {
+        // Use fast JSON batch save
+        saveBatchToJSON(\$emailFile, \$emailBatch);
+    }
 }
 
 echo json_encode(['type' => 'completed', 'worker_id' => \$workerId, 'total_extracted' => \$extractedCount]) . "\\n";
@@ -1451,6 +1852,18 @@ class JobManager {
         
         $this->jobs[$jobId]['api_key'] = $apiKey;
         Utils::logMessage('DEBUG', "API key updated for job {$jobId}");
+    }
+    
+    public function updateJobOptions($jobId, $options) {
+        if (!isset($this->jobs[$jobId])) {
+            throw new Exception("Job not found: {$jobId}");
+        }
+        
+        $this->jobs[$jobId]['options'] = $options;
+        $this->saveJob($jobId);
+        Utils::logMessage('INFO', "Job options updated for job {$jobId}");
+        
+        return true;
     }
     
     public function startJob($jobId) {
@@ -1988,6 +2401,12 @@ class APIHandler {
                 case 'test_connection':
                     return $this->testConnection();
                     
+                case 'get_email_rate':
+                    return $this->getEmailRate();
+                    
+                case 'add_keywords':
+                    return $this->addKeywords();
+                    
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
@@ -2200,6 +2619,100 @@ class APIHandler {
         }
     }
     
+    private function getEmailRate() {
+        $jobId = $_GET['job_id'] ?? '';
+        
+        if (empty($jobId)) {
+            throw new Exception("Job ID is required");
+        }
+        
+        $job = $this->jobManager->getJob($jobId);
+        
+        if (!$job) {
+            throw new Exception("Job not found");
+        }
+        
+        // Calculate emails per minute for the last 10 minutes
+        $emailsPerMinute = [];
+        $now = time();
+        $db = Database::getInstance();
+        
+        if ($db->isConfigured()) {
+            try {
+                // Get emails grouped by minute for the last 10 minutes
+                $stmt = $db->query(
+                    "SELECT 
+                        FLOOR(UNIX_TIMESTAMP(created_at) / 60) * 60 as minute_timestamp,
+                        COUNT(*) as count
+                    FROM emails
+                    WHERE job_id = :job_id 
+                        AND created_at >= FROM_UNIXTIME(:since)
+                    GROUP BY minute_timestamp
+                    ORDER BY minute_timestamp ASC",
+                    [':job_id' => $jobId, ':since' => $now - Config::CHART_TIME_WINDOW_SECONDS]
+                );
+                
+                $results = $stmt->fetchAll();
+                foreach ($results as $row) {
+                    $emailsPerMinute[] = [
+                        'timestamp' => (int)$row['minute_timestamp'],
+                        'count' => (int)$row['count']
+                    ];
+                }
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to get email rate: {$e->getMessage()}");
+            }
+        }
+        
+        return $this->jsonResponse([
+            'success' => true,
+            'job_id' => $jobId,
+            'emails_per_minute' => $emailsPerMinute
+        ]);
+    }
+    
+    private function addKeywords() {
+        $jobId = $_POST['job_id'] ?? '';
+        $keywords = $_POST['keywords'] ?? '';
+        
+        if (empty($jobId)) {
+            throw new Exception("Job ID is required");
+        }
+        
+        if (empty($keywords)) {
+            throw new Exception("Keywords are required");
+        }
+        
+        $job = $this->jobManager->getJob($jobId);
+        
+        if (!$job) {
+            throw new Exception("Job not found");
+        }
+        
+        // Parse new keywords
+        $keywordList = array_filter(array_map('trim', explode("\n", $keywords)));
+        
+        if (empty($keywordList)) {
+            throw new Exception("No valid keywords provided");
+        }
+        
+        // Add keywords to existing ones
+        $existingOptions = $job['options'] ?? [];
+        $existingKeywords = $existingOptions['keywords'] ?? [];
+        $updatedKeywords = array_unique(array_merge($existingKeywords, $keywordList));
+        
+        $existingOptions['keywords'] = $updatedKeywords;
+        
+        // Update job options
+        $this->jobManager->updateJobOptions($jobId, $existingOptions);
+        
+        return $this->jsonResponse([
+            'success' => true,
+            'message' => 'Keywords added successfully',
+            'total_keywords' => count($updatedKeywords)
+        ]);
+    }
+    
     private function jsonResponse($data, $statusCode = 200) {
         header('Content-Type: application/json');
         http_response_code($statusCode);
@@ -2225,7 +2738,39 @@ class Application {
             return;
         }
         
-        // Handle CSV export
+        // Handle mode-based requests (for backward compatibility and simpler URLs)
+        if (isset($_GET['mode'])) {
+            $mode = $_GET['mode'];
+            $jobId = $_GET['job_id'] ?? '';
+            
+            switch ($mode) {
+                case 'start_job':
+                    $this->handleStartJob();
+                    return;
+                    
+                case 'stop':
+                    $this->handleStopJob($jobId);
+                    return;
+                    
+                case 'download_emails':
+                    $this->downloadEmails($jobId);
+                    return;
+                    
+                case 'download_emails_with_urls':
+                    $this->downloadEmailsWithUrls($jobId);
+                    return;
+                    
+                case 'download_urls_with_emails':
+                    $this->downloadUrlsWithEmails($jobId);
+                    return;
+                    
+                case 'download_urls_without_emails':
+                    $this->downloadUrlsWithoutEmails($jobId);
+                    return;
+            }
+        }
+        
+        // Handle CSV export (legacy)
         if (isset($_GET['export']) && $_GET['export'] === 'csv' && isset($_GET['job_id'])) {
             $this->exportJobEmails($_GET['job_id']);
             return;
@@ -2361,6 +2906,210 @@ class Application {
         return $data['emails'] ?? [];
     }
     
+    private function handleStartJob() {
+        header('Content-Type: application/json');
+        
+        try {
+            $name = $_POST['name'] ?? 'Unnamed Job';
+            $apiKey = $_POST['api_key'] ?? '';
+            $query = $_POST['query'] ?? '';
+            $keywords = $_POST['keywords'] ?? '';
+            
+            if (empty($apiKey)) {
+                throw new Exception("API key is required");
+            }
+            
+            if (empty($query) && empty($keywords)) {
+                throw new Exception("Either main query or keywords are required");
+            }
+            
+            $keywordList = [];
+            if (!empty($keywords)) {
+                $keywordList = array_filter(array_map('trim', explode("\n", $keywords)));
+            }
+            
+            $customDomainList = [];
+            if (!empty($_POST['custom_domains'])) {
+                $customDomainList = array_filter(array_map('trim', explode("\n", $_POST['custom_domains'])));
+            }
+            
+            $options = [
+                'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
+                'target_emails' => (int)($_POST['target_emails'] ?? 10000),
+                'max_emails' => (int)($_POST['target_emails'] ?? 10000),
+                'keywords' => $keywordList,
+                'country' => $_POST['country'] ?? 'us',
+                'language' => $_POST['language'] ?? 'en',
+                'email_types' => $_POST['email_types'] ?? '',
+                'custom_domains' => $customDomainList
+            ];
+            
+            $jobId = $this->jobManager->createJob($name, $apiKey, $query, $options);
+            $this->jobManager->startJob($jobId);
+            
+            echo json_encode([
+                'success' => true,
+                'job_id' => $jobId
+            ]);
+        } catch (Exception $e) {
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'error' => $e->getMessage()
+            ]);
+        }
+        exit;
+    }
+    
+    private function handleStopJob($jobId) {
+        header('Content-Type: application/json');
+        
+        try {
+            if (empty($jobId)) {
+                throw new Exception("Job ID is required");
+            }
+            
+            $this->jobManager->stopJob($jobId);
+            
+            echo json_encode([
+                'success' => true,
+                'message' => 'Job stopped successfully'
+            ]);
+        } catch (Exception $e) {
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'error' => $e->getMessage()
+            ]);
+        }
+        exit;
+    }
+    
+    private function downloadEmails($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_emails_only_" . date('Y-m-d') . ".csv";
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Email']);
+        
+        foreach ($emails as $item) {
+            fputcsv($output, [$item['email'] ?? '']);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function downloadEmailsWithUrls($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_emails_with_urls_" . date('Y-m-d') . ".csv";
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Email', 'Source URL']);
+        
+        foreach ($emails as $item) {
+            fputcsv($output, [
+                $item['email'] ?? '',
+                $item['source_url'] ?? ''
+            ]);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function downloadUrlsWithEmails($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_urls_with_emails_" . date('Y-m-d') . ".csv";
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Source URL', 'Email']);
+        
+        foreach ($emails as $item) {
+            fputcsv($output, [
+                $item['source_url'] ?? '',
+                $item['email'] ?? ''
+            ]);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function downloadUrlsWithoutEmails($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_urls_only_" . date('Y-m-d') . ".csv";
+        
+        // Filter empty URLs first, then get unique URLs for better performance
+        $urls = array_filter(array_map(function($item) {
+            return $item['source_url'] ?? '';
+        }, $emails));
+        
+        $urls = array_unique($urls);
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Source URL']);
+        
+        foreach ($urls as $url) {
+            fputcsv($output, [$url]);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
     private function renderResultsPage($jobId) {
         $job = $this->jobManager->getJob($jobId);
         if (!$job) {
@@ -2440,7 +3189,11 @@ class Application {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Job Results - <?php echo htmlspecialchars($job['name']); ?></title>
+    <!-- AGGRESSIVE CACHE BUSTING -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate, max-age=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Job Results - <?php echo htmlspecialchars($job['name']); ?> - <?php echo time(); ?></title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f7fa; padding: 20px; }
@@ -2561,7 +3314,15 @@ class Application {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Email Extraction System - v<?php echo Config::VERSION; ?></title>
+    <!-- AGGRESSIVE CACHE BUSTING - Forces browser to reload everything -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate, max-age=0, post-check=0, pre-check=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="cache-control" content="no-cache, no-store, must-revalidate">
+    <meta name="expires" content="0">
+    <meta name="pragma" content="no-cache">
+    <title>Email Extraction System - v<?php echo APP_VERSION; ?> Build <?php echo time(); ?></title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js?v=<?php echo time(); ?>"></script>
     <style>
         * {
             margin: 0;
@@ -2711,6 +3472,138 @@ class Application {
         .stats-value {
             font-weight: 600;
             color: #0066ff;
+        }
+        
+        .create-job-panel {
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 8px;
+            padding: 25px;
+            margin-bottom: 30px;
+        }
+        
+        .create-job-panel h3 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            color: #1a1a1a;
+        }
+        
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        
+        .form-grid .form-group {
+            margin-bottom: 0;
+        }
+        
+        .form-actions {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .chart-container {
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .chart-container h3 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #1a1a1a;
+        }
+        
+        .chart-wrapper {
+            position: relative;
+            height: 300px;
+        }
+        
+        .download-menu {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .download-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .download-btn:hover {
+            background: #218838;
+        }
+        
+        .download-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            right: 0;
+            margin-top: 5px;
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+            min-width: 220px;
+        }
+        
+        .download-dropdown.show {
+            display: block;
+        }
+        
+        .download-dropdown a {
+            display: block;
+            padding: 10px 15px;
+            color: #1a1a1a;
+            text-decoration: none;
+            font-size: 13px;
+            transition: background 0.2s;
+        }
+        
+        .download-dropdown a:hover {
+            background: #f6f8fa;
+        }
+        
+        .download-dropdown a:first-child {
+            border-radius: 6px 6px 0 0;
+        }
+        
+        .download-dropdown a:last-child {
+            border-radius: 0 0 6px 6px;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                position: relative;
+                width: 100%;
+                height: auto;
+                border-right: none;
+                border-bottom: 1px solid #e1e4e8;
+            }
+            
+            .main-content {
+                margin-left: 0;
+            }
+            
+            .form-grid {
+                grid-template-columns: 1fr;
+            }
         }
         
         .main-content {
@@ -3095,13 +3988,77 @@ class Application {
             flex: 1;
             color: #666;
         }
+        
+        /* Modal Styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 9998;
+        }
+        
+        .modal-overlay.active {
+            display: block;
+        }
+        
+        .modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            z-index: 9999;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+        }
+        
+        .modal h2 {
+            margin-bottom: 20px;
+            color: #1a1a1a;
+        }
+        
+        .modal-body {
+            margin-bottom: 25px;
+        }
+        
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .modal-actions button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        
+        .modal-actions .btn-cancel {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .modal-actions .btn-primary {
+            background: #0066ff;
+            color: white;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="sidebar">
             <h1>📧 Email Extractor</h1>
-            <div class="version">Version <?php echo Config::VERSION; ?></div>
+            <div class="version">Version <?php echo APP_VERSION; ?> - Build <?php echo date('H:i:s', time()); ?></div>
+            <div style="font-size: 10px; color: #666; margin-top: 5px;">🔄 Cache-Buster: Active</div>
             
             <?php 
             $db = Database::getInstance();
@@ -3116,6 +4073,17 @@ class Application {
                     </p>
                 </div>
             <?php endif; ?>
+            
+            <div style="background: #d1ecf1; border: 1px solid #0c5460; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px; color: #0c5460;">
+                <strong>✅ VERSION <?php echo APP_VERSION; ?> - Real Web Scraping Active</strong><br>
+                If you see fake emails (jane.smith, sarah.miller) or placeholder URLs (search-result-pending.local), please:
+                <ol style="margin: 10px 0 0 20px;">
+                    <li><strong>Hard refresh</strong> your browser (Ctrl+Shift+R or Cmd+Shift+R)</li>
+                    <li><strong>Stop all running jobs</strong> and restart them</li>
+                    <li>Ensure you have entered a valid <strong>Serper API Key</strong></li>
+                    <li>Check browser console for any JavaScript errors</li>
+                </ol>
+            </div>
             
             <div class="sidebar-section">
                 <h3>System Stats</h3>
@@ -3158,149 +4126,111 @@ class Application {
                 <button id="testConnectionBtn" class="btn btn-secondary">Test Connection</button>
                 <div id="connectionStatus" style="margin-top: 10px; display: none;"></div>
             </div>
-            
-            <div class="sidebar-section">
-                <h3>Create New Job</h3>
-                <form id="createJobForm">
-                    <div class="form-group">
-                        <label for="jobName">Job Name</label>
-                        <input type="text" id="jobName" name="name" placeholder="My Email Extraction Job" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="query">Main Search Query</label>
-                        <input type="text" id="query" name="query" placeholder="e.g., real estate agents" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="keywords">Additional Keywords (one per line)</label>
-                        <textarea id="keywords" name="keywords" placeholder="california&#10;los angeles&#10;san francisco" rows="4"></textarea>
-                        <small style="color: #666;">Each keyword will be combined with the main query</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="country">Country</label>
-                        <select id="country" name="country">
-                            <option value="">Worldwide (All Countries)</option>
-                            <option value="us">United States</option>
-                            <option value="uk">United Kingdom</option>
-                            <option value="ca">Canada</option>
-                            <option value="au">Australia</option>
-                            <option value="de">Germany</option>
-                            <option value="fr">France</option>
-                            <option value="es">Spain</option>
-                            <option value="it">Italy</option>
-                            <option value="br">Brazil</option>
-                            <option value="mx">Mexico</option>
-                            <option value="in">India</option>
-                            <option value="jp">Japan</option>
-                            <option value="cn">China</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="language">Language</label>
-                        <select id="language" name="language">
-                            <option value="en">English</option>
-                            <option value="es">Spanish</option>
-                            <option value="fr">French</option>
-                            <option value="de">German</option>
-                            <option value="it">Italian</option>
-                            <option value="pt">Portuguese</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email Types (Select Multiple)</label>
-                        <div style="padding: 10px; border: 1px solid #d1d5da; border-radius: 6px; background: #f6f8fa;">
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="gmail" style="margin-right: 8px; width: auto;">
-                                    Gmail
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="yahoo" style="margin-right: 8px; width: auto;">
-                                    Yahoo
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="att" style="margin-right: 8px; width: auto;">
-                                    AT&T
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="sbcglobal" style="margin-right: 8px; width: auto;">
-                                    SBCGlobal
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="bellsouth" style="margin-right: 8px; width: auto;">
-                                    BellSouth
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="aol" style="margin-right: 8px; width: auto;">
-                                    AOL
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="outlook" style="margin-right: 8px; width: auto;">
-                                    Outlook/Hotmail
-                                </label>
-                            </div>
-                            <div>
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="business" style="margin-right: 8px; width: auto;">
-                                    Business Domains
-                                </label>
-                            </div>
-                        </div>
-                        <small style="color: #666;">Select one or more email types. Leave unchecked for all types.</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="customDomains">Custom Domains (Optional)</label>
-                        <textarea id="customDomains" name="custom_domains" placeholder="example.com&#10;company.net&#10;business.org" rows="3"></textarea>
-                        <small style="color: #666;">Enter custom domains to extract (one per line)</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="targetEmails">Target Emails</label>
-                        <input type="number" id="targetEmails" name="target_emails" value="10000" min="100" max="1000000" step="100">
-                        <small style="color: #666;">Goal for completion progress (100 - 1,000,000)</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="maxWorkers">Max Workers</label>
-                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="200">
-                        <small style="color: #666;">Parallel workers (1-200, optimized for performance)</small>
-                    </div>
-                    
-                    <button type="submit" class="btn">Create Job</button>
-                </form>
-            </div>
         </div>
         
         <div class="main-content">
             <div class="header">
-                <h2>Job Dashboard</h2>
-                <p>Real-time monitoring and management of email extraction jobs</p>
+                <h2>Email Extraction Dashboard</h2>
+                <p>Create jobs and monitor email extraction in real-time</p>
             </div>
             
             <div id="alertContainer"></div>
             
-            <div id="jobContainer" class="job-grid">
-                <div class="empty-state">
-                    <h3>No Jobs Yet</h3>
-                    <p>Create your first job using the form on the left</p>
+            <!-- Create Job Panel (TOP) -->
+            <div class="create-job-panel">
+                <h3>🚀 Create New Job</h3>
+                <form id="createJobForm">
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="jobName">Job Name *</label>
+                            <input type="text" id="jobName" name="name" placeholder="My Email Extraction Job" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="query">Main Search Query *</label>
+                            <input type="text" id="query" name="query" placeholder="e.g., real estate agents" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="keywords">Keywords (one per line)</label>
+                            <textarea id="keywords" name="keywords" placeholder="california&#10;los angeles" rows="3"></textarea>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="emailTypes">Email Type</label>
+                            <select id="emailTypes" name="email_types" multiple style="height: 60px;">
+                                <option value="gmail">Gmail</option>
+                                <option value="yahoo">Yahoo</option>
+                                <option value="outlook">Outlook/Hotmail</option>
+                                <option value="att">AT&T</option>
+                                <option value="sbcglobal">SBCGlobal</option>
+                                <option value="bellsouth">BellSouth</option>
+                                <option value="aol">AOL</option>
+                                <option value="business">Business Domains</option>
+                            </select>
+                            <small style="color: #666;">Hold Ctrl/Cmd to select multiple</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="country">Location</label>
+                            <select id="country" name="country">
+                                <option value="">Worldwide</option>
+                                <option value="us">United States</option>
+                                <option value="uk">United Kingdom</option>
+                                <option value="ca">Canada</option>
+                                <option value="au">Australia</option>
+                                <option value="de">Germany</option>
+                                <option value="fr">France</option>
+                                <option value="es">Spain</option>
+                                <option value="it">Italy</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="maxWorkers">Requested Workers</label>
+                            <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="200">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="targetEmails">Target Emails</label>
+                            <input type="number" id="targetEmails" name="target_emails" value="10000" min="100" max="1000000" step="100">
+                        </div>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button type="submit" class="btn">Create Job</button>
+                    </div>
+                </form>
+            </div>
+            
+            <!-- Multi Jobs Dashboard (BELOW) -->
+            <div>
+                <h3 style="margin-bottom: 20px; font-size: 20px;">Active Jobs</h3>
+                <div id="jobContainer" class="job-grid">
+                    <div class="empty-state">
+                        <h3>No Jobs Yet</h3>
+                        <p>Create your first job using the form above</p>
+                    </div>
                 </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal for adding more queries -->
+    <div class="modal-overlay" id="queryModal">
+        <div class="modal">
+            <h2>🔍 Add More Search Queries</h2>
+            <div class="modal-body">
+                <p style="margin-bottom: 15px;">This job has exhausted its current queries. Add more keywords to continue collecting emails:</p>
+                <div class="form-group">
+                    <label for="modalKeywords">Additional Keywords (one per line)</label>
+                    <textarea id="modalKeywords" rows="5" style="width: 100%; padding: 10px; border: 1px solid #d1d5da; border-radius: 6px;" placeholder="new york&#10;miami&#10;chicago"></textarea>
+                </div>
+                <input type="hidden" id="modalJobId">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeQueryModal()">Cancel</button>
+                <button class="btn-primary" onclick="addMoreQueries()">Add Queries & Continue</button>
             </div>
         </div>
     </div>
@@ -3357,7 +4287,7 @@ class Application {
                     container.innerHTML = `
                         <div class="empty-state">
                             <h3>No Jobs Yet</h3>
-                            <p>Create your first job using the form on the left</p>
+                            <p>Create your first job using the form above</p>
                         </div>
                     `;
                     return;
@@ -3487,14 +4417,25 @@ class Application {
                         <div class="job-actions">
                             ${job.status === 'running' ? `
                                 <button onclick="JobController.stopJob('${job.id}')" class="danger">Stop</button>
-                            ` : job.status === 'completed' ? `
-                                <button onclick="JobController.deleteJob('${job.id}')" class="danger" style="width: 100%;">Delete</button>
                             ` : job.status === 'error' ? `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Retry</button>
-                            ` : `
+                            ` : job.status === 'stopped' || job.status === 'created' ? `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Start</button>
-                            `}
-                            ${job.status !== 'completed' ? `
+                            ` : ''}
+                            
+                            ${acceptedEmails > 0 ? `
+                                <div class="download-menu">
+                                    <button class="download-btn" onclick="toggleDownload('${job.id}')">📥 Download</button>
+                                    <div class="download-dropdown" id="download-${job.id}">
+                                        <a href="?mode=download_emails&job_id=${job.id}">Download Emails</a>
+                                        <a href="?mode=download_emails_with_urls&job_id=${job.id}">Download Emails with URLs</a>
+                                        <a href="?mode=download_urls_with_emails&job_id=${job.id}">Download URLs with Emails</a>
+                                        <a href="?mode=download_urls_without_emails&job_id=${job.id}">Download URLs without Emails</a>
+                                    </div>
+                                </div>
+                            ` : ''}
+                            
+                            ${job.status === 'completed' || job.status === 'stopped' ? `
                                 <button onclick="JobController.deleteJob('${job.id}')" class="danger">Delete</button>
                             ` : ''}
                         </div>
@@ -3673,14 +4614,17 @@ class Application {
             
             const apiKey = document.getElementById('apiKey').value;
             
-            // Save API key to localStorage
-            if (apiKey) {
-                localStorage.setItem('serper_api_key', apiKey);
+            if (!apiKey) {
+                UI.showAlert('Please enter your Serper API key first', 'error');
+                return;
             }
             
-            // Collect selected email types from checkboxes
-            const emailTypeCheckboxes = document.querySelectorAll('input[name="email_types[]"]:checked');
-            const selectedEmailTypes = Array.from(emailTypeCheckboxes).map(cb => cb.value);
+            // Save API key to localStorage
+            localStorage.setItem('serper_api_key', apiKey);
+            
+            // Collect selected email types from multi-select
+            const emailTypeSelect = document.getElementById('emailTypes');
+            const selectedEmailTypes = Array.from(emailTypeSelect.selectedOptions).map(opt => opt.value);
             
             const formData = {
                 name: document.getElementById('jobName').value,
@@ -3688,9 +4632,8 @@ class Application {
                 query: document.getElementById('query').value,
                 keywords: document.getElementById('keywords').value,
                 country: document.getElementById('country').value,
-                language: document.getElementById('language').value,
-                email_types: selectedEmailTypes.join(','), // Join as comma-separated string
-                custom_domains: document.getElementById('customDomains').value,
+                language: 'en',
+                email_types: selectedEmailTypes.join(','),
                 target_emails: document.getElementById('targetEmails').value,
                 max_workers: document.getElementById('maxWorkers').value
             };
@@ -3698,11 +4641,186 @@ class Application {
             await JobController.createJob(formData);
         });
         
-        // Auto-refresh every 5 seconds
-        setInterval(() => JobController.refreshJobs(), 5000);
+        // Download dropdown toggle
+        window.toggleDownload = function(jobId) {
+            const dropdown = document.getElementById('download-' + jobId);
+            dropdown.classList.toggle('show');
+            
+            // Close when clicking outside
+            setTimeout(() => {
+                document.addEventListener('click', function closeDropdown(e) {
+                    if (!e.target.closest('.download-menu')) {
+                        dropdown.classList.remove('show');
+                        document.removeEventListener('click', closeDropdown);
+                    }
+                });
+            }, 10);
+        };
+        
+        // Modal functions for adding more queries
+        let needsQueriesJobId = null;
+        
+        function openQueryModal(jobId) {
+            needsQueriesJobId = jobId;
+            document.getElementById('modalJobId').value = jobId;
+            document.getElementById('queryModal').classList.add('active');
+        }
+        
+        function closeQueryModal() {
+            document.getElementById('queryModal').classList.remove('active');
+            document.getElementById('modalKeywords').value = '';
+            needsQueriesJobId = null;
+        }
+        
+        async function addMoreQueries() {
+            const keywords = document.getElementById('modalKeywords').value;
+            const jobId = needsQueriesJobId;
+            
+            if (!keywords.trim()) {
+                UI.showAlert('Please enter at least one keyword', 'error');
+                return;
+            }
+            
+            try {
+                // Update job with new keywords (this would require a new backend endpoint)
+                const result = await API.call('add_keywords', {
+                    job_id: jobId,
+                    keywords: keywords
+                });
+                
+                if (result.success) {
+                    UI.showAlert('Keywords added! Job will continue...', 'success');
+                    closeQueryModal();
+                    JobController.refreshJobs();
+                } else {
+                    UI.showAlert(result.error || 'Failed to add keywords', 'error');
+                }
+            } catch (error) {
+                UI.showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        // Listen for needs_more_queries events
+        window.addEventListener('job_needs_queries', function(e) {
+            openQueryModal(e.detail.jobId);
+        });
+        
+        // Chart.js initialization
+        let emailRateChart = null;
+        let chartData = {
+            labels: [],
+            datasets: [{
+                label: 'Emails/Minute',
+                data: [],
+                borderColor: '#0066ff',
+                backgroundColor: 'rgba(0, 102, 255, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        };
+        
+        async function updateChart() {
+            const jobs = await API.get('get_jobs');
+            if (!jobs.success || jobs.jobs.length === 0) {
+                document.getElementById('chartContainer').style.display = 'none';
+                return;
+            }
+            
+            // Find first running job to display
+            // Note: Currently shows only the first running job. For multiple simultaneous jobs,
+            // consider adding a job selector dropdown or aggregating data from all running jobs.
+            const runningJob = jobs.jobs.find(j => j.status === 'running');
+            if (!runningJob) {
+                document.getElementById('chartContainer').style.display = 'none';
+                return;
+            }
+            
+            // Show chart container
+            document.getElementById('chartContainer').style.display = 'block';
+            
+            // Get email rate data
+            const rateData = await API.get('get_email_rate', { job_id: runningJob.id });
+            if (rateData.success && rateData.emails_per_minute.length > 0) {
+                chartData.labels = rateData.emails_per_minute.map(d => {
+                    const date = new Date(d.timestamp * 1000);
+                    return date.toLocaleTimeString();
+                });
+                chartData.datasets[0].data = rateData.emails_per_minute.map(d => d.count);
+                
+                if (!emailRateChart) {
+                    const ctx = document.getElementById('emailRateChart').getContext('2d');
+                    emailRateChart = new Chart(ctx, {
+                        type: 'line',
+                        data: chartData,
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    display: true,
+                                    position: 'top'
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    beginAtZero: true,
+                                    ticks: {
+                                        precision: 0
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    emailRateChart.data = chartData;
+                    emailRateChart.update();
+                }
+            }
+        }
+        
+        // AGGRESSIVE CACHE BUSTING - Force reload if cached
+        (function() {
+            const cacheBuster = '<?php echo time(); ?>';
+            const storedVersion = localStorage.getItem('app_cache_buster');
+            
+            // Always clear localStorage on load to prevent stale data
+            if (performance.navigation.type === 1) {
+                // Page was refreshed
+                localStorage.clear();
+                sessionStorage.clear();
+            }
+            
+            // Store current version
+            localStorage.setItem('app_cache_buster', cacheBuster);
+            
+            // Prevent back/forward cache (bfcache)
+            window.onpageshow = function(event) {
+                if (event.persisted) {
+                    window.location.reload(true);
+                }
+            };
+            
+            // Force reload on visibility change if tab was hidden
+            document.addEventListener('visibilitychange', function() {
+                if (!document.hidden) {
+                    // Clear any cached data when tab becomes visible
+                    sessionStorage.clear();
+                }
+            });
+            
+            console.log('🔄 Cache Buster Active: ' + cacheBuster);
+            console.log('✅ VERSION: <?php echo APP_VERSION; ?>');
+        })();
+        
+        // Auto-refresh every 2 seconds for real-time updates (like SendGrid)
+        setInterval(() => {
+            JobController.refreshJobs();
+            updateChart();
+        }, 2000);
         
         // Initial load
         JobController.refreshJobs();
+        updateChart();
     </script>
 </body>
 </html>
