@@ -1229,6 +1229,19 @@ function getCurrentEmailCountFromFile(\$emailFile) {
 \$lastCountCheck = time(); // For periodic count checking
 \$localEmailCount = 0; // Local counter
 
+// Log worker initialization
+echo json_encode([
+    'type' => 'worker_init',
+    'worker_id' => \$workerId,
+    'job_id' => \$jobId,
+    'query' => \$query,
+    'max_emails' => \$maxEmails,
+    'max_run_time' => \$maxRunTime,
+    'has_api_key' => !empty(\$apiKey),
+    'has_db' => \$pdo !== null
+]) . "\\n";
+flush();
+
 // Load already processed URLs for resume capability
 \$processedUrls = getProcessedUrls(\$emailFile);
 
@@ -1249,6 +1262,14 @@ if (empty(\$queryList)) {
 }
 
 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
+
+echo json_encode([
+    'type' => 'worker_ready',
+    'worker_id' => \$workerId,
+    'queries_count' => count(\$queryList),
+    'active_query' => \$activeQuery
+]) . "\\n";
+flush();
 
 while ((time() - \$startTime) < \$maxRunTime) {
     // Check target limit periodically (every 10 seconds) instead of every iteration
@@ -1275,10 +1296,19 @@ while ((time() - \$startTime) < \$maxRunTime) {
         }
     }
     
-    // Output heartbeat regularly (every 30 seconds for consistent feedback)
+    // Output heartbeat regularly with full diagnostics (every 10 seconds for better visibility)
     static \$lastHeartbeat = 0;
-    if ((time() - \$lastHeartbeat) >= 30 || \$lastHeartbeat == 0) {
-        echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time(), 'extracted' => \$extractedCount]) . "\\n";
+    if ((time() - \$lastHeartbeat) >= 10 || \$lastHeartbeat == 0) {
+        echo json_encode([
+            'type' => 'heartbeat',
+            'worker_id' => \$workerId,
+            'time' => time(),
+            'extracted' => \$extractedCount,
+            'urls_in_buffer' => count(\$urlsToProcess),
+            'current_page' => \$currentPage,
+            'active_query' => \$activeQuery,
+            'elapsed_time' => time() - \$startTime
+        ]) . "\\n";
         flush();
         \$lastHeartbeat = time();
     }
@@ -1315,8 +1345,8 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 ]) . "\\n";
                 flush();
                 
-                // Wait before retrying to avoid hammering the API
-                sleep(5);
+                // Wait briefly before retrying to avoid hammering the API
+                sleep(1);
                 continue;
             }
             
@@ -1394,8 +1424,7 @@ while ((time() - \$startTime) < \$maxRunTime) {
             sleep(5); // Wait before checking again
             continue;
         }
-        // Sleep briefly to avoid tight CPU loop when waiting for URLs
-        usleep(100000); // 0.1 seconds
+        // Continue immediately without delay - user wants maximum speed
         continue;
     }
     
@@ -1576,7 +1605,14 @@ PHP;
             if (empty($line)) continue;
             
             $data = json_decode($line, true);
-            if (!$data) continue;
+            if (!$data) {
+                // Log unparseable output
+                Utils::logMessage('WARNING', "Worker {$workerId} unparseable output: " . substr($line, 0, 100));
+                continue;
+            }
+            
+            // Log all worker events for debugging
+            Utils::logMessage('DEBUG', "Worker {$workerId} event: " . $data['type'], $data);
             
             if ($data['type'] === 'heartbeat') {
                 $this->workers[$workerId]['last_heartbeat'] = time();
@@ -1584,6 +1620,14 @@ PHP;
                 // Update job stats by reading email file
                 $this->updateJobStatsFromFile();
                 Utils::logMessage('INFO', "Worker {$workerId} found {$data['count']} emails");
+            } elseif ($data['type'] === 'error' || $data['type'] === 'serper_api_error') {
+                // Log errors from workers
+                $errorMsg = $data['message'] ?? 'Unknown error';
+                Utils::logMessage('ERROR', "Worker {$workerId} error: {$errorMsg}", $data);
+            } elseif ($data['type'] === 'worker_init') {
+                Utils::logMessage('INFO', "Worker {$workerId} initialized for job {$this->jobId}");
+            } elseif ($data['type'] === 'urls_fetched') {
+                Utils::logMessage('DEBUG', "Worker {$workerId} fetched {$data['count']} URLs (page {$data['page']})");
             }
         }
     }
@@ -2188,6 +2232,78 @@ class JobManager {
         }
     }
     
+    public function verifyExtraction($jobId) {
+        // Verification function to check if extraction is actually happening
+        if (!isset($this->jobs[$jobId])) {
+            return ['status' => 'error', 'message' => 'Job not found'];
+        }
+        
+        $job = $this->jobs[$jobId];
+        $issues = [];
+        $info = [];
+        
+        // Check 1: Worker status
+        if ($job['worker_governor']) {
+            $stats = $job['worker_governor']->getStats();
+            $info['workers_total'] = $stats['total'];
+            $info['workers_running'] = $stats['running'];
+            $info['workers_completed'] = $stats['completed'];
+            
+            if ($stats['running'] == 0) {
+                $issues[] = 'No workers are currently running';
+            }
+        } else {
+            $issues[] = 'Worker governor not initialized';
+        }
+        
+        // Check 2: Email progress
+        $this->updateEmailCountsFromFile($jobId);
+        $emailsAccepted = $job['emails_accepted'] ?? 0;
+        $info['emails_extracted'] = $emailsAccepted;
+        
+        if ($emailsAccepted == 0 && $job['status'] === 'running') {
+            $runtime = time() - ($job['started_at'] ?? time());
+            if ($runtime > 60) { // More than 1 minute
+                $issues[] = "No emails extracted after {$runtime} seconds";
+            }
+        }
+        
+        // Check 3: API key
+        if (empty($job['api_key'])) {
+            $issues[] = 'API key is missing';
+        }
+        
+        // Check 4: Query
+        if (empty($job['query'])) {
+            $issues[] = 'Search query is missing';
+        }
+        
+        // Check 5: Recent errors
+        if (!empty($job['error_messages'])) {
+            $recentErrors = array_slice($job['error_messages'], -3);
+            $info['recent_errors'] = array_map(function($err) {
+                return $err['message'];
+            }, $recentErrors);
+        }
+        
+        // Check 6: File/DB storage
+        $emailFile = Config::DATA_DIR . "/job_{$jobId}_emails.json";
+        if (file_exists($emailFile)) {
+            $fileSize = filesize($emailFile);
+            $info['email_file_size'] = Utils::formatBytes($fileSize);
+        } else {
+            $info['email_file_exists'] = false;
+        }
+        
+        return [
+            'status' => empty($issues) ? 'ok' : 'issues_found',
+            'issues' => $issues,
+            'info' => $info,
+            'job_status' => $job['status'],
+            'job_id' => $jobId
+        ];
+    }
+    
     private function updateEmailCountsFromFile($jobId) {
         // First try to get from database
         if ($this->db->isConfigured()) {
@@ -2405,6 +2521,9 @@ class APIHandler {
                     
                 case 'get_job':
                     return $this->getJob();
+                    
+                case 'verify_extraction':
+                    return $this->verifyExtractionAPI();
                     
                 case 'get_jobs':
                     return $this->getJobs();
@@ -2727,6 +2846,21 @@ class APIHandler {
             'success' => true,
             'message' => 'Keywords added successfully',
             'total_keywords' => count($updatedKeywords)
+        ]);
+    }
+    
+    private function verifyExtractionAPI() {
+        $jobId = $_POST['job_id'] ?? $_GET['job_id'] ?? null;
+        
+        if (!$jobId) {
+            throw new Exception("Job ID is required");
+        }
+        
+        $verification = $this->jobManager->verifyExtraction($jobId);
+        
+        return $this->jsonResponse([
+            'success' => true,
+            'verification' => $verification
         ]);
     }
     
