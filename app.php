@@ -1315,6 +1315,17 @@ while ((time() - \$startTime) < \$maxRunTime) {
     
     // Fetch URLs from Serper API - fetch more at once and keep cycling through queries
     if (count(\$urlsToProcess) < 50 && !empty(\$apiKey)) {
+        // Log that we're attempting to fetch
+        echo json_encode([
+            'type' => 'api_fetch_attempt',
+            'worker_id' => \$workerId,
+            'current_page' => \$currentPage,
+            'max_pages' => \$maxPages,
+            'buffer_size' => count(\$urlsToProcess),
+            'query' => \$activeQuery
+        ]) . "\\n";
+        flush();
+        
         // Try fetching from current page if we haven't exceeded max pages
         if (\$currentPage <= \$maxPages) {
             \$apiResponse = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
@@ -1409,6 +1420,27 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 \$currentPage = 1;
             }
         }
+    } else {
+        // Log why we're not fetching
+        static \$lastSkipLog = 0;
+        if ((time() - \$lastSkipLog) >= 30) { // Log every 30 seconds
+            if (empty(\$apiKey)) {
+                echo json_encode([
+                    'type' => 'api_fetch_skip',
+                    'worker_id' => \$workerId,
+                    'reason' => 'No API key'
+                ]) . "\\n";
+            } else {
+                echo json_encode([
+                    'type' => 'api_fetch_skip',
+                    'worker_id' => \$workerId,
+                    'reason' => 'Buffer full',
+                    'buffer_size' => count(\$urlsToProcess)
+                ]) . "\\n";
+            }
+            flush();
+            \$lastSkipLog = time();
+        }
     }
     
     // Process URLs and extract REAL emails
@@ -1424,7 +1456,9 @@ while ((time() - \$startTime) < \$maxRunTime) {
             sleep(5); // Wait before checking again
             continue;
         }
-        // Continue immediately without delay - user wants maximum speed
+        // Small delay to prevent CPU spin when waiting for API to fetch URLs
+        // This only happens when buffer is empty and waiting for new URLs
+        usleep(50000); // 0.05 seconds - minimal delay for CPU efficiency
         continue;
     }
     
