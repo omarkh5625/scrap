@@ -1323,6 +1323,7 @@ while ((time() - \$startTime) < \$maxRunTime) {
             \$results = \$apiResponse['results'] ?? [];
             
             if (!empty(\$results)) {
+                \$newUrlCount = 0;
                 foreach (\$results as \$result) {
                     if (isset(\$result['link'])) {
                         \$url = \$result['link'];
@@ -1330,9 +1331,22 @@ while ((time() - \$startTime) < \$maxRunTime) {
                         if (!isset(\$processedUrls[\$url])) {
                             \$urlsToProcess[] = \$url;
                             \$processedUrls[\$url] = true;
+                            \$newUrlCount++;
                         }
                     }
                 }
+                
+                // Log successful URL fetch
+                echo json_encode([
+                    'type' => 'urls_fetched',
+                    'worker_id' => \$workerId,
+                    'count' => \$newUrlCount,
+                    'page' => \$currentPage,
+                    'query' => \$activeQuery,
+                    'buffer_size' => count(\$urlsToProcess)
+                ]) . "\\n";
+                flush();
+                
                 \$currentPage++;
             } else {
                 // No results, try next query immediately
