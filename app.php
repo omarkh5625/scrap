@@ -4923,7 +4923,10 @@ class Application {
         async function updateChart() {
             const jobs = await API.get('get_jobs');
             if (!jobs.success || jobs.jobs.length === 0) {
-                document.getElementById('chartContainer').style.display = 'none';
+                const chartContainer = document.getElementById('chartContainer');
+                if (chartContainer) {
+                    chartContainer.style.display = 'none';
+                }
                 return;
             }
             
@@ -4932,12 +4935,18 @@ class Application {
             // consider adding a job selector dropdown or aggregating data from all running jobs.
             const runningJob = jobs.jobs.find(j => j.status === 'running');
             if (!runningJob) {
-                document.getElementById('chartContainer').style.display = 'none';
+                const chartContainer = document.getElementById('chartContainer');
+                if (chartContainer) {
+                    chartContainer.style.display = 'none';
+                }
                 return;
             }
             
             // Show chart container
-            document.getElementById('chartContainer').style.display = 'block';
+            const chartContainer = document.getElementById('chartContainer');
+            if (chartContainer) {
+                chartContainer.style.display = 'block';
+            }
             
             // Get email rate data
             const rateData = await API.get('get_email_rate', { job_id: runningJob.id });
@@ -4948,8 +4957,13 @@ class Application {
                 });
                 chartData.datasets[0].data = rateData.emails_per_minute.map(d => d.count);
                 
+                const chartElement = document.getElementById('emailRateChart');
+                if (!chartElement) {
+                    return; // Chart element doesn't exist
+                }
+                
                 if (!emailRateChart) {
-                    const ctx = document.getElementById('emailRateChart').getContext('2d');
+                    const ctx = chartElement.getContext('2d');
                     emailRateChart = new Chart(ctx, {
                         type: 'line',
                         data: chartData,
