@@ -52,8 +52,8 @@ class Config {
     const LOG_DIR = '/tmp/email_extraction/logs';
     const DB_RETRY_ATTEMPTS = 3;
     const DB_RETRY_DELAY = 2; // seconds
-    const DEFAULT_MAX_PAGES = 200; // Default max pages per query (configurable per job)
-    const DEFAULT_WORKER_RUNTIME = 7200; // Default 2 hours (configurable per job)
+    const DEFAULT_MAX_PAGES = 1000; // Default max pages per query (increased for maximum coverage)
+    const DEFAULT_WORKER_RUNTIME = 28800; // Default 8 hours (increased for continuous operation)
     const CHART_TIME_WINDOW_SECONDS = 600; // 10 minutes for email rate chart
 }
 
@@ -956,6 +956,18 @@ function extractEmailsFromContent(\$content) {
 }
 
 function fetchUrlContent(\$url) {
+    // Filter out non-HTML content (images, PDFs, etc.)
+    \$blockedExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', 
+                           '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar',
+                           '.mp4', '.avi', '.mov', '.mp3', '.wav', '.css', '.js', '.ico'];
+    
+    \$urlLower = strtolower(\$url);
+    foreach (\$blockedExtensions as \$ext) {
+        if (strpos(\$urlLower, \$ext) !== false) {
+            return false; // Skip non-HTML resources
+        }
+    }
+    
     \$ch = curl_init(\$url);
     curl_setopt_array(\$ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -964,14 +976,23 @@ function fetchUrlContent(\$url) {
         CURLOPT_TIMEOUT => 5,
         CURLOPT_CONNECTTIMEOUT => 3,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        CURLOPT_HTTPHEADER => ['Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8']
     ]);
     
     \$content = curl_exec(\$ch);
     \$httpCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
+    \$contentType = curl_getinfo(\$ch, CURLINFO_CONTENT_TYPE);
     curl_close(\$ch);
     
-    return (\$httpCode >= 200 && \$httpCode < 300) ? \$content : false;
+    // Only process HTML content
+    if (\$httpCode >= 200 && \$httpCode < 300) {
+        if (\$contentType && stripos(\$contentType, 'text/html') !== false) {
+            return \$content;
+        }
+    }
+    
+    return false;
 }
 
 function getEmailQuality(\$email, \$content) {
@@ -1031,6 +1052,38 @@ function saveBatchToDB(\$pdo, \$jobId, \$emailBatch) {
     }
 }
 
+// Fast JSON batch save for when database is not available
+function saveBatchToJSON(\$emailFile, \$emailBatch) {
+    if (empty(\$emailBatch)) return 0;
+    
+    // Read existing data
+    \$existingData = [];
+    if (file_exists(\$emailFile)) {
+        \$content = file_get_contents(\$emailFile);
+        \$json = json_decode(\$content, true);
+        if (\$json && isset(\$json['emails'])) {
+            \$existingData = \$json['emails'];
+        }
+    }
+    
+    // Merge new emails (with deduplication)
+    \$existingEmails = array_column(\$existingData, 'email');
+    \$saved = 0;
+    foreach (\$emailBatch as \$emailData) {
+        if (!in_array(\$emailData['email'], \$existingEmails)) {
+            \$existingData[] = \$emailData;
+            \$existingEmails[] = \$emailData['email'];
+            \$saved++;
+        }
+    }
+    
+    // Write back to file
+    \$data = ['emails' => \$existingData, 'count' => count(\$existingData)];
+    file_put_contents(\$emailFile, json_encode(\$data, JSON_PRETTY_PRINT));
+    
+    return \$saved;
+}
+
 // Extraction work with REAL email scraping - OPTIMIZED
 \$startTime = time();
 \$extractedCount = 0;
@@ -1082,28 +1135,44 @@ while ((time() - \$startTime) < \$maxRunTime) {
         flush();
     }
     
-    // Fetch URLs from Serper API - fetch more at once
-    if (count(\$urlsToProcess) < 50 && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
-        \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
-        if (!empty(\$results)) {
-            foreach (\$results as \$result) {
-                if (isset(\$result['link'])) {
-                    \$url = \$result['link'];
-                    // Use hash for O(1) lookup instead of in_array
-                    if (!isset(\$processedUrls[\$url])) {
-                        \$urlsToProcess[] = \$url;
-                        \$processedUrls[\$url] = true;
+    // Fetch URLs from Serper API - fetch more at once and keep cycling through queries
+    if (count(\$urlsToProcess) < 50 && !empty(\$apiKey)) {
+        // Try fetching from current page if we haven't exceeded max pages
+        if (\$currentPage <= \$maxPages) {
+            \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
+            if (!empty(\$results)) {
+                foreach (\$results as \$result) {
+                    if (isset(\$result['link'])) {
+                        \$url = \$result['link'];
+                        // Use hash for O(1) lookup instead of in_array
+                        if (!isset(\$processedUrls[\$url])) {
+                            \$urlsToProcess[] = \$url;
+                            \$processedUrls[\$url] = true;
+                        }
                     }
                 }
+                \$currentPage++;
+            } else {
+                // No results, try next query
+                if (count(\$queryList) > 1) {
+                    \$currentQueryIndex++;
+                    \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
+                    \$currentPage = 1;
+                    echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+                    flush();
+                }
             }
-            \$currentPage++;
         } else {
-            // Switch to next query if available
+            // Reached max pages for current query, cycle to next query and reset page count
             if (count(\$queryList) > 1) {
                 \$currentQueryIndex++;
                 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
                 \$currentPage = 1;
-                echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+                echo json_encode(['type' => 'query_cycle', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
+                flush();
+            } else {
+                // Single query and max pages reached, reset to page 1 to keep working
+                \$currentPage = 1;
             }
         }
     }
@@ -1183,9 +1252,16 @@ while ((time() - \$startTime) < \$maxRunTime) {
                     flush();
                 }
             } else {
-                // Fallback to file
-                foreach (\$emailBatch as \$ed) {
-                    saveEmailToFile(\$emailFile, \$ed);
+                // Use fast JSON batch save instead of one-by-one
+                \$saved = saveBatchToJSON(\$emailFile, \$emailBatch);
+                if (\$saved > 0) {
+                    echo json_encode([
+                        'type' => 'batch_saved_json',
+                        'worker_id' => \$workerId,
+                        'count' => \$saved,
+                        'time' => time()
+                    ]) . "\\n";
+                    flush();
                 }
             }
             \$emailBatch = [];
@@ -1211,9 +1287,8 @@ if (!empty(\$emailBatch)) {
     if (\$pdo) {
         saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
     } else {
-        foreach (\$emailBatch as \$ed) {
-            saveEmailToFile(\$emailFile, \$ed);
-        }
+        // Use fast JSON batch save
+        saveBatchToJSON(\$emailFile, \$emailBatch);
     }
 }
 
