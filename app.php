@@ -4009,8 +4009,6 @@ class Application {
                     <li>Check browser console for any JavaScript errors</li>
                 </ol>
             </div>
-                </div>
-            <?php endif; ?>
             
             <div class="sidebar-section">
                 <h3>System Stats</h3>
