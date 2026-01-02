@@ -54,6 +54,7 @@ class Config {
     const DB_RETRY_DELAY = 2; // seconds
     const DEFAULT_MAX_PAGES = 200; // Default max pages per query (configurable per job)
     const DEFAULT_WORKER_RUNTIME = 7200; // Default 2 hours (configurable per job)
+    const CHART_TIME_WINDOW_SECONDS = 600; // 10 minutes for email rate chart
 }
 
 // Database Connection Manager
@@ -2233,7 +2234,7 @@ class APIHandler {
                         AND created_at >= FROM_UNIXTIME(:since)
                     GROUP BY minute_timestamp
                     ORDER BY minute_timestamp ASC",
-                    [':job_id' => $jobId, ':since' => $now - 600]
+                    [':job_id' => $jobId, ':since' => $now - Config::CHART_TIME_WINDOW_SECONDS]
                 );
                 
                 $results = $stmt->fetchAll();
@@ -2457,8 +2458,12 @@ class Application {
             $query = $_POST['query'] ?? '';
             $keywords = $_POST['keywords'] ?? '';
             
-            if (empty($apiKey) || (empty($query) && empty($keywords))) {
-                throw new Exception("API key and query/keywords are required");
+            if (empty($apiKey)) {
+                throw new Exception("API key is required");
+            }
+            
+            if (empty($query) && empty($keywords)) {
+                throw new Exception("Either main query or keywords are required");
             }
             
             $keywordList = [];
@@ -2625,10 +2630,12 @@ class Application {
         $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
         $filename = "job_{$jobName}_urls_only_" . date('Y-m-d') . ".csv";
         
-        // Get unique URLs
-        $urls = array_unique(array_map(function($item) {
+        // Filter empty URLs first, then get unique URLs for better performance
+        $urls = array_filter(array_map(function($item) {
             return $item['source_url'] ?? '';
         }, $emails));
+        
+        $urls = array_unique($urls);
         
         header('Content-Type: text/csv');
         header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -2639,9 +2646,7 @@ class Application {
         fputcsv($output, ['Source URL']);
         
         foreach ($urls as $url) {
-            if (!empty($url)) {
-                fputcsv($output, [$url]);
-            }
+            fputcsv($output, [$url]);
         }
         
         fclose($output);
@@ -4119,7 +4124,9 @@ class Application {
                 return;
             }
             
-            // Find first running job
+            // Find first running job to display
+            // Note: Currently shows only the first running job. For multiple simultaneous jobs,
+            // consider adding a job selector dropdown or aggregating data from all running jobs.
             const runningJob = jobs.jobs.find(j => j.status === 'running');
             if (!runningJob) {
                 document.getElementById('chartContainer').style.display = 'none';
