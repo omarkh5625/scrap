@@ -29,6 +29,14 @@ ini_set('log_errors', 1);
 ini_set('max_execution_time', 0);
 ini_set('memory_limit', '512M');
 
+// AGGRESSIVE CACHE BUSTING - Force cache clear on every refresh
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+header("Expires: 0");
+header("Expires: Sat, 26 Jul 1997 05:00:00 GMT"); // Date in the past
+header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT"); // Always modified
+
 // Session management
 session_start();
 
@@ -3126,7 +3134,11 @@ class Application {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Job Results - <?php echo htmlspecialchars($job['name']); ?></title>
+    <!-- AGGRESSIVE CACHE BUSTING -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate, max-age=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Job Results - <?php echo htmlspecialchars($job['name']); ?> - <?php echo time(); ?></title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f7fa; padding: 20px; }
@@ -3247,8 +3259,15 @@ class Application {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Email Extraction System - v<?php echo Config::VERSION; ?></title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+    <!-- AGGRESSIVE CACHE BUSTING - Forces browser to reload everything -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate, max-age=0, post-check=0, pre-check=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="cache-control" content="no-cache, no-store, must-revalidate">
+    <meta name="expires" content="0">
+    <meta name="pragma" content="no-cache">
+    <title>Email Extraction System - v<?php echo APP_VERSION; ?> Build <?php echo time(); ?></title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js?v=<?php echo time(); ?>"></script>
     <style>
         * {
             margin: 0;
@@ -3983,7 +4002,8 @@ class Application {
     <div class="container">
         <div class="sidebar">
             <h1>📧 Email Extractor</h1>
-            <div class="version">Version <?php echo APP_VERSION; ?> - REAL SCRAPING ONLY</div>
+            <div class="version">Version <?php echo APP_VERSION; ?> - Build <?php echo date('H:i:s', time()); ?></div>
+            <div style="font-size: 10px; color: #666; margin-top: 5px;">🔄 Cache-Buster: Active</div>
             
             <?php 
             $db = Database::getInstance();
@@ -4702,6 +4722,40 @@ class Application {
                 }
             }
         }
+        
+        // AGGRESSIVE CACHE BUSTING - Force reload if cached
+        (function() {
+            const cacheBuster = '<?php echo time(); ?>';
+            const storedVersion = localStorage.getItem('app_cache_buster');
+            
+            // Always clear localStorage on load to prevent stale data
+            if (performance.navigation.type === 1) {
+                // Page was refreshed
+                localStorage.clear();
+                sessionStorage.clear();
+            }
+            
+            // Store current version
+            localStorage.setItem('app_cache_buster', cacheBuster);
+            
+            // Prevent back/forward cache (bfcache)
+            window.onpageshow = function(event) {
+                if (event.persisted) {
+                    window.location.reload(true);
+                }
+            };
+            
+            // Force reload on visibility change if tab was hidden
+            document.addEventListener('visibilitychange', function() {
+                if (!document.hidden) {
+                    // Clear any cached data when tab becomes visible
+                    sessionStorage.clear();
+                }
+            });
+            
+            console.log('🔄 Cache Buster Active: ' + cacheBuster);
+            console.log('✅ VERSION: <?php echo APP_VERSION; ?>');
+        })();
         
         // Auto-refresh every 2 seconds for real-time updates (like SendGrid)
         setInterval(() => {
