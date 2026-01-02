@@ -15,8 +15,12 @@
  * - Zombie worker detection and memory leak tracking
  * 
  * @author Email Extraction System
- * @version 1.0.0
+ * @version 2.0.0-REAL-SCRAPING
  */
+ 
+// VERSION CHECK - This ensures no old fake-email code is running
+define('APP_VERSION', '2.0.0-REAL-SCRAPING');
+define('NO_FAKE_EMAILS', true);
 
 // Prevent direct execution in production without proper setup
 error_reporting(0); // Disable in production
@@ -1317,15 +1321,34 @@ while ((time() - \$startTime) < \$maxRunTime) {
     
     \$url = array_shift(\$urlsToProcess);
     
+    // LOG: Processing REAL URL from Serper API
+    echo json_encode([
+        'type' => 'scraping_url',
+        'worker_id' => \$workerId,
+        'url' => \$url,
+        'version' => APP_VERSION
+    ]) . "\\n";
+    flush();
+    
     // Fetch and parse the URL content
     \$content = fetchUrlContent(\$url);
     if (\$content === false) {
+        echo json_encode(['type' => 'url_fetch_failed', 'worker_id' => \$workerId, 'url' => \$url]) . "\\n";
+        flush();
         continue; // Skip failed URLs quickly
     }
     
     // Extract emails from the page content
     \$extractedEmails = extractEmailsFromContent(\$content);
     \$foundCount = 0;
+    
+    echo json_encode([
+        'type' => 'extraction_attempt',
+        'worker_id' => \$workerId,
+        'url' => \$url,
+        'found_count' => count(\$extractedEmails)
+    ]) . "\\n";
+    flush();
     
     foreach (\$extractedEmails as \$email) {
         // Deduplicate using memory cache only (much faster)
@@ -1358,6 +1381,22 @@ while ((time() - \$startTime) < \$maxRunTime) {
             'confidence' => 0.85,
             'worker_id' => \$workerId
         ];
+        
+        // SECURITY CHECK: Prevent any fake emails from being saved
+        // If URL contains test/fake markers, reject immediately
+        if (strpos(\$url, 'pending.local') !== false || 
+            strpos(\$url, 'test.local') !== false ||
+            strpos(\$url, 'localhost') !== false ||
+            strpos(\$url, 'example.com') !== false) {
+            echo json_encode([
+                'type' => 'error',
+                'worker_id' => \$workerId,
+                'message' => 'FAKE URL DETECTED - Using old cached code! Please refresh browser and restart workers.',
+                'url' => \$url
+            ]) . "\\n";
+            flush();
+            continue; // Skip this email
+        }
         
         // Save strategy depends on storage mode
         if (\$pdo) {
@@ -3944,7 +3983,7 @@ class Application {
     <div class="container">
         <div class="sidebar">
             <h1>📧 Email Extractor</h1>
-            <div class="version">Version <?php echo Config::VERSION; ?></div>
+            <div class="version">Version <?php echo APP_VERSION; ?> - REAL SCRAPING ONLY</div>
             
             <?php 
             $db = Database::getInstance();
@@ -3954,6 +3993,20 @@ class Application {
             <?php if (!$dbConfigured): ?>
                 <div style="background: #fff3cd; border: 1px solid #ffc107; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px;">
                     <strong>⚠️ Database Not Configured</strong><br>
+                    Please run <a href="install.php" style="color: #007bff;">install.php</a> to set up MySQL database for persistent email storage.
+                </div>
+            <?php endif; ?>
+            
+            <div style="background: #d1ecf1; border: 1px solid #0c5460; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px; color: #0c5460;">
+                <strong>✅ VERSION <?php echo APP_VERSION; ?> - Real Web Scraping Active</strong><br>
+                If you see fake emails (jane.smith, sarah.miller) or placeholder URLs (search-result-pending.local), please:
+                <ol style="margin: 10px 0 0 20px;">
+                    <li><strong>Hard refresh</strong> your browser (Ctrl+Shift+R or Cmd+Shift+R)</li>
+                    <li><strong>Stop all running jobs</strong> and restart them</li>
+                    <li>Ensure you have entered a valid <strong>Serper API Key</strong></li>
+                    <li>Check browser console for any JavaScript errors</li>
+                </ol>
+            </div>
                     <p style="margin-top: 8px; color: #856404;">
                         Please run <a href="install.php" style="color: #0066ff; text-decoration: underline;">install.php</a> to set up MySQL database for persistent email storage.
                     </p>
