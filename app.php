@@ -2849,6 +2849,7 @@ class Application {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email Extraction System - v<?php echo Config::VERSION; ?></title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
     <style>
         * {
             margin: 0;
@@ -2998,6 +2999,138 @@ class Application {
         .stats-value {
             font-weight: 600;
             color: #0066ff;
+        }
+        
+        .create-job-panel {
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 8px;
+            padding: 25px;
+            margin-bottom: 30px;
+        }
+        
+        .create-job-panel h3 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            color: #1a1a1a;
+        }
+        
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        
+        .form-grid .form-group {
+            margin-bottom: 0;
+        }
+        
+        .form-actions {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .chart-container {
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .chart-container h3 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #1a1a1a;
+        }
+        
+        .chart-wrapper {
+            position: relative;
+            height: 300px;
+        }
+        
+        .download-menu {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .download-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .download-btn:hover {
+            background: #218838;
+        }
+        
+        .download-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            right: 0;
+            margin-top: 5px;
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+            min-width: 220px;
+        }
+        
+        .download-dropdown.show {
+            display: block;
+        }
+        
+        .download-dropdown a {
+            display: block;
+            padding: 10px 15px;
+            color: #1a1a1a;
+            text-decoration: none;
+            font-size: 13px;
+            transition: background 0.2s;
+        }
+        
+        .download-dropdown a:hover {
+            background: #f6f8fa;
+        }
+        
+        .download-dropdown a:first-child {
+            border-radius: 6px 6px 0 0;
+        }
+        
+        .download-dropdown a:last-child {
+            border-radius: 0 0 6px 6px;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                position: relative;
+                width: 100%;
+                height: auto;
+                border-right: none;
+                border-bottom: 1px solid #e1e4e8;
+            }
+            
+            .main-content {
+                margin-left: 0;
+            }
+            
+            .form-grid {
+                grid-template-columns: 1fr;
+            }
         }
         
         .main-content {
@@ -3445,148 +3578,99 @@ class Application {
                 <button id="testConnectionBtn" class="btn btn-secondary">Test Connection</button>
                 <div id="connectionStatus" style="margin-top: 10px; display: none;"></div>
             </div>
-            
-            <div class="sidebar-section">
-                <h3>Create New Job</h3>
-                <form id="createJobForm">
-                    <div class="form-group">
-                        <label for="jobName">Job Name</label>
-                        <input type="text" id="jobName" name="name" placeholder="My Email Extraction Job" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="query">Main Search Query</label>
-                        <input type="text" id="query" name="query" placeholder="e.g., real estate agents" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="keywords">Additional Keywords (one per line)</label>
-                        <textarea id="keywords" name="keywords" placeholder="california&#10;los angeles&#10;san francisco" rows="4"></textarea>
-                        <small style="color: #666;">Each keyword will be combined with the main query</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="country">Country</label>
-                        <select id="country" name="country">
-                            <option value="">Worldwide (All Countries)</option>
-                            <option value="us">United States</option>
-                            <option value="uk">United Kingdom</option>
-                            <option value="ca">Canada</option>
-                            <option value="au">Australia</option>
-                            <option value="de">Germany</option>
-                            <option value="fr">France</option>
-                            <option value="es">Spain</option>
-                            <option value="it">Italy</option>
-                            <option value="br">Brazil</option>
-                            <option value="mx">Mexico</option>
-                            <option value="in">India</option>
-                            <option value="jp">Japan</option>
-                            <option value="cn">China</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="language">Language</label>
-                        <select id="language" name="language">
-                            <option value="en">English</option>
-                            <option value="es">Spanish</option>
-                            <option value="fr">French</option>
-                            <option value="de">German</option>
-                            <option value="it">Italian</option>
-                            <option value="pt">Portuguese</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email Types (Select Multiple)</label>
-                        <div style="padding: 10px; border: 1px solid #d1d5da; border-radius: 6px; background: #f6f8fa;">
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="gmail" style="margin-right: 8px; width: auto;">
-                                    Gmail
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="yahoo" style="margin-right: 8px; width: auto;">
-                                    Yahoo
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="att" style="margin-right: 8px; width: auto;">
-                                    AT&T
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="sbcglobal" style="margin-right: 8px; width: auto;">
-                                    SBCGlobal
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="bellsouth" style="margin-right: 8px; width: auto;">
-                                    BellSouth
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="aol" style="margin-right: 8px; width: auto;">
-                                    AOL
-                                </label>
-                            </div>
-                            <div style="margin-bottom: 8px;">
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="outlook" style="margin-right: 8px; width: auto;">
-                                    Outlook/Hotmail
-                                </label>
-                            </div>
-                            <div>
-                                <label style="display: flex; align-items: center; font-weight: normal; cursor: pointer;">
-                                    <input type="checkbox" name="email_types[]" value="business" style="margin-right: 8px; width: auto;">
-                                    Business Domains
-                                </label>
-                            </div>
-                        </div>
-                        <small style="color: #666;">Select one or more email types. Leave unchecked for all types.</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="customDomains">Custom Domains (Optional)</label>
-                        <textarea id="customDomains" name="custom_domains" placeholder="example.com&#10;company.net&#10;business.org" rows="3"></textarea>
-                        <small style="color: #666;">Enter custom domains to extract (one per line)</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="targetEmails">Target Emails</label>
-                        <input type="number" id="targetEmails" name="target_emails" value="10000" min="100" max="1000000" step="100">
-                        <small style="color: #666;">Goal for completion progress (100 - 1,000,000)</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="maxWorkers">Max Workers</label>
-                        <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="200">
-                        <small style="color: #666;">Parallel workers (1-200, optimized for performance)</small>
-                    </div>
-                    
-                    <button type="submit" class="btn">Create Job</button>
-                </form>
-            </div>
         </div>
         
         <div class="main-content">
             <div class="header">
-                <h2>Job Dashboard</h2>
-                <p>Real-time monitoring and management of email extraction jobs</p>
+                <h2>Email Extraction Dashboard</h2>
+                <p>Create jobs and monitor email extraction in real-time</p>
             </div>
             
             <div id="alertContainer"></div>
             
-            <div id="jobContainer" class="job-grid">
-                <div class="empty-state">
-                    <h3>No Jobs Yet</h3>
-                    <p>Create your first job using the form on the left</p>
+            <!-- Create Job Panel (TOP) -->
+            <div class="create-job-panel">
+                <h3>🚀 Create New Job</h3>
+                <form id="createJobForm">
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="jobName">Job Name *</label>
+                            <input type="text" id="jobName" name="name" placeholder="My Email Extraction Job" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="query">Main Search Query *</label>
+                            <input type="text" id="query" name="query" placeholder="e.g., real estate agents" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="keywords">Keywords (one per line)</label>
+                            <textarea id="keywords" name="keywords" placeholder="california&#10;los angeles" rows="3"></textarea>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="emailTypes">Email Type</label>
+                            <select id="emailTypes" name="email_types" multiple style="height: 60px;">
+                                <option value="gmail">Gmail</option>
+                                <option value="yahoo">Yahoo</option>
+                                <option value="outlook">Outlook/Hotmail</option>
+                                <option value="att">AT&T</option>
+                                <option value="sbcglobal">SBCGlobal</option>
+                                <option value="bellsouth">BellSouth</option>
+                                <option value="aol">AOL</option>
+                                <option value="business">Business Domains</option>
+                            </select>
+                            <small style="color: #666;">Hold Ctrl/Cmd to select multiple</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="country">Location</label>
+                            <select id="country" name="country">
+                                <option value="">Worldwide</option>
+                                <option value="us">United States</option>
+                                <option value="uk">United Kingdom</option>
+                                <option value="ca">Canada</option>
+                                <option value="au">Australia</option>
+                                <option value="de">Germany</option>
+                                <option value="fr">France</option>
+                                <option value="es">Spain</option>
+                                <option value="it">Italy</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="maxWorkers">Requested Workers</label>
+                            <input type="number" id="maxWorkers" name="max_workers" value="10" min="1" max="200">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="targetEmails">Target Emails</label>
+                            <input type="number" id="targetEmails" name="target_emails" value="10000" min="100" max="1000000" step="100">
+                        </div>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button type="submit" class="btn">Create Job</button>
+                    </div>
+                </form>
+            </div>
+            
+            <!-- Email Rate Chart -->
+            <div class="chart-container" style="display: none;" id="chartContainer">
+                <h3>📈 Emails Processed Per Minute</h3>
+                <div class="chart-wrapper">
+                    <canvas id="emailRateChart"></canvas>
+                </div>
+            </div>
+            
+            <!-- Multi Jobs Dashboard (BELOW) -->
+            <div>
+                <h3 style="margin-bottom: 20px; font-size: 20px;">Active Jobs</h3>
+                <div id="jobContainer" class="job-grid">
+                    <div class="empty-state">
+                        <h3>No Jobs Yet</h3>
+                        <p>Create your first job using the form above</p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -3774,14 +3858,25 @@ class Application {
                         <div class="job-actions">
                             ${job.status === 'running' ? `
                                 <button onclick="JobController.stopJob('${job.id}')" class="danger">Stop</button>
-                            ` : job.status === 'completed' ? `
-                                <button onclick="JobController.deleteJob('${job.id}')" class="danger" style="width: 100%;">Delete</button>
                             ` : job.status === 'error' ? `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Retry</button>
-                            ` : `
+                            ` : job.status === 'stopped' || job.status === 'created' ? `
                                 <button onclick="JobController.startJob('${job.id}')" class="primary">Start</button>
-                            `}
-                            ${job.status !== 'completed' ? `
+                            ` : ''}
+                            
+                            ${acceptedEmails > 0 ? `
+                                <div class="download-menu">
+                                    <button class="download-btn" onclick="toggleDownload('${job.id}')">📥 Download</button>
+                                    <div class="download-dropdown" id="download-${job.id}">
+                                        <a href="?mode=download_emails&job_id=${job.id}">Download Emails</a>
+                                        <a href="?mode=download_emails_with_urls&job_id=${job.id}">Download Emails with URLs</a>
+                                        <a href="?mode=download_urls_with_emails&job_id=${job.id}">Download URLs with Emails</a>
+                                        <a href="?mode=download_urls_without_emails&job_id=${job.id}">Download URLs without Emails</a>
+                                    </div>
+                                </div>
+                            ` : ''}
+                            
+                            ${job.status === 'completed' || job.status === 'stopped' ? `
                                 <button onclick="JobController.deleteJob('${job.id}')" class="danger">Delete</button>
                             ` : ''}
                         </div>
@@ -3960,14 +4055,17 @@ class Application {
             
             const apiKey = document.getElementById('apiKey').value;
             
-            // Save API key to localStorage
-            if (apiKey) {
-                localStorage.setItem('serper_api_key', apiKey);
+            if (!apiKey) {
+                UI.showAlert('Please enter your Serper API key first', 'error');
+                return;
             }
             
-            // Collect selected email types from checkboxes
-            const emailTypeCheckboxes = document.querySelectorAll('input[name="email_types[]"]:checked');
-            const selectedEmailTypes = Array.from(emailTypeCheckboxes).map(cb => cb.value);
+            // Save API key to localStorage
+            localStorage.setItem('serper_api_key', apiKey);
+            
+            // Collect selected email types from multi-select
+            const emailTypeSelect = document.getElementById('emailTypes');
+            const selectedEmailTypes = Array.from(emailTypeSelect.selectedOptions).map(opt => opt.value);
             
             const formData = {
                 name: document.getElementById('jobName').value,
@@ -3975,9 +4073,8 @@ class Application {
                 query: document.getElementById('query').value,
                 keywords: document.getElementById('keywords').value,
                 country: document.getElementById('country').value,
-                language: document.getElementById('language').value,
-                email_types: selectedEmailTypes.join(','), // Join as comma-separated string
-                custom_domains: document.getElementById('customDomains').value,
+                language: 'en',
+                email_types: selectedEmailTypes.join(','),
                 target_emails: document.getElementById('targetEmails').value,
                 max_workers: document.getElementById('maxWorkers').value
             };
@@ -3985,11 +4082,102 @@ class Application {
             await JobController.createJob(formData);
         });
         
+        // Download dropdown toggle
+        window.toggleDownload = function(jobId) {
+            const dropdown = document.getElementById('download-' + jobId);
+            dropdown.classList.toggle('show');
+            
+            // Close when clicking outside
+            setTimeout(() => {
+                document.addEventListener('click', function closeDropdown(e) {
+                    if (!e.target.closest('.download-menu')) {
+                        dropdown.classList.remove('show');
+                        document.removeEventListener('click', closeDropdown);
+                    }
+                });
+            }, 10);
+        };
+        
+        // Chart.js initialization
+        let emailRateChart = null;
+        let chartData = {
+            labels: [],
+            datasets: [{
+                label: 'Emails/Minute',
+                data: [],
+                borderColor: '#0066ff',
+                backgroundColor: 'rgba(0, 102, 255, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        };
+        
+        async function updateChart() {
+            const jobs = await API.get('get_jobs');
+            if (!jobs.success || jobs.jobs.length === 0) {
+                document.getElementById('chartContainer').style.display = 'none';
+                return;
+            }
+            
+            // Find first running job
+            const runningJob = jobs.jobs.find(j => j.status === 'running');
+            if (!runningJob) {
+                document.getElementById('chartContainer').style.display = 'none';
+                return;
+            }
+            
+            // Show chart container
+            document.getElementById('chartContainer').style.display = 'block';
+            
+            // Get email rate data
+            const rateData = await API.get('get_email_rate', { job_id: runningJob.id });
+            if (rateData.success && rateData.emails_per_minute.length > 0) {
+                chartData.labels = rateData.emails_per_minute.map(d => {
+                    const date = new Date(d.timestamp * 1000);
+                    return date.toLocaleTimeString();
+                });
+                chartData.datasets[0].data = rateData.emails_per_minute.map(d => d.count);
+                
+                if (!emailRateChart) {
+                    const ctx = document.getElementById('emailRateChart').getContext('2d');
+                    emailRateChart = new Chart(ctx, {
+                        type: 'line',
+                        data: chartData,
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    display: true,
+                                    position: 'top'
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    beginAtZero: true,
+                                    ticks: {
+                                        precision: 0
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    emailRateChart.data = chartData;
+                    emailRateChart.update();
+                }
+            }
+        }
+        
         // Auto-refresh every 5 seconds
-        setInterval(() => JobController.refreshJobs(), 5000);
+        setInterval(() => {
+            JobController.refreshJobs();
+            updateChart();
+        }, 5000);
         
         // Initial load
         JobController.refreshJobs();
+        updateChart();
     </script>
 </body>
 </html>
