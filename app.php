@@ -1683,37 +1683,21 @@ PHP;
             return 0;
         }
         
-        // Calculate batches
-        $batchSize = Config::WORKER_SPAWN_BATCH_SIZE;
-        $totalBatches = ceil($actualCount / $batchSize);
+        // Spawn all workers immediately in parallel - no batching delays
+        Utils::logMessage('INFO', "Starting parallel spawn: {$actualCount} workers");
         
-        Utils::logMessage('INFO', "Starting batch spawn: {$actualCount} workers in {$totalBatches} batches");
-        
-        for ($batchNum = 0; $batchNum < $totalBatches; $batchNum++) {
-            $workersInThisBatch = min($batchSize, $actualCount - $spawned);
-            
-            for ($i = 0; $i < $workersInThisBatch; $i++) {
-                $workerId = Utils::generateId('worker_');
-                try {
-                    $this->spawnWorker($workerId, $config);
-                    $spawned++;
-                } catch (Exception $e) {
-                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
-                    Utils::logMessage('ERROR', $errorMsg);
-                }
-            }
-            
-            // Sleep between batches to avoid CPU spikes, but not after the last batch
-            if ($batchNum < $totalBatches - 1) {
-                $completedBatch = $batchNum + 1;
-                $nextBatch = $completedBatch + 1;
-                $delay = Config::WORKER_SPAWN_BATCH_DELAY;
-                Utils::logMessage('DEBUG', sprintf("Completed batch %d/%d, sleeping for %d second(s) before starting batch %d", $completedBatch, $totalBatches, $delay, $nextBatch));
-                sleep(Config::WORKER_SPAWN_BATCH_DELAY);
+        for ($i = 0; $i < $actualCount; $i++) {
+            $workerId = Utils::generateId('worker_');
+            try {
+                $this->spawnWorker($workerId, $config);
+                $spawned++;
+            } catch (Exception $e) {
+                $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
+                Utils::logMessage('ERROR', $errorMsg);
             }
         }
         
-        Utils::logMessage('INFO', "Batch spawn complete: {$spawned} workers spawned");
+        Utils::logMessage('INFO', "Parallel spawn complete: {$spawned} workers spawned instantly");
         
         return $spawned;
     }
@@ -4989,10 +4973,10 @@ if (php_sapi_name() === 'cli') {
     while (true) {
         try {
             $app->runBackgroundTasks();
-            sleep(5); // Check every 5 seconds
+            sleep(1); // Check every 1 second for maximum responsiveness
         } catch (Exception $e) {
             Utils::logMessage('ERROR', "Application error: {$e->getMessage()}");
-            sleep(10); // Wait before retry
+            sleep(2); // Wait before retry
         }
     }
 } else {
