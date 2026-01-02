@@ -1058,21 +1058,26 @@ function saveBatchToJSON(\$emailFile, \$emailBatch) {
     
     // Read existing data
     \$existingData = [];
+    \$existingEmailsHash = []; // Use hash map for O(1) lookups
     if (file_exists(\$emailFile)) {
         \$content = file_get_contents(\$emailFile);
         \$json = json_decode(\$content, true);
         if (\$json && isset(\$json['emails'])) {
             \$existingData = \$json['emails'];
+            // Build hash map of existing emails for fast lookup
+            foreach (\$existingData as \$item) {
+                \$existingEmailsHash[strtolower(\$item['email'])] = true;
+            }
         }
     }
     
-    // Merge new emails (with deduplication)
-    \$existingEmails = array_column(\$existingData, 'email');
+    // Merge new emails (with deduplication using hash map - O(1))
     \$saved = 0;
     foreach (\$emailBatch as \$emailData) {
-        if (!in_array(\$emailData['email'], \$existingEmails)) {
+        \$emailLower = strtolower(\$emailData['email']);
+        if (!isset(\$existingEmailsHash[\$emailLower])) {
             \$existingData[] = \$emailData;
-            \$existingEmails[] = \$emailData['email'];
+            \$existingEmailsHash[\$emailLower] = true;
             \$saved++;
         }
     }
@@ -1082,6 +1087,26 @@ function saveBatchToJSON(\$emailFile, \$emailBatch) {
     file_put_contents(\$emailFile, json_encode(\$data, JSON_PRETTY_PRINT));
     
     return \$saved;
+}
+
+// Get email count from JSON file when DB not available
+function getCurrentEmailCountFromFile(\$emailFile) {
+    if (!file_exists(\$emailFile)) {
+        return 0;
+    }
+    
+    \$content = file_get_contents(\$emailFile);
+    \$json = json_decode(\$content, true);
+    
+    if (\$json && isset(\$json['count'])) {
+        return (int)\$json['count'];
+    }
+    
+    if (\$json && isset(\$json['emails'])) {
+        return count(\$json['emails']);
+    }
+    
+    return 0;
 }
 
 // Extraction work with REAL email scraping - OPTIMIZED
@@ -1116,13 +1141,23 @@ if (empty(\$queryList)) {
 
 while ((time() - \$startTime) < \$maxRunTime) {
     // Check target limit periodically (every 10 seconds) instead of every iteration
-    if (\$pdo && (time() - \$lastCountCheck) >= 10) {
-        \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+    if ((time() - \$lastCountCheck) >= 10) {
+        if (\$pdo) {
+            \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
+        } else {
+            // Check file count when DB not available
+            \$currentTotal = getCurrentEmailCountFromFile(\$emailFile);
+        }
         \$lastCountCheck = time();
+        
         if (\$currentTotal >= \$maxEmails) {
             // Save any remaining emails in batch
             if (!empty(\$emailBatch)) {
-                saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+                if (\$pdo) {
+                    saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
+                } else {
+                    saveBatchToJSON(\$emailFile, \$emailBatch);
+                }
             }
             echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
             break;
