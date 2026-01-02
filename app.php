@@ -1053,6 +1053,82 @@ function saveBatchToDB(\$pdo, \$jobId, \$emailBatch) {
 }
 
 // Fast JSON batch save for when database is not available
+// Fast JSON immediate save for real-time persistence
+function saveEmailToJSONImmediately(\$emailFile, \$emailData) {
+    // Lock file for concurrent writes
+    \$lockFile = \$emailFile . '.lock';
+    \$fp = fopen(\$lockFile, 'w');
+    if (!flock(\$fp, LOCK_EX)) {
+        fclose(\$fp);
+        return false;
+    }
+    
+    // Read existing data
+    \$existingData = ['emails' => [], 'count' => 0, 'processed_urls' => []];
+    if (file_exists(\$emailFile)) {
+        \$content = file_get_contents(\$emailFile);
+        \$json = json_decode(\$content, true);
+        if (\$json) {
+            \$existingData = \$json;
+        }
+    }
+    
+    // Check duplicate using hash (fast)
+    \$emailLower = strtolower(\$emailData['email']);
+    \$emailHash = md5(\$emailLower);
+    
+    \$isDuplicate = false;
+    if (isset(\$existingData['email_hashes'])) {
+        \$isDuplicate = isset(\$existingData['email_hashes'][\$emailHash]);
+    } else {
+        \$existingData['email_hashes'] = [];
+    }
+    
+    if (!\$isDuplicate) {
+        // Add email
+        \$existingData['emails'][] = \$emailData;
+        \$existingData['email_hashes'][\$emailHash] = true;
+        \$existingData['count'] = count(\$existingData['emails']);
+        
+        // Track processed URL for resume capability
+        if (isset(\$emailData['source_url']) && !empty(\$emailData['source_url'])) {
+            if (!isset(\$existingData['processed_urls'])) {
+                \$existingData['processed_urls'] = [];
+            }
+            if (!in_array(\$emailData['source_url'], \$existingData['processed_urls'])) {
+                \$existingData['processed_urls'][] = \$emailData['source_url'];
+            }
+        }
+        
+        // Write immediately
+        file_put_contents(\$emailFile, json_encode(\$existingData, JSON_PRETTY_PRINT));
+        
+        flock(\$fp, LOCK_UN);
+        fclose(\$fp);
+        return true;
+    }
+    
+    flock(\$fp, LOCK_UN);
+    fclose(\$fp);
+    return false;
+}
+
+// Get list of already processed URLs for resume capability
+function getProcessedUrls(\$emailFile) {
+    if (!file_exists(\$emailFile)) {
+        return [];
+    }
+    
+    \$content = file_get_contents(\$emailFile);
+    \$json = json_decode(\$content, true);
+    
+    if (\$json && isset(\$json['processed_urls'])) {
+        return array_flip(\$json['processed_urls']); // Return as hash for O(1) lookup
+    }
+    
+    return [];
+}
+
 function saveBatchToJSON(\$emailFile, \$emailBatch) {
     if (empty(\$emailBatch)) return 0;
     
@@ -1113,13 +1189,15 @@ function getCurrentEmailCountFromFile(\$emailFile) {
 \$startTime = time();
 \$extractedCount = 0;
 \$urlsToProcess = [];
-\$processedUrls = [];
 \$seenEmails = []; // In-memory deduplication cache for this worker
 \$currentQueryIndex = 0;
 \$currentPage = 1;
-\$emailBatch = []; // Batch buffer for database inserts
+\$emailBatch = []; // Batch buffer for database inserts (DB mode)
 \$lastCountCheck = time(); // For periodic count checking
 \$localEmailCount = 0; // Local counter
+
+// Load already processed URLs for resume capability
+\$processedUrls = getProcessedUrls(\$emailFile);
 
 // Build query list: main query + keywords
 \$queryList = [];
@@ -1270,15 +1348,13 @@ while ((time() - \$startTime) < \$maxRunTime) {
             'worker_id' => \$workerId
         ];
         
-        // Add to batch instead of immediate save
-        \$emailBatch[] = \$emailData;
-        \$extractedCount++;
-        \$localEmailCount++;
-        \$foundCount++;
-        
-        // Flush batch when it reaches 100 emails
-        if (count(\$emailBatch) >= 100) {
-            if (\$pdo) {
+        // Save strategy depends on storage mode
+        if (\$pdo) {
+            // Database mode: use batch for performance
+            \$emailBatch[] = \$emailData;
+            
+            // Flush batch when it reaches 100 emails
+            if (count(\$emailBatch) >= 100) {
                 \$saved = saveBatchToDB(\$pdo, \$jobId, \$emailBatch);
                 if (\$saved > 0) {
                     echo json_encode([
@@ -1289,21 +1365,25 @@ while ((time() - \$startTime) < \$maxRunTime) {
                     ]) . "\\n";
                     flush();
                 }
-            } else {
-                // Use fast JSON batch save instead of one-by-one
-                \$saved = saveBatchToJSON(\$emailFile, \$emailBatch);
-                if (\$saved > 0) {
-                    echo json_encode([
-                        'type' => 'batch_saved_json',
-                        'worker_id' => \$workerId,
-                        'count' => \$saved,
-                        'time' => time()
-                    ]) . "\\n";
-                    flush();
-                }
+                \$emailBatch = [];
             }
-            \$emailBatch = [];
+        } else {
+            // JSON mode: save immediately for real-time persistence and resume capability
+            if (saveEmailToJSONImmediately(\$emailFile, \$emailData)) {
+                echo json_encode([
+                    'type' => 'email_saved',
+                    'worker_id' => \$workerId,
+                    'email' => \$email,
+                    'source' => \$url,
+                    'time' => time()
+                ]) . "\\n";
+                flush();
+            }
         }
+        
+        \$extractedCount++;
+        \$localEmailCount++;
+        \$foundCount++;
     }
     
     if (\$foundCount > 0 && \$foundCount % 20 == 0) {
