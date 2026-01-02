@@ -737,6 +737,15 @@ class WorkerGovernor {
         return <<<PHP
 <?php
 // Worker Process - Real Serper API Integration with MySQL
+// Force error output
+error_reporting(E_ALL);
+ini_set('display_errors', '1');
+ini_set('log_errors', '0');
+
+// Immediate output - test if worker even starts
+echo json_encode(['type' => 'worker_start', 'worker_id' => '{$workerIdSafe}', 'pid' => getmypid()]) . "\\n";
+flush();
+
 \$config = json_decode(base64_decode('{$configJson}'), true);
 \$workerId = '{$workerIdSafe}';
 \$jobId = \$config['job_id'];
@@ -761,6 +770,10 @@ class WorkerGovernor {
 
 // Email storage file (fallback)
 \$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
+
+// Test output before functions
+echo json_encode(['type' => 'worker_config_loaded', 'worker_id' => \$workerId, 'has_api_key' => !empty(\$apiKey), 'query' => \$query]) . "\\n";
+flush();
 
 // Helper function to check if email matches selected types
 function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
@@ -1611,11 +1624,26 @@ PHP;
         $now = time();
         
         foreach ($this->workers as $workerId => $worker) {
-            // Read output from worker
+            // Read output from worker stdout
             if (is_resource($worker['pipes'][1])) {
                 $output = stream_get_contents($worker['pipes'][1]);
                 if ($output) {
                     $this->processWorkerOutput($workerId, $output);
+                }
+            }
+            
+            // Read errors from worker stderr
+            if (is_resource($worker['pipes'][2])) {
+                $errors = stream_get_contents($worker['pipes'][2]);
+                if ($errors) {
+                    Utils::logMessage('ERROR', "Worker {$workerId} stderr: " . substr($errors, 0, 500));
+                    // Also try to parse as JSON
+                    $errorLines = explode("\n", trim($errors));
+                    foreach ($errorLines as $line) {
+                        if (!empty($line)) {
+                            Utils::logMessage('ERROR', "Worker {$workerId} error line: {$line}");
+                        }
+                    }
                 }
             }
             
@@ -1648,7 +1676,11 @@ PHP;
             // Log all worker events for debugging
             Utils::logMessage('DEBUG', "Worker {$workerId} event: " . $data['type'], $data);
             
-            if ($data['type'] === 'heartbeat') {
+            if ($data['type'] === 'worker_start') {
+                Utils::logMessage('INFO', "Worker {$workerId} process started with PID: " . ($data['pid'] ?? 'unknown'));
+            } elseif ($data['type'] === 'worker_config_loaded') {
+                Utils::logMessage('INFO', "Worker {$workerId} config loaded - API key: " . ($data['has_api_key'] ? 'YES' : 'NO') . ", Query: " . ($data['query'] ?? 'none'));
+            } elseif ($data['type'] === 'heartbeat') {
                 $this->workers[$workerId]['last_heartbeat'] = time();
             } elseif ($data['type'] === 'emails_found') {
                 // Update job stats by reading email file
