@@ -939,14 +939,73 @@ function searchSerper(\$apiKey, \$query, \$country, \$language, \$page = 1) {
     return [];
 }
 
-// Extraction work with real URLs
+// Email extraction functions
+function extractEmailsFromContent(\$content) {
+    \$pattern = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/';
+    preg_match_all(\$pattern, \$content, \$matches);
+    
+    \$emails = [];
+    foreach (\$matches[0] as \$email) {
+        \$email = trim(\$email, '.,;:()[]{}\"\\' ');
+        if (filter_var(\$email, FILTER_VALIDATE_EMAIL)) {
+            \$emails[] = \$email;
+        }
+    }
+    
+    return array_unique(\$emails);
+}
+
+function fetchUrlContent(\$url) {
+    \$ch = curl_init(\$url);
+    curl_setopt_array(\$ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_TIMEOUT => 10,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    ]);
+    
+    \$content = curl_exec(\$ch);
+    \$httpCode = curl_getinfo(\$ch, CURLINFO_HTTP_CODE);
+    curl_close(\$ch);
+    
+    return (\$httpCode >= 200 && \$httpCode < 300) ? \$content : false;
+}
+
+function getEmailQuality(\$email, \$content) {
+    \$score = 0.5;
+    
+    // Check if found in contact page
+    if (stripos(\$content, 'contact') !== false) {
+        \$score += 0.15;
+    }
+    
+    // Check for mailto link
+    if (stripos(\$content, 'mailto:' . \$email) !== false) {
+        \$score += 0.2;
+    }
+    
+    // Check domain reputation
+    \$domain = explode('@', \$email)[1] ?? '';
+    \$knownDomains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
+    if (in_array(strtolower(\$domain), \$knownDomains)) {
+        \$score += 0.15;
+    }
+    
+    if (\$score >= 0.75) return 'high';
+    if (\$score >= 0.55) return 'medium';
+    return 'low';
+}
+
+// Extraction work with REAL email scraping
 \$startTime = time();
 \$extractedCount = 0;
-\$urlCache = [];
-\$currentPage = 1;
+\$urlsToProcess = [];
+\$processedUrls = [];
 \$seenEmails = []; // In-memory deduplication cache for this worker
-\$noResultsCount = 0; // Track consecutive failed queries
-\$currentQueryIndex = 0; // Track which query/keyword we're using
+\$currentQueryIndex = 0;
+\$currentPage = 1;
 
 // Build query list: main query + keywords
 \$queryList = [];
@@ -956,34 +1015,23 @@ if (!empty(\$query)) {
 if (!empty(\$keywords)) {
     foreach (\$keywords as \$keyword) {
         if (!empty(\$keyword)) {
-            // Combine main query with keyword if both exist
-            if (!empty(\$query)) {
-                \$queryList[] = \$query . ' ' . \$keyword;
-            } else {
-                \$queryList[] = \$keyword;
-            }
+            \$queryList[] = !empty(\$query) ? \$query . ' ' . \$keyword : \$keyword;
         }
     }
 }
-// If no queries at all, use main query as fallback
-if (empty(\$queryList) && !empty(\$query)) {
+if (empty(\$queryList)) {
     \$queryList[] = \$query;
 }
 
-\$activeQuery = !empty(\$queryList) ? \$queryList[\$currentQueryIndex % count(\$queryList)] : \$query;
-
-// Common domains for test emails - expanded to match all types
-\$domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'att.net', 'sbcglobal.net', 
-            'bellsouth.net', 'aol.com', 'business.com', 'company.net', 'corp.com'];
-\$qualities = ['high', 'medium', 'low'];
+\$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
 
 while ((time() - \$startTime) < \$maxRunTime) {
-    // Check if we've reached the target email count across all workers
+    // Check if we've reached the target email count
     if (\$pdo) {
         \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
         if (\$currentTotal >= \$maxEmails) {
             echo json_encode(['type' => 'target_reached', 'worker_id' => \$workerId, 'total' => \$currentTotal]) . "\\n";
-            break; // Stop this worker, target reached
+            break;
         }
     }
     
@@ -991,115 +1039,88 @@ while ((time() - \$startTime) < \$maxRunTime) {
     echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
     flush();
     
-    // Fetch real URLs from Serper API if cache is empty or needs refresh
-    // Iterate through pages up to maxPages
-    if ((empty(\$urlCache) || count(\$urlCache) < 5) && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
+    // Fetch URLs from Serper API if we need more
+    if (count(\$urlsToProcess) < 10 && !empty(\$apiKey) && \$currentPage <= \$maxPages) {
         \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
         if (!empty(\$results)) {
-            \$noResultsCount = 0; // Reset no results counter
             foreach (\$results as \$result) {
-                if (isset(\$result['link'])) {
-                    \$urlCache[] = \$result['link'];
+                if (isset(\$result['link']) && !in_array(\$result['link'], \$processedUrls)) {
+                    \$urlsToProcess[] = \$result['link'];
                 }
             }
-            \$currentPage++; // Move to next page
+            \$currentPage++;
         } else {
-            // No results found for this query
-            \$noResultsCount++;
-            echo json_encode(['type' => 'no_results', 'worker_id' => \$workerId, 'query' => \$activeQuery, 'page' => \$currentPage]) . "\\n";
-            
-            // If no results for 2 consecutive attempts, switch to next query
-            if (\$noResultsCount >= 2 && !empty(\$queryList) && count(\$queryList) > 1) {
+            // Switch to next query if available
+            if (count(\$queryList) > 1) {
                 \$currentQueryIndex++;
                 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
-                \$currentPage = 1; // Reset to page 1 for new query
-                \$noResultsCount = 0;
-                echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
-            } else {
-                // Reset to page 1 for same query
                 \$currentPage = 1;
+                echo json_encode(['type' => 'query_switch', 'worker_id' => \$workerId, 'new_query' => \$activeQuery]) . "\\n";
             }
         }
     }
     
-    // Delay between extraction cycles
-    sleep(rand(10, 30));
+    // Process URLs and extract REAL emails
+    if (empty(\$urlsToProcess)) {
+        sleep(2); // Short sleep if no URLs to process
+        continue;
+    }
     
-    // Generate realistic emails with real source URLs
-    \$found = rand(3, 8);
-    for (\$i = 0; \$i < \$found; \$i++) {
-        // Check target again before each email
+    \$url = array_shift(\$urlsToProcess);
+    \$processedUrls[] = \$url;
+    
+    // Fetch and parse the URL content
+    \$content = fetchUrlContent(\$url);
+    if (\$content === false) {
+        continue; // Skip failed URLs
+    }
+    
+    // Extract emails from the page content
+    \$extractedEmails = extractEmailsFromContent(\$content);
+    \$foundCount = 0;
+    
+    foreach (\$extractedEmails as \$email) {
+        // Check target limit
         if (\$pdo) {
             \$currentTotal = getCurrentEmailCount(\$pdo, \$jobId);
             if (\$currentTotal >= \$maxEmails) {
-                break 2; // Break out of both loops
+                break 2;
             }
         }
         
-        \$firstName = ['john', 'jane', 'mike', 'sarah', 'david', 'emily', 'robert', 'lisa'][rand(0, 7)];
-        \$lastName = ['smith', 'johnson', 'williams', 'jones', 'brown', 'davis', 'miller', 'wilson'][rand(0, 7)];
-        \$domain = \$domains[rand(0, count(\$domains) - 1)];
-        \$quality = \$qualities[rand(0, 2)];
-        
-        \$email = \$firstName . '.' . \$lastName . rand(1, 999) . '@' . \$domain;
-        
-        // Check for duplicates in memory cache first
+        // Deduplicate
         \$emailLower = strtolower(\$email);
         if (isset(\$seenEmails[\$emailLower])) {
-            continue; // Skip duplicate email (already seen in this worker)
+            continue;
         }
         
-        // Check for duplicates in database if available
         if (\$pdo && isEmailDuplicate(\$pdo, \$jobId, \$email)) {
-            \$seenEmails[\$emailLower] = true; // Cache it to avoid future DB checks
-            continue; // Skip duplicate email (already in database)
+            \$seenEmails[\$emailLower] = true;
+            continue;
         }
         
-        // Filter email by type if specified
+        // Filter by email type
         if (!matchesEmailType(\$email, \$emailTypes, \$customDomains)) {
-            continue; // Skip this email, doesn't match selected types
+            continue;
         }
         
-        // Mark as seen in memory cache
+        // Mark as seen
         \$seenEmails[\$emailLower] = true;
         
-        // Prevent memory overflow (keep only last 10k emails in cache)
+        // Prevent memory overflow
         if (count(\$seenEmails) > 10000) {
             \$seenEmails = array_slice(\$seenEmails, 5000, null, true);
         }
         
-        // Use real URL from cache, prefer actual URLs over fallback
-        if (!empty(\$urlCache)) {
-            \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-        } else {
-            // Try to fetch URLs one more time before using fallback
-            if (!empty(\$apiKey)) {
-                \$results = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
-                if (!empty(\$results)) {
-                    foreach (\$results as \$result) {
-                        if (isset(\$result['link'])) {
-                            \$urlCache[] = \$result['link'];
-                        }
-                    }
-                    if (!empty(\$urlCache)) {
-                        \$sourceUrl = \$urlCache[array_rand(\$urlCache)];
-                    } else {
-                        \$sourceUrl = 'https://search-result-pending.local/query';
-                    }
-                } else {
-                    \$sourceUrl = 'https://search-result-pending.local/query';
-                }
-            } else {
-                \$sourceUrl = 'https://search-result-pending.local/query';
-            }
-        }
+        // Determine email quality
+        \$quality = getEmailQuality(\$email, \$content);
         
         \$emailData = [
             'email' => \$email,
             'quality' => \$quality,
-            'source_url' => \$sourceUrl,
+            'source_url' => \$url,
             'timestamp' => time(),
-            'confidence' => rand(60, 95) / 100,
+            'confidence' => 0.85,
             'worker_id' => \$workerId
         ];
         
@@ -1112,15 +1133,22 @@ while ((time() - \$startTime) < \$maxRunTime) {
             saveEmailToFile(\$emailFile, \$emailData);
         }
         \$extractedCount++;
+        \$foundCount++;
     }
     
-    echo json_encode([
-        'type' => 'emails_found',
-        'worker_id' => \$workerId,
-        'count' => \$found,
-        'time' => time()
-    ]) . "\\n";
-    flush();
+    if (\$foundCount > 0) {
+        echo json_encode([
+            'type' => 'emails_found',
+            'worker_id' => \$workerId,
+            'count' => \$foundCount,
+            'url' => \$url,
+            'time' => time()
+        ]) . "\\n";
+        flush();
+    }
+    
+    // Very short delay between URL processing (optimize for speed)
+    usleep(100000); // 0.1 second
 }
 
 echo json_encode(['type' => 'completed', 'worker_id' => \$workerId, 'total_extracted' => \$extractedCount]) . "\\n";
