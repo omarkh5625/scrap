@@ -1097,19 +1097,23 @@ function saveBatchToJSONOptimized(\$emailFile, \$emailBatch) {
         return 0;
     }
     
-    // Read existing data
-    \$existingData = ['emails' => [], 'count' => 0];
+    // Read existing data or initialize defaults
     if (file_exists(\$emailFile)) {
         \$content = file_get_contents(\$emailFile);
-        \$json = json_decode(\$content, true);
-        if (\$json) {
-            \$existingData = \$json;
+        \$existingData = json_decode(\$content, true);
+        if (!\$existingData) {
+            \$existingData = [];
         }
+    } else {
+        \$existingData = [];
     }
     
-    // Ensure required keys exist
+    // Ensure all required keys exist
     if (!isset(\$existingData['emails'])) {
         \$existingData['emails'] = [];
+    }
+    if (!isset(\$existingData['count'])) {
+        \$existingData['count'] = 0;
     }
     if (!isset(\$existingData['email_hashes'])) {
         \$existingData['email_hashes'] = [];
