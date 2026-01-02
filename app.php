@@ -737,6 +737,15 @@ class WorkerGovernor {
         return <<<PHP
 <?php
 // Worker Process - Real Serper API Integration with MySQL
+// Force error output
+error_reporting(E_ALL);
+ini_set('display_errors', '1');
+ini_set('log_errors', '0');
+
+// Immediate output - test if worker even starts
+echo json_encode(['type' => 'worker_start', 'worker_id' => '{$workerIdSafe}', 'pid' => getmypid()]) . "\\n";
+flush();
+
 \$config = json_decode(base64_decode('{$configJson}'), true);
 \$workerId = '{$workerIdSafe}';
 \$jobId = \$config['job_id'];
@@ -761,6 +770,10 @@ class WorkerGovernor {
 
 // Email storage file (fallback)
 \$emailFile = \$dataDir . "/job_{\$jobId}_emails.json";
+
+// Test output before functions
+echo json_encode(['type' => 'worker_config_loaded', 'worker_id' => \$workerId, 'has_api_key' => !empty(\$apiKey), 'query' => \$query]) . "\\n";
+flush();
 
 // Helper function to check if email matches selected types
 function matchesEmailType(\$email, \$emailTypes, \$customDomains) {
@@ -1229,6 +1242,19 @@ function getCurrentEmailCountFromFile(\$emailFile) {
 \$lastCountCheck = time(); // For periodic count checking
 \$localEmailCount = 0; // Local counter
 
+// Log worker initialization
+echo json_encode([
+    'type' => 'worker_init',
+    'worker_id' => \$workerId,
+    'job_id' => \$jobId,
+    'query' => \$query,
+    'max_emails' => \$maxEmails,
+    'max_run_time' => \$maxRunTime,
+    'has_api_key' => !empty(\$apiKey),
+    'has_db' => \$pdo !== null
+]) . "\\n";
+flush();
+
 // Load already processed URLs for resume capability
 \$processedUrls = getProcessedUrls(\$emailFile);
 
@@ -1249,6 +1275,14 @@ if (empty(\$queryList)) {
 }
 
 \$activeQuery = \$queryList[\$currentQueryIndex % count(\$queryList)];
+
+echo json_encode([
+    'type' => 'worker_ready',
+    'worker_id' => \$workerId,
+    'queries_count' => count(\$queryList),
+    'active_query' => \$activeQuery
+]) . "\\n";
+flush();
 
 while ((time() - \$startTime) < \$maxRunTime) {
     // Check target limit periodically (every 10 seconds) instead of every iteration
@@ -1275,14 +1309,36 @@ while ((time() - \$startTime) < \$maxRunTime) {
         }
     }
     
-    // Output heartbeat less frequently
-    if (\$extractedCount % 50 == 0) {
-        echo json_encode(['type' => 'heartbeat', 'worker_id' => \$workerId, 'time' => time()]) . "\\n";
+    // Output heartbeat regularly with full diagnostics (every 10 seconds for better visibility)
+    static \$lastHeartbeat = 0;
+    if ((time() - \$lastHeartbeat) >= 10 || \$lastHeartbeat == 0) {
+        echo json_encode([
+            'type' => 'heartbeat',
+            'worker_id' => \$workerId,
+            'time' => time(),
+            'extracted' => \$extractedCount,
+            'urls_in_buffer' => count(\$urlsToProcess),
+            'current_page' => \$currentPage,
+            'active_query' => \$activeQuery,
+            'elapsed_time' => time() - \$startTime
+        ]) . "\\n";
         flush();
+        \$lastHeartbeat = time();
     }
     
     // Fetch URLs from Serper API - fetch more at once and keep cycling through queries
     if (count(\$urlsToProcess) < 50 && !empty(\$apiKey)) {
+        // Log that we're attempting to fetch
+        echo json_encode([
+            'type' => 'api_fetch_attempt',
+            'worker_id' => \$workerId,
+            'current_page' => \$currentPage,
+            'max_pages' => \$maxPages,
+            'buffer_size' => count(\$urlsToProcess),
+            'query' => \$activeQuery
+        ]) . "\\n";
+        flush();
+        
         // Try fetching from current page if we haven't exceeded max pages
         if (\$currentPage <= \$maxPages) {
             \$apiResponse = searchSerper(\$apiKey, \$activeQuery, \$country, \$language, \$currentPage);
@@ -1313,14 +1369,15 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 ]) . "\\n";
                 flush();
                 
-                // Wait before retrying to avoid hammering the API
-                sleep(5);
+                // Wait briefly before retrying to avoid hammering the API
+                sleep(1);
                 continue;
             }
             
             \$results = \$apiResponse['results'] ?? [];
             
             if (!empty(\$results)) {
+                \$newUrlCount = 0;
                 foreach (\$results as \$result) {
                     if (isset(\$result['link'])) {
                         \$url = \$result['link'];
@@ -1328,9 +1385,22 @@ while ((time() - \$startTime) < \$maxRunTime) {
                         if (!isset(\$processedUrls[\$url])) {
                             \$urlsToProcess[] = \$url;
                             \$processedUrls[\$url] = true;
+                            \$newUrlCount++;
                         }
                     }
                 }
+                
+                // Log successful URL fetch
+                echo json_encode([
+                    'type' => 'urls_fetched',
+                    'worker_id' => \$workerId,
+                    'count' => \$newUrlCount,
+                    'page' => \$currentPage,
+                    'query' => \$activeQuery,
+                    'buffer_size' => count(\$urlsToProcess)
+                ]) . "\\n";
+                flush();
+                
                 \$currentPage++;
             } else {
                 // No results, try next query immediately
@@ -1363,6 +1433,27 @@ while ((time() - \$startTime) < \$maxRunTime) {
                 \$currentPage = 1;
             }
         }
+    } else {
+        // Log why we're not fetching
+        static \$lastSkipLog = 0;
+        if ((time() - \$lastSkipLog) >= 30) { // Log every 30 seconds
+            if (empty(\$apiKey)) {
+                echo json_encode([
+                    'type' => 'api_fetch_skip',
+                    'worker_id' => \$workerId,
+                    'reason' => 'No API key'
+                ]) . "\\n";
+            } else {
+                echo json_encode([
+                    'type' => 'api_fetch_skip',
+                    'worker_id' => \$workerId,
+                    'reason' => 'Buffer full',
+                    'buffer_size' => count(\$urlsToProcess)
+                ]) . "\\n";
+            }
+            flush();
+            \$lastSkipLog = time();
+        }
     }
     
     // Process URLs and extract REAL emails
@@ -1378,7 +1469,9 @@ while ((time() - \$startTime) < \$maxRunTime) {
             sleep(5); // Wait before checking again
             continue;
         }
-        // Don't sleep, just continue to fetch more URLs
+        // Small delay to prevent CPU spin when waiting for API to fetch URLs
+        // This only happens when buffer is empty and waiting for new URLs
+        usleep(50000); // 0.05 seconds - minimal delay for CPU efficiency
         continue;
     }
     
@@ -1531,11 +1624,26 @@ PHP;
         $now = time();
         
         foreach ($this->workers as $workerId => $worker) {
-            // Read output from worker
+            // Read output from worker stdout
             if (is_resource($worker['pipes'][1])) {
                 $output = stream_get_contents($worker['pipes'][1]);
                 if ($output) {
                     $this->processWorkerOutput($workerId, $output);
+                }
+            }
+            
+            // Read errors from worker stderr
+            if (is_resource($worker['pipes'][2])) {
+                $errors = stream_get_contents($worker['pipes'][2]);
+                if ($errors) {
+                    Utils::logMessage('ERROR', "Worker {$workerId} stderr: " . substr($errors, 0, 500));
+                    // Also try to parse as JSON
+                    $errorLines = explode("\n", trim($errors));
+                    foreach ($errorLines as $line) {
+                        if (!empty($line)) {
+                            Utils::logMessage('ERROR', "Worker {$workerId} error line: {$line}");
+                        }
+                    }
                 }
             }
             
@@ -1559,14 +1667,33 @@ PHP;
             if (empty($line)) continue;
             
             $data = json_decode($line, true);
-            if (!$data) continue;
+            if (!$data) {
+                // Log unparseable output
+                Utils::logMessage('WARNING', "Worker {$workerId} unparseable output: " . substr($line, 0, 100));
+                continue;
+            }
             
-            if ($data['type'] === 'heartbeat') {
+            // Log all worker events for debugging
+            Utils::logMessage('DEBUG', "Worker {$workerId} event: " . $data['type'], $data);
+            
+            if ($data['type'] === 'worker_start') {
+                Utils::logMessage('INFO', "Worker {$workerId} process started with PID: " . ($data['pid'] ?? 'unknown'));
+            } elseif ($data['type'] === 'worker_config_loaded') {
+                Utils::logMessage('INFO', "Worker {$workerId} config loaded - API key: " . ($data['has_api_key'] ? 'YES' : 'NO') . ", Query: " . ($data['query'] ?? 'none'));
+            } elseif ($data['type'] === 'heartbeat') {
                 $this->workers[$workerId]['last_heartbeat'] = time();
             } elseif ($data['type'] === 'emails_found') {
                 // Update job stats by reading email file
                 $this->updateJobStatsFromFile();
                 Utils::logMessage('INFO', "Worker {$workerId} found {$data['count']} emails");
+            } elseif ($data['type'] === 'error' || $data['type'] === 'serper_api_error') {
+                // Log errors from workers
+                $errorMsg = $data['message'] ?? 'Unknown error';
+                Utils::logMessage('ERROR', "Worker {$workerId} error: {$errorMsg}", $data);
+            } elseif ($data['type'] === 'worker_init') {
+                Utils::logMessage('INFO', "Worker {$workerId} initialized for job {$this->jobId}");
+            } elseif ($data['type'] === 'urls_fetched') {
+                Utils::logMessage('DEBUG', "Worker {$workerId} fetched {$data['count']} URLs (page {$data['page']})");
             }
         }
     }
@@ -1622,37 +1749,21 @@ PHP;
             return 0;
         }
         
-        // Calculate batches
-        $batchSize = Config::WORKER_SPAWN_BATCH_SIZE;
-        $totalBatches = ceil($actualCount / $batchSize);
+        // Spawn all workers immediately in parallel - no batching delays
+        Utils::logMessage('INFO', "Starting parallel spawn: {$actualCount} workers");
         
-        Utils::logMessage('INFO', "Starting batch spawn: {$actualCount} workers in {$totalBatches} batches");
-        
-        for ($batchNum = 0; $batchNum < $totalBatches; $batchNum++) {
-            $workersInThisBatch = min($batchSize, $actualCount - $spawned);
-            
-            for ($i = 0; $i < $workersInThisBatch; $i++) {
-                $workerId = Utils::generateId('worker_');
-                try {
-                    $this->spawnWorker($workerId, $config);
-                    $spawned++;
-                } catch (Exception $e) {
-                    $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
-                    Utils::logMessage('ERROR', $errorMsg);
-                }
-            }
-            
-            // Sleep between batches to avoid CPU spikes, but not after the last batch
-            if ($batchNum < $totalBatches - 1) {
-                $completedBatch = $batchNum + 1;
-                $nextBatch = $completedBatch + 1;
-                $delay = Config::WORKER_SPAWN_BATCH_DELAY;
-                Utils::logMessage('DEBUG', sprintf("Completed batch %d/%d, sleeping for %d second(s) before starting batch %d", $completedBatch, $totalBatches, $delay, $nextBatch));
-                sleep(Config::WORKER_SPAWN_BATCH_DELAY);
+        for ($i = 0; $i < $actualCount; $i++) {
+            $workerId = Utils::generateId('worker_');
+            try {
+                $this->spawnWorker($workerId, $config);
+                $spawned++;
+            } catch (Exception $e) {
+                $errorMsg = "Failed to spawn worker {$workerId}: {$e->getMessage()}";
+                Utils::logMessage('ERROR', $errorMsg);
             }
         }
         
-        Utils::logMessage('INFO', "Batch spawn complete: {$spawned} workers spawned");
+        Utils::logMessage('INFO', "Parallel spawn complete: {$spawned} workers spawned instantly");
         
         return $spawned;
     }
@@ -2171,6 +2282,78 @@ class JobManager {
         }
     }
     
+    public function verifyExtraction($jobId) {
+        // Verification function to check if extraction is actually happening
+        if (!isset($this->jobs[$jobId])) {
+            return ['status' => 'error', 'message' => 'Job not found'];
+        }
+        
+        $job = $this->jobs[$jobId];
+        $issues = [];
+        $info = [];
+        
+        // Check 1: Worker status
+        if ($job['worker_governor']) {
+            $stats = $job['worker_governor']->getStats();
+            $info['workers_total'] = $stats['total'];
+            $info['workers_running'] = $stats['running'];
+            $info['workers_completed'] = $stats['completed'];
+            
+            if ($stats['running'] == 0) {
+                $issues[] = 'No workers are currently running';
+            }
+        } else {
+            $issues[] = 'Worker governor not initialized';
+        }
+        
+        // Check 2: Email progress
+        $this->updateEmailCountsFromFile($jobId);
+        $emailsAccepted = $job['emails_accepted'] ?? 0;
+        $info['emails_extracted'] = $emailsAccepted;
+        
+        if ($emailsAccepted == 0 && $job['status'] === 'running') {
+            $runtime = time() - ($job['started_at'] ?? time());
+            if ($runtime > 60) { // More than 1 minute
+                $issues[] = "No emails extracted after {$runtime} seconds";
+            }
+        }
+        
+        // Check 3: API key
+        if (empty($job['api_key'])) {
+            $issues[] = 'API key is missing';
+        }
+        
+        // Check 4: Query
+        if (empty($job['query'])) {
+            $issues[] = 'Search query is missing';
+        }
+        
+        // Check 5: Recent errors
+        if (!empty($job['error_messages'])) {
+            $recentErrors = array_slice($job['error_messages'], -3);
+            $info['recent_errors'] = array_map(function($err) {
+                return $err['message'];
+            }, $recentErrors);
+        }
+        
+        // Check 6: File/DB storage
+        $emailFile = Config::DATA_DIR . "/job_{$jobId}_emails.json";
+        if (file_exists($emailFile)) {
+            $fileSize = filesize($emailFile);
+            $info['email_file_size'] = Utils::formatBytes($fileSize);
+        } else {
+            $info['email_file_exists'] = false;
+        }
+        
+        return [
+            'status' => empty($issues) ? 'ok' : 'issues_found',
+            'issues' => $issues,
+            'info' => $info,
+            'job_status' => $job['status'],
+            'job_id' => $jobId
+        ];
+    }
+    
     private function updateEmailCountsFromFile($jobId) {
         // First try to get from database
         if ($this->db->isConfigured()) {
@@ -2388,6 +2571,9 @@ class APIHandler {
                     
                 case 'get_job':
                     return $this->getJob();
+                    
+                case 'verify_extraction':
+                    return $this->verifyExtractionAPI();
                     
                 case 'get_jobs':
                     return $this->getJobs();
@@ -2710,6 +2896,21 @@ class APIHandler {
             'success' => true,
             'message' => 'Keywords added successfully',
             'total_keywords' => count($updatedKeywords)
+        ]);
+    }
+    
+    private function verifyExtractionAPI() {
+        $jobId = $_POST['job_id'] ?? $_GET['job_id'] ?? null;
+        
+        if (!$jobId) {
+            throw new Exception("Job ID is required");
+        }
+        
+        $verification = $this->jobManager->verifyExtraction($jobId);
+        
+        return $this->jsonResponse([
+            'success' => true,
+            'verification' => $verification
         ]);
     }
     
@@ -4722,7 +4923,10 @@ class Application {
         async function updateChart() {
             const jobs = await API.get('get_jobs');
             if (!jobs.success || jobs.jobs.length === 0) {
-                document.getElementById('chartContainer').style.display = 'none';
+                const chartContainer = document.getElementById('chartContainer');
+                if (chartContainer) {
+                    chartContainer.style.display = 'none';
+                }
                 return;
             }
             
@@ -4731,12 +4935,18 @@ class Application {
             // consider adding a job selector dropdown or aggregating data from all running jobs.
             const runningJob = jobs.jobs.find(j => j.status === 'running');
             if (!runningJob) {
-                document.getElementById('chartContainer').style.display = 'none';
+                const chartContainer = document.getElementById('chartContainer');
+                if (chartContainer) {
+                    chartContainer.style.display = 'none';
+                }
                 return;
             }
             
             // Show chart container
-            document.getElementById('chartContainer').style.display = 'block';
+            const chartContainer = document.getElementById('chartContainer');
+            if (chartContainer) {
+                chartContainer.style.display = 'block';
+            }
             
             // Get email rate data
             const rateData = await API.get('get_email_rate', { job_id: runningJob.id });
@@ -4747,8 +4957,13 @@ class Application {
                 });
                 chartData.datasets[0].data = rateData.emails_per_minute.map(d => d.count);
                 
+                const chartElement = document.getElementById('emailRateChart');
+                if (!chartElement) {
+                    return; // Chart element doesn't exist
+                }
+                
                 if (!emailRateChart) {
-                    const ctx = document.getElementById('emailRateChart').getContext('2d');
+                    const ctx = chartElement.getContext('2d');
                     emailRateChart = new Chart(ctx, {
                         type: 'line',
                         data: chartData,
@@ -4838,10 +5053,10 @@ if (php_sapi_name() === 'cli') {
     while (true) {
         try {
             $app->runBackgroundTasks();
-            sleep(5); // Check every 5 seconds
+            sleep(1); // Check every 1 second for maximum responsiveness
         } catch (Exception $e) {
             Utils::logMessage('ERROR', "Application error: {$e->getMessage()}");
-            sleep(10); // Wait before retry
+            sleep(2); // Wait before retry
         }
     }
 } else {
