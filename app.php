@@ -1098,15 +1098,18 @@ function saveBatchToJSONOptimized(\$emailFile, \$emailBatch) {
     }
     
     // Read existing data
-    \$existingData = ['emails' => [], 'count' => 0, 'processed_urls' => [], 'email_hashes' => []];
+    \$existingData = ['emails' => [], 'count' => 0, 'processed_urls' => [], 'url_hashes' => [], 'email_hashes' => []];
     if (file_exists(\$emailFile)) {
         \$content = file_get_contents(\$emailFile);
         \$json = json_decode(\$content, true);
         if (\$json) {
             \$existingData = \$json;
-            // Ensure email_hashes exists
+            // Ensure hashes exist
             if (!isset(\$existingData['email_hashes'])) {
                 \$existingData['email_hashes'] = [];
+            }
+            if (!isset(\$existingData['url_hashes'])) {
+                \$existingData['url_hashes'] = [];
             }
         }
     }
@@ -1122,13 +1125,15 @@ function saveBatchToJSONOptimized(\$emailFile, \$emailBatch) {
             \$existingData['email_hashes'][\$emailHash] = true;
             \$saved++;
             
-            // Track processed URL
+            // Track processed URL with hash for O(1) lookup
             if (isset(\$emailData['source_url']) && !empty(\$emailData['source_url'])) {
-                if (!isset(\$existingData['processed_urls'])) {
-                    \$existingData['processed_urls'] = [];
-                }
-                if (!in_array(\$emailData['source_url'], \$existingData['processed_urls'])) {
+                \$urlHash = md5(\$emailData['source_url']);
+                if (!isset(\$existingData['url_hashes'][\$urlHash])) {
+                    if (!isset(\$existingData['processed_urls'])) {
+                        \$existingData['processed_urls'] = [];
+                    }
                     \$existingData['processed_urls'][] = \$emailData['source_url'];
+                    \$existingData['url_hashes'][\$urlHash] = true;
                 }
             }
         }
@@ -1157,20 +1162,28 @@ function addUrlsToQueue(\$dataDir, \$jobId, \$urls) {
         return; // Skip if can't acquire lock immediately
     }
     
-    \$queue = ['urls' => [], 'processed' => []];
+    \$queue = ['urls' => [], 'processed' => [], 'pending_hashes' => []];
     if (file_exists(\$queueFile)) {
         \$content = file_get_contents(\$queueFile);
         \$json = json_decode(\$content, true);
         if (\$json) {
             \$queue = \$json;
+            // Build hash map for existing URLs if not present
+            if (!isset(\$queue['pending_hashes'])) {
+                \$queue['pending_hashes'] = [];
+                foreach (\$queue['urls'] as \$existingUrl) {
+                    \$queue['pending_hashes'][md5(\$existingUrl)] = true;
+                }
+            }
         }
     }
     
-    // Add new URLs with deduplication
+    // Add new URLs with O(1) hash-based deduplication
     foreach (\$urls as \$url) {
         \$urlHash = md5(\$url);
-        if (!isset(\$queue['processed'][\$urlHash]) && !in_array(\$url, \$queue['urls'])) {
+        if (!isset(\$queue['processed'][\$urlHash]) && !isset(\$queue['pending_hashes'][\$urlHash])) {
             \$queue['urls'][] = \$url;
+            \$queue['pending_hashes'][\$urlHash] = true;
         }
     }
     
@@ -1206,12 +1219,18 @@ function getUrlsFromQueue(\$dataDir, \$jobId, \$count = 100) {
     \$urls = array_slice(\$queue['urls'], 0, \$count);
     \$queue['urls'] = array_slice(\$queue['urls'], \$count);
     
-    // Mark as processed
+    // Mark as processed and remove from pending_hashes
     if (!isset(\$queue['processed'])) {
         \$queue['processed'] = [];
     }
+    if (!isset(\$queue['pending_hashes'])) {
+        \$queue['pending_hashes'] = [];
+    }
+    
     foreach (\$urls as \$url) {
-        \$queue['processed'][md5(\$url)] = true;
+        \$urlHash = md5(\$url);
+        \$queue['processed'][\$urlHash] = true;
+        unset(\$queue['pending_hashes'][\$urlHash]);
     }
     
     file_put_contents(\$queueFile, json_encode(\$queue));
