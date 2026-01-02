@@ -1300,6 +1300,17 @@ while ((time() - \$startTime) < \$maxRunTime) {
     
     // Process URLs and extract REAL emails
     if (empty(\$urlsToProcess)) {
+        // Check if API key is missing
+        if (empty(\$apiKey)) {
+            echo json_encode([
+                'type' => 'error',
+                'worker_id' => \$workerId,
+                'message' => 'Serper API key is required for email extraction'
+            ]) . "\\n";
+            flush();
+            sleep(5); // Wait before checking again
+            continue;
+        }
         // Don't sleep, just continue to fetch more URLs
         continue;
     }
