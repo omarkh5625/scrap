@@ -4128,14 +4128,6 @@ class Application {
                 </form>
             </div>
             
-            <!-- Email Rate Chart -->
-            <div class="chart-container" style="display: none;" id="chartContainer">
-                <h3>📈 Emails Processed Per Minute</h3>
-                <div class="chart-wrapper">
-                    <canvas id="emailRateChart"></canvas>
-                </div>
-            </div>
-            
             <!-- Multi Jobs Dashboard (BELOW) -->
             <div>
                 <h3 style="margin-bottom: 20px; font-size: 20px;">Active Jobs</h3>
