@@ -1988,6 +1988,9 @@ class APIHandler {
                 case 'test_connection':
                     return $this->testConnection();
                     
+                case 'get_email_rate':
+                    return $this->getEmailRate();
+                    
                 default:
                     throw new Exception("Unknown action: {$action}");
             }
@@ -2200,6 +2203,58 @@ class APIHandler {
         }
     }
     
+    private function getEmailRate() {
+        $jobId = $_GET['job_id'] ?? '';
+        
+        if (empty($jobId)) {
+            throw new Exception("Job ID is required");
+        }
+        
+        $job = $this->jobManager->getJob($jobId);
+        
+        if (!$job) {
+            throw new Exception("Job not found");
+        }
+        
+        // Calculate emails per minute for the last 10 minutes
+        $emailsPerMinute = [];
+        $now = time();
+        $db = Database::getInstance();
+        
+        if ($db->isConfigured()) {
+            try {
+                // Get emails grouped by minute for the last 10 minutes
+                $stmt = $db->query(
+                    "SELECT 
+                        FLOOR(UNIX_TIMESTAMP(created_at) / 60) * 60 as minute_timestamp,
+                        COUNT(*) as count
+                    FROM emails
+                    WHERE job_id = :job_id 
+                        AND created_at >= FROM_UNIXTIME(:since)
+                    GROUP BY minute_timestamp
+                    ORDER BY minute_timestamp ASC",
+                    [':job_id' => $jobId, ':since' => $now - 600]
+                );
+                
+                $results = $stmt->fetchAll();
+                foreach ($results as $row) {
+                    $emailsPerMinute[] = [
+                        'timestamp' => (int)$row['minute_timestamp'],
+                        'count' => (int)$row['count']
+                    ];
+                }
+            } catch (Exception $e) {
+                Utils::logMessage('ERROR', "Failed to get email rate: {$e->getMessage()}");
+            }
+        }
+        
+        return $this->jsonResponse([
+            'success' => true,
+            'job_id' => $jobId,
+            'emails_per_minute' => $emailsPerMinute
+        ]);
+    }
+    
     private function jsonResponse($data, $statusCode = 200) {
         header('Content-Type: application/json');
         http_response_code($statusCode);
@@ -2225,7 +2280,39 @@ class Application {
             return;
         }
         
-        // Handle CSV export
+        // Handle mode-based requests (for backward compatibility and simpler URLs)
+        if (isset($_GET['mode'])) {
+            $mode = $_GET['mode'];
+            $jobId = $_GET['job_id'] ?? '';
+            
+            switch ($mode) {
+                case 'start_job':
+                    $this->handleStartJob();
+                    return;
+                    
+                case 'stop':
+                    $this->handleStopJob($jobId);
+                    return;
+                    
+                case 'download_emails':
+                    $this->downloadEmails($jobId);
+                    return;
+                    
+                case 'download_emails_with_urls':
+                    $this->downloadEmailsWithUrls($jobId);
+                    return;
+                    
+                case 'download_urls_with_emails':
+                    $this->downloadUrlsWithEmails($jobId);
+                    return;
+                    
+                case 'download_urls_without_emails':
+                    $this->downloadUrlsWithoutEmails($jobId);
+                    return;
+            }
+        }
+        
+        // Handle CSV export (legacy)
         if (isset($_GET['export']) && $_GET['export'] === 'csv' && isset($_GET['job_id'])) {
             $this->exportJobEmails($_GET['job_id']);
             return;
@@ -2359,6 +2446,206 @@ class Application {
         
         $data = json_decode(file_get_contents($emailFile), true);
         return $data['emails'] ?? [];
+    }
+    
+    private function handleStartJob() {
+        header('Content-Type: application/json');
+        
+        try {
+            $name = $_POST['name'] ?? 'Unnamed Job';
+            $apiKey = $_POST['api_key'] ?? '';
+            $query = $_POST['query'] ?? '';
+            $keywords = $_POST['keywords'] ?? '';
+            
+            if (empty($apiKey) || (empty($query) && empty($keywords))) {
+                throw new Exception("API key and query/keywords are required");
+            }
+            
+            $keywordList = [];
+            if (!empty($keywords)) {
+                $keywordList = array_filter(array_map('trim', explode("\n", $keywords)));
+            }
+            
+            $customDomainList = [];
+            if (!empty($_POST['custom_domains'])) {
+                $customDomainList = array_filter(array_map('trim', explode("\n", $_POST['custom_domains'])));
+            }
+            
+            $options = [
+                'max_workers' => (int)($_POST['max_workers'] ?? Config::MAX_WORKERS_PER_JOB),
+                'target_emails' => (int)($_POST['target_emails'] ?? 10000),
+                'max_emails' => (int)($_POST['target_emails'] ?? 10000),
+                'keywords' => $keywordList,
+                'country' => $_POST['country'] ?? 'us',
+                'language' => $_POST['language'] ?? 'en',
+                'email_types' => $_POST['email_types'] ?? '',
+                'custom_domains' => $customDomainList
+            ];
+            
+            $jobId = $this->jobManager->createJob($name, $apiKey, $query, $options);
+            $this->jobManager->startJob($jobId);
+            
+            echo json_encode([
+                'success' => true,
+                'job_id' => $jobId
+            ]);
+        } catch (Exception $e) {
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'error' => $e->getMessage()
+            ]);
+        }
+        exit;
+    }
+    
+    private function handleStopJob($jobId) {
+        header('Content-Type: application/json');
+        
+        try {
+            if (empty($jobId)) {
+                throw new Exception("Job ID is required");
+            }
+            
+            $this->jobManager->stopJob($jobId);
+            
+            echo json_encode([
+                'success' => true,
+                'message' => 'Job stopped successfully'
+            ]);
+        } catch (Exception $e) {
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'error' => $e->getMessage()
+            ]);
+        }
+        exit;
+    }
+    
+    private function downloadEmails($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_emails_only_" . date('Y-m-d') . ".csv";
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Email']);
+        
+        foreach ($emails as $item) {
+            fputcsv($output, [$item['email'] ?? '']);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function downloadEmailsWithUrls($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_emails_with_urls_" . date('Y-m-d') . ".csv";
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Email', 'Source URL']);
+        
+        foreach ($emails as $item) {
+            fputcsv($output, [
+                $item['email'] ?? '',
+                $item['source_url'] ?? ''
+            ]);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function downloadUrlsWithEmails($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_urls_with_emails_" . date('Y-m-d') . ".csv";
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Source URL', 'Email']);
+        
+        foreach ($emails as $item) {
+            fputcsv($output, [
+                $item['source_url'] ?? '',
+                $item['email'] ?? ''
+            ]);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function downloadUrlsWithoutEmails($jobId) {
+        $job = $this->jobManager->getJob($jobId);
+        if (!$job) {
+            http_response_code(404);
+            echo "Job not found";
+            return;
+        }
+        
+        $emails = $this->loadJobEmails($jobId);
+        $jobName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $job['name']);
+        $filename = "job_{$jobName}_urls_only_" . date('Y-m-d') . ".csv";
+        
+        // Get unique URLs
+        $urls = array_unique(array_map(function($item) {
+            return $item['source_url'] ?? '';
+        }, $emails));
+        
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        $output = fopen('php://output', 'w');
+        fputcsv($output, ['Source URL']);
+        
+        foreach ($urls as $url) {
+            if (!empty($url)) {
+                fputcsv($output, [$url]);
+            }
+        }
+        
+        fclose($output);
+        exit;
     }
     
     private function renderResultsPage($jobId) {
