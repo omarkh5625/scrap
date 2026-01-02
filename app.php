@@ -3993,7 +3993,9 @@ class Application {
             <?php if (!$dbConfigured): ?>
                 <div style="background: #fff3cd; border: 1px solid #ffc107; padding: 15px; border-radius: 6px; margin: 15px 0; font-size: 13px;">
                     <strong>⚠️ Database Not Configured</strong><br>
-                    Please run <a href="install.php" style="color: #007bff;">install.php</a> to set up MySQL database for persistent email storage.
+                    <p style="margin-top: 8px; color: #856404;">
+                        Please run <a href="install.php" style="color: #0066ff; text-decoration: underline;">install.php</a> to set up MySQL database for persistent email storage.
+                    </p>
                 </div>
             <?php endif; ?>
             
@@ -4007,9 +4009,6 @@ class Application {
                     <li>Check browser console for any JavaScript errors</li>
                 </ol>
             </div>
-                    <p style="margin-top: 8px; color: #856404;">
-                        Please run <a href="install.php" style="color: #0066ff; text-decoration: underline;">install.php</a> to set up MySQL database for persistent email storage.
-                    </p>
                 </div>
             <?php endif; ?>
             
